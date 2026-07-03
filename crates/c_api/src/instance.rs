@@ -1,10 +1,5 @@
 use crate::{
-    WasmStoreRef,
-    wasm_extern_t,
-    wasm_extern_vec_t,
-    wasm_module_t,
-    wasm_store_t,
-    wasm_trap_t,
+    WasmStoreRef, wasm_extern_t, wasm_extern_vec_t, wasm_module_t, wasm_store_t, wasm_trap_t,
 };
 use alloc::boxed::Box;
 use wasmi::Instance;

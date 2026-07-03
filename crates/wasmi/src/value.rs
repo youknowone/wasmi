@@ -1,12 +1,5 @@
 use crate::{
-    ExternRef,
-    F32,
-    F64,
-    Func,
-    Nullable,
-    Ref,
-    V128,
-    ValType,
+    ExternRef, F32, F64, Func, Nullable, Ref, V128, ValType,
     core::{RawRef, RawVal},
     store::AsStoreId,
 };

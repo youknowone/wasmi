@@ -1,15 +1,6 @@
 use super::TrampolineEntity;
 use crate::{
-    AsContext,
-    Caller,
-    Error,
-    ExternRef,
-    F32,
-    F64,
-    Func,
-    FuncType,
-    Nullable,
-    ValType,
+    AsContext, Caller, Error, ExternRef, F32, F64, Func, FuncType, Nullable, ValType,
     engine::{InOutParams, InOutResults, LiftFromCellsByValue, LowerToCells},
 };
 use core::{array, iter::FusedIterator};

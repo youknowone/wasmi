@@ -29,10 +29,18 @@ spin = { version = "0.9", default-features = false, features = [
     "spin_mutex",
     "rwlock",
 ] }
+# PoC meta-tracing JIT tier (feature `majit-jit`). The `majit` crates live in a
+# separate workspace one level up, so these are cross-workspace path deps.
+majit-ir = { path = "../../../majit/majit-ir", optional = true }
+majit-macros = { path = "../../../majit/majit-macros", optional = true }
+majit-metainterp = { path = "../../../majit/majit-metainterp", default-features = false, optional = true }
 
 [dev-dependencies]
 assert_matches = "1.5"
 criterion = { version = "0.5", default-features = false }
+# `.wat` -> wasm in-process for the `majit-jit` prepass tests (always available
+# in test builds, independent of the optional `wat` runtime feature).
+wat = { workspace = true }
 
 [features]
 default = ["stable", "std", "wat", "validate", "memory64"]
@@ -66,6 +74,19 @@ portable-dispatch = []
 # embedded function pointers for more compact bytecode.
 indirect-dispatch = ["wasmi_ir/slot16"]
 
+# PoC: meta-tracing JIT tier built on the in-repo `majit` framework. Additive
+# and off by default; the only hot-path edit is one cfg block in `func.rs`.
+# Requires `indirect-dispatch` so the prepass can decode the op stream (the
+# default stream encodes raw handler pointers, not decodable op-codes).
+majit-jit = [
+    "std",
+    "indirect-dispatch",
+    "dep:majit-ir",
+    "dep:majit-macros",
+    "dep:majit-metainterp",
+    "majit-metainterp/cranelift",
+]
+
 # Enables extra checks performed during Wasmi bytecode execution.
 #
 # These checks are unnecessary as long as Wasmi translation works as intended.
@@ -84,6 +105,12 @@ libm = ["wasmi_core/libm"]
 [[bench]]
 name = "benches"
 harness = false
+
+# Micro-benchmark for the `majit-jit` meta-tracing tier. Needs `wat` to build the
+# workload modules in-process and `majit-jit` for the tier under test.
+[[example]]
+name = "majit_bench"
+required-features = ["majit-jit", "wat"]
 
 [package.metadata.docs.rs]
 features = ["std", "wat", "simd"]

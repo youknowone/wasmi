@@ -4,12 +4,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use wasmi::{Config, Engine, Export, Linker, Module, Store, StoreLimitsBuilder, Val, ValType};
 use wasmi_fuzz::{
-    FuzzModule,
-    FuzzSmithConfig,
-    FuzzVal,
-    FuzzValType,
-    FuzzWasmiConfig,
-    config::ValidationMode,
+    FuzzModule, FuzzSmithConfig, FuzzVal, FuzzValType, FuzzWasmiConfig, config::ValidationMode,
 };
 
 #[derive(Debug)]

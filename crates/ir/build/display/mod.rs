@@ -8,13 +8,8 @@ mod result;
 mod utils;
 
 pub use self::{
-    constructors::DisplayConstructor,
-    decode::DisplayDecode,
-    encode::DisplayEncode,
-    op::DisplayOp,
-    op_code::DisplayOpCode,
-    result::DisplayResultMut,
-    utils::Indent,
+    constructors::DisplayConstructor, decode::DisplayDecode, encode::DisplayEncode, op::DisplayOp,
+    op_code::DisplayOpCode, result::DisplayResultMut, utils::Indent,
 };
 use crate::build::{display::ident::DisplayIdent, op::Op};
 use core::fmt::{self, Display};

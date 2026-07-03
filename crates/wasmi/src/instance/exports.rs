@@ -1,13 +1,5 @@
 use crate::{
-    AsContext,
-    Func,
-    FuncType,
-    Global,
-    GlobalType,
-    Memory,
-    MemoryType,
-    Table,
-    TableType,
+    AsContext, Func, FuncType, Global, GlobalType, Memory, MemoryType, Table, TableType,
     collections::map::Iter as MapIter,
 };
 use alloc::boxed::Box;

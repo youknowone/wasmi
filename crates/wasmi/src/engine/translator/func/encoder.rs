@@ -1,7 +1,6 @@
 use super::{Reset, ReusableAllocations};
 use crate::{
-    Engine,
-    Error,
+    Engine, Error,
     core::FuelCostsProvider,
     engine::{
         TranslationError,
@@ -9,8 +8,7 @@ use crate::{
         translator::{
             comparator::UpdateBranchOffset,
             func::{
-                LabelRef,
-                LabelRegistry,
+                LabelRef, LabelRegistry,
                 labels::{Label, ResolvedLabelUser},
             },
         },

@@ -2,24 +2,12 @@ use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState
 #[cfg(feature = "simd")]
 use crate::core::simd::ImmLaneIdx;
 use crate::{
-    Error,
-    Func,
-    Global,
-    Instance,
-    Memory,
-    Nullable,
-    RefType,
-    Table,
-    TrapCode,
-    V128,
+    Error, Func, Global, Instance, Memory, Nullable, RefType, Table, TrapCode, V128,
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, RawVal, ShiftAmount, WriteAs},
     engine::{
-        DedupFuncType,
-        EngineFunc,
-        FuncEntry,
+        DedupFuncType, EngineFunc, FuncEntry,
         executor::{
-            LoadFromCellsByValue,
-            StoreToCells,
+            LoadFromCellsByValue, StoreToCells,
             handler::{Break, Control, Done, DoneReason},
         },
         utils::unreachable_unchecked,
@@ -28,16 +16,8 @@ use crate::{
     instance::InstanceEntity,
     ir,
     ir::{
-        Address,
-        BoundedSlotSpan,
-        BranchOffset,
-        Local,
-        Offset,
-        Offset16,
-        Slot,
-        SlotAndReg,
-        SlotSpan,
-        index,
+        Address, BoundedSlotSpan, BranchOffset, Local, Offset, Offset16, Slot, SlotAndReg,
+        SlotSpan, index,
     },
     memory::{DataSegment, DataSegmentEntity},
     store::{CallHooks, PrunedStore, StoreError, StoreInner},
@@ -595,6 +575,39 @@ pub fn extract_mem0(store: &mut PrunedStore, instance: Inst) -> (Mem0Ptr, Mem0Le
     let mem0_ptr = mem0.as_mut_ptr();
     let mem0_len = mem0.len();
     (Mem0Ptr::from(mem0_ptr), Mem0Len::from(mem0_len))
+}
+
+/// Resolves a raw pointer to each of the instance's global `RawVal` storages,
+/// indexed by wasm global index, for the majit JIT tier's global residual helpers.
+///
+/// `RawVal` is `repr(transparent)`/`repr(C)` with `lo64` first, so a
+/// `*mut RawVal` points at the low 64 bits the integer globals use. Mutable
+/// globals (the only `global.set` targets) get a sound `*mut` from `get_raw_ptr`;
+/// immutable globals are read-only, so casting their shared `get_raw` reference is
+/// sound (they are never written). The table lives for the run's duration in the
+/// caller; the residuals read it through the kernel's `GLOBALS_CTX`.
+#[cfg(feature = "majit-jit")]
+pub fn resolve_globals_table(store: &mut PrunedStore, instance: Inst) -> alloc::vec::Vec<*mut u64> {
+    let inst = unsafe { instance.as_ref() };
+    // Collect the (Copy) global handles first so the instance borrow ends before
+    // the store is borrowed to resolve each global's storage pointer.
+    let mut handles = alloc::vec::Vec::new();
+    let mut idx = 0u32;
+    while let Some(global) = inst.get_global(idx) {
+        handles.push(global);
+        idx += 1;
+    }
+    let mut table = alloc::vec::Vec::with_capacity(handles.len());
+    for global in &handles {
+        let is_mut = resolve_global(store, global).ty().mutability().is_mut();
+        let ptr = if is_mut {
+            resolve_global_mut(store, global).get_raw_ptr().as_ptr() as *mut u64
+        } else {
+            resolve_global(store, global).get_raw() as *const RawVal as *mut u64
+        };
+        table.push(ptr);
+    }
+    table
 }
 
 pub fn memory_bytes<'a>(
