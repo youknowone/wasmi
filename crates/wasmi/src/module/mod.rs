@@ -35,13 +35,7 @@ pub(crate) use self::{
     utils::WasmiValueType,
 };
 use crate::{
-    Engine,
-    Error,
-    ExternType,
-    FuncType,
-    GlobalType,
-    MemoryType,
-    TableType,
+    Engine, Error, ExternType, FuncType, GlobalType, MemoryType, TableType,
     collections::Map,
     engine::{DedupFuncType, EngineFunc, EngineFuncSpan, EngineFuncSpanIter, EngineWeak},
 };
@@ -207,6 +201,16 @@ impl ModuleImports {
 }
 
 impl Module {
+    /// Returns the [`EngineFunc`] for the function at the given global function
+    /// index (imports included), if it is module-defined.
+    ///
+    /// Helper for the `majit-jit` prepass tests, which need an [`EngineFunc`]
+    /// handle without constructing a (module-private) `FuncIdx`.
+    #[cfg(all(feature = "majit-jit", test))]
+    pub(crate) fn engine_func_by_index(&self, func_idx: u32) -> Option<EngineFunc> {
+        self.inner.header.get_engine_func(FuncIdx::from(func_idx))
+    }
+
     /// Creates a new Wasm [`Module`] from the given Wasm bytecode buffer.
     ///
     /// # Note

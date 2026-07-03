@@ -1,10 +1,6 @@
 pub use self::{element::ElementSegment, ty::TableType};
 use crate::{
-    AsContext,
-    AsContextMut,
-    Error,
-    Handle,
-    Ref,
+    AsContext, AsContextMut, Error, Handle, Ref,
     core::{CoreTable, TypedRawRef},
     errors::TableError,
     store::{StoreInner, Stored},

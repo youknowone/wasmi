@@ -9,14 +9,7 @@ mod tests;
 use self::buffer::ByteBuffer;
 pub use self::{
     access::{
-        load,
-        load_at,
-        load_extend,
-        load_extend_at,
-        store,
-        store_at,
-        store_wrap,
-        store_wrap_at,
+        load, load_at, load_extend, load_extend_at, store, store_at, store_wrap, store_wrap_at,
     },
     error::MemoryError,
     ty::{MemoryType, MemoryTypeBuilder},

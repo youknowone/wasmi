@@ -1,10 +1,5 @@
 use super::errors::{
-    EnforcedLimitsError,
-    FuncError,
-    GlobalError,
-    InstantiationError,
-    IrError,
-    LinkerError,
+    EnforcedLimitsError, FuncError, GlobalError, InstantiationError, IrError, LinkerError,
 };
 use crate::{
     TrapCode,

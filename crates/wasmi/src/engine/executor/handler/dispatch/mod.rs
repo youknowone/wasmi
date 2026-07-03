@@ -18,8 +18,7 @@ pub mod backend;
 pub use self::backend::{Done, Handler, execute_until_done, op_code_to_handler};
 use super::state::Ip;
 use crate::{
-    Error,
-    TrapCode,
+    Error, TrapCode,
     engine::{ResumableHostTrapError, ResumableOutOfFuelError},
 };
 use core::ops::ControlFlow;

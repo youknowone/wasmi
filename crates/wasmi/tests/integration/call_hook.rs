@@ -1,17 +1,7 @@
 //! Tests to check if `Store::call_hook` works as intended.
 
 use wasmi::{
-    AsContext,
-    AsContextMut,
-    CallHook,
-    Caller,
-    Error,
-    Extern,
-    Func,
-    Linker,
-    Module,
-    Store,
-    TrapCode,
+    AsContext, AsContextMut, CallHook, Caller, Error, Extern, Func, Linker, Module, Store, TrapCode,
 };
 
 /// Number of times different callback events have fired.

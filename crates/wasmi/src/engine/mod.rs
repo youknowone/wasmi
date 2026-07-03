@@ -16,23 +16,13 @@ pub(crate) use self::translator::ValidatingFuncTranslator;
 pub(crate) use self::{
     block_type::BlockType,
     executor::{
-        InOutParams,
-        InOutResults,
-        Inst,
-        LiftFromCells,
-        LiftFromCellsByValue,
-        LoadByVal,
-        LowerToCells,
-        Stack,
+        InOutParams, InOutResults, Inst, LiftFromCells, LiftFromCellsByValue, LoadByVal,
+        LowerToCells, Stack,
     },
     func_types::DedupFuncType,
     translator::{
-        FuncTranslationDriver,
-        FuncTranslator,
-        FuncTranslatorAllocations,
-        LazyFuncTranslator,
-        WasmTranslator,
-        required_cells_for_tys,
+        FuncTranslationDriver, FuncTranslator, FuncTranslatorAllocations, LazyFuncTranslator,
+        WasmTranslator, required_cells_for_tys,
     },
 };
 use self::{
@@ -45,22 +35,14 @@ pub use self::{
     config::{CompilationMode, Config},
     limits::{EnforcedLimits, EnforcedLimitsError, StackConfig},
     resumable::{
-        ResumableCall,
-        ResumableCallHostTrap,
-        ResumableCallOutOfFuel,
-        ResumableHostTrapError,
-        ResumableOutOfFuelError,
-        TypedResumableCall,
-        TypedResumableCallHostTrap,
+        ResumableCall, ResumableCallHostTrap, ResumableCallOutOfFuel, ResumableHostTrapError,
+        ResumableOutOfFuelError, TypedResumableCall, TypedResumableCallHostTrap,
         TypedResumableCallOutOfFuel,
     },
     translator::TranslationError,
 };
 use crate::{
-    Error,
-    Func,
-    FuncType,
-    StoreContextMut,
+    Error, Func, FuncType, StoreContextMut,
     engine::code_map::FuncEntry,
     module::{FuncIdx, ModuleHeader},
 };
@@ -198,6 +180,28 @@ impl Engine {
     /// Returns a reference to the [`FuncEntry`] at `func` if any.
     pub(super) fn resolve_func(&self, func: EngineFunc) -> Option<&FuncEntry> {
         self.inner.resolve_func(func)
+    }
+
+    /// Compiles `func` if needed and calls `f` with its encoded op stream and
+    /// local/stack slot counts.
+    ///
+    /// Returns `None` if `func` is not a valid [`EngineFunc`] of this engine.
+    /// The `majit-jit` prepass consumes the op stream (`indirect-dispatch`
+    /// encoding) to build a MiniProgram. Test-only: the runtime JIT path reads
+    /// the op stream directly from `init_wasm_func_call`.
+    #[cfg(all(feature = "majit-jit", test))]
+    pub(crate) fn with_compiled_ops<R>(
+        &self,
+        func: EngineFunc,
+        f: impl FnOnce(&[u8], u16, u16) -> R,
+    ) -> Option<R> {
+        let view = self.inner.code_map.view();
+        let compiled = view.get_or_compile(None, func).ok()??;
+        Some(f(
+            compiled.ops(),
+            compiled.len_local_slots(),
+            compiled.len_stack_slots(),
+        ))
     }
 
     /// Resolves a deduplicated function type into a [`FuncType`] entity.

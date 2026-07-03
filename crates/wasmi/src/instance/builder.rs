@@ -1,17 +1,7 @@
 use super::InstanceEntity;
 use crate::{
-    ElementSegment,
-    Extern,
-    ExternType,
-    Func,
-    Global,
-    Memory,
-    Module,
-    Table,
-    collections::Map,
-    engine::DedupFuncType,
-    memory::DataSegment,
-    module::FuncIdx,
+    ElementSegment, Extern, ExternType, Func, Global, Memory, Module, Table, collections::Map,
+    engine::DedupFuncType, memory::DataSegment, module::FuncIdx,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 

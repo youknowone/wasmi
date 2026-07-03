@@ -1,9 +1,6 @@
 use super::{Func, into_func::WasmTyList};
 use crate::{
-    AsContext,
-    AsContextMut,
-    Error,
-    TypedResumableCall,
+    AsContext, AsContextMut, Error, TypedResumableCall,
     engine::{LiftFromCellsByValue, LoadByVal, LowerToCells},
 };
 use core::{fmt, fmt::Debug, marker::PhantomData};

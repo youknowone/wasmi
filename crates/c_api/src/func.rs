@@ -1,10 +1,5 @@
 use crate::{
-    wasm_extern_t,
-    wasm_functype_t,
-    wasm_store_t,
-    wasm_trap_t,
-    wasm_val_t,
-    wasm_val_vec_t,
+    wasm_extern_t, wasm_functype_t, wasm_store_t, wasm_trap_t, wasm_val_t, wasm_val_vec_t,
 };
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::{any::Any, ffi::c_void, hint, iter, ptr, str};

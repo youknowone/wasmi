@@ -1,11 +1,5 @@
 use crate::{
-    Extern,
-    ExternType,
-    FuncType,
-    GlobalType,
-    MemoryType,
-    Table,
-    TableType,
+    Extern, ExternType, FuncType, GlobalType, MemoryType, Table, TableType,
     errors::{MemoryError, TableError},
     module::ImportName,
 };

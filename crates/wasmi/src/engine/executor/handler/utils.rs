@@ -1,4 +1,4 @@
-use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState};
+use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState, mem0_bytes};
 #[cfg(feature = "simd")]
 use crate::core::simd::ImmLaneIdx;
 use crate::{
@@ -14,9 +14,7 @@ use crate::{
     V128,
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, RawVal, ShiftAmount},
     engine::{
-        DedupFuncType,
-        EngineFunc,
-        FuncEntry,
+        DedupFuncType, EngineFunc, FuncEntry,
         executor::{
             LoadFromCellsByValue,
             StoreToCells,
@@ -562,6 +560,53 @@ pub fn extract_mem0(store: &mut PrunedStore, instance: Inst) -> (Mem0Ptr, Mem0Le
     (Mem0Ptr::from(mem0_ptr), Mem0Len::from(mem0_len))
 }
 
+/// Resolves a raw pointer to each of the instance's global `RawVal` storages,
+/// indexed by wasm global index, for the majit JIT tier's global residual helpers.
+///
+/// `RawVal` is `repr(transparent)`/`repr(C)` with `lo64` first, so a
+/// `*mut RawVal` points at the low 64 bits the integer globals use. Mutable
+/// globals (the only `global.set` targets) get a sound `*mut` from `get_raw_ptr`;
+/// immutable globals are read-only, so casting their shared `get_raw` reference is
+/// sound (they are never written). The table lives for the run's duration in the
+/// caller; the residuals read it through the kernel's `GLOBALS_CTX`.
+#[cfg(feature = "majit-jit")]
+pub fn resolve_globals_table(store: &mut PrunedStore, instance: Inst) -> alloc::vec::Vec<*mut u64> {
+    let inst = unsafe { instance.as_ref() };
+    // Collect the (Copy) global handles first so the instance borrow ends before
+    // the store is borrowed to resolve each global's storage pointer.
+    let mut handles = alloc::vec::Vec::new();
+    let mut idx = 0u32;
+    while let Some(global) = inst.get_global(idx) {
+        handles.push(global);
+        idx += 1;
+    }
+    let mut table = alloc::vec::Vec::with_capacity(handles.len());
+    for global in &handles {
+        let is_mut = resolve_global(store, global).ty().mutability().is_mut();
+        let ptr = if is_mut {
+            resolve_global_mut(store, global).get_raw_ptr().as_ptr() as *mut u64
+        } else {
+            resolve_global(store, global).get_raw() as *const RawVal as *mut u64
+        };
+        table.push(ptr);
+    }
+    table
+}
+
+pub fn memory_bytes<'a>(
+    memory: index::Memory,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+    instance: Inst,
+    state: &'a mut VmState,
+) -> &'a mut [u8] {
+    if memory.is_default() {
+        return mem0_bytes::<'a>(mem0, mem0_len);
+    }
+    let memory = fetch_memory(instance, memory);
+    resolve_memory_mut(state.store, &memory).data_mut()
+}
+
 pub fn memory_slice(memory: &CoreMemory, pos: usize, len: usize) -> Result<&[u8], TrapCode> {
     memory
         .data()
@@ -637,7 +682,7 @@ macro_rules! impl_resolve_from_store {
 impl_resolve_from_store! {
     // fn resolve_elem(elem: &ElementSegment) -> &'a CoreElementSegment = StoreInner::try_resolve_element;
     fn resolve_func(func: &Func) -> &'a FuncEntity = StoreInner::try_resolve_func;
-    // fn resolve_global(global: &Global) -> &'a CoreGlobal = StoreInner::try_resolve_global;
+    fn resolve_global(global: &Global) -> &'a CoreGlobal = StoreInner::try_resolve_global;
     fn resolve_memory(memory: &Memory) -> &'a CoreMemory = StoreInner::try_resolve_memory;
     fn resolve_table(table: &Table) -> &'a CoreTable = StoreInner::try_resolve_table;
     fn resolve_instance(func: &Instance) -> &'a InstanceEntity = StoreInner::try_resolve_instance;

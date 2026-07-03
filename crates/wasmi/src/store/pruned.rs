@@ -1,10 +1,6 @@
 use super::{CallHooks, StoreInner, typeid};
 use crate::{
-    CallHook,
-    Error,
-    Memory,
-    Store,
-    Table,
+    CallHook, Error, Memory, Store, Table,
     core::{RawRef, hint},
     engine::{InOutParams, Inst},
     errors::{MemoryError, TableError},
