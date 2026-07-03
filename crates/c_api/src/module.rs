@@ -1,11 +1,6 @@
 use crate::{
-    CExternType,
-    wasm_byte_vec_t,
-    wasm_exporttype_t,
-    wasm_exporttype_vec_t,
-    wasm_importtype_t,
-    wasm_importtype_vec_t,
-    wasm_store_t,
+    CExternType, wasm_byte_vec_t, wasm_exporttype_t, wasm_exporttype_vec_t, wasm_importtype_t,
+    wasm_importtype_vec_t, wasm_store_t,
 };
 use alloc::{boxed::Box, string::String};
 use wasmi::{Engine, Module};

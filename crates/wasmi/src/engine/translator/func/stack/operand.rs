@@ -1,7 +1,6 @@
 use super::{LocalIdx, StackOperand, StackPos};
 use crate::{
-    Error,
-    ValType,
+    Error, ValType,
     core::{RawVal, TypedRawVal},
     engine::translator::{
         func::{layout::StackLayout, stack::Allocation},

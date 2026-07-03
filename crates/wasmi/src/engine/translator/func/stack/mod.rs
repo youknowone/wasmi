@@ -10,33 +10,19 @@ use self::{
 };
 pub use self::{
     control::{
-        AcquiredTarget,
-        BlockControlFrame,
-        BranchParamRegs,
-        BranchParams,
-        ControlFrame,
-        ControlFrameBase,
-        ControlFrameKind,
-        ElseControlFrame,
-        ElseReachability,
-        IfControlFrame,
-        IfReachability,
-        LoopControlFrame,
-        RegKind,
+        AcquiredTarget, BlockControlFrame, BranchParamRegs, BranchParams, ControlFrame,
+        ControlFrameBase, ControlFrameKind, ElseControlFrame, ElseReachability, IfControlFrame,
+        IfReachability, LoopControlFrame, RegKind,
     },
     operand::{ImmediateOperand, LocalOperand, Location, Operand, ResolvedOperand, TempOperand},
     operands::{Allocation, PreservedAllLocalsIter, PreservedLocalsIter, PreservedRegs},
 };
 use super::{Reset, ReusableAllocations};
 use crate::{
-    Engine,
-    Error,
-    FuncType,
-    ValType,
+    Engine, Error, FuncType, ValType,
     core::TypedRawVal,
     engine::{
-        BlockType,
-        required_cells_for_tys,
+        BlockType, required_cells_for_tys,
         translator::func::{LocalIdx, Pos, labels::LabelRef},
     },
     ir::{self, BoundedSlotSpan, SlotSpan},

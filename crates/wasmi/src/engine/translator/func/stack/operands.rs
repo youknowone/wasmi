@@ -1,7 +1,6 @@
 use super::{ImmediateOperand, LocalIdx, LocalOperand, LocalsHead, Operand, Reset, TempOperand};
 use crate::{
-    Error,
-    ValType,
+    Error, ValType,
     core::{RawVal, TypedRawVal},
     engine::{TranslationError, translator::utils::required_cells_for_ty},
     ir::{Slot, SlotSpan},

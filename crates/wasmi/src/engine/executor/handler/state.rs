@@ -1,20 +1,10 @@
 use crate::{
-    Error,
-    Func,
-    TrapCode,
+    Error, Func, TrapCode,
     core::RawRef,
     engine::{
-        ResumableHostTrapError,
-        ResumableOutOfFuelError,
-        StackConfig,
+        ResumableHostTrapError, ResumableOutOfFuelError, StackConfig,
         executor::{
-            Cell,
-            CellError,
-            CellsReader,
-            CellsWriter,
-            CodeView,
-            InOutParams,
-            LoadFromCellsByValue,
+            Cell, CellError, CellsReader, CellsWriter, CodeView, InOutParams, LoadFromCellsByValue,
             StoreToCells,
             handler::{
                 dispatch::{Control, ExecutionOutcome},
@@ -252,6 +242,14 @@ impl From<*mut u8> for Mem0Ptr {
     }
 }
 
+impl Mem0Ptr {
+    /// The base pointer as raw address bits (for the majit JIT tier, which
+    /// passes it as an `i64` red and reconstructs the pointer in a residual).
+    pub fn addr(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// The length in bytes of the default Wasm linear memory at index 0.
 #[derive(Debug, Copy, Clone)]
 #[repr(transparent)]
@@ -260,6 +258,13 @@ pub struct Mem0Len(usize);
 impl From<usize> for Mem0Len {
     fn from(value: usize) -> Self {
         Self(value)
+    }
+}
+
+impl Mem0Len {
+    /// The length in bytes.
+    pub fn get(self) -> usize {
+        self.0
     }
 }
 
