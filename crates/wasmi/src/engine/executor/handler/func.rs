@@ -262,6 +262,10 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             call_runner_fn,
             &mut call_ctx as *mut CallRunnerCtx as *mut (),
         );
+        super::majit::kernel::set_imported_call_runners(
+            call_imported_runner_fn,
+            call_indirect_runner_fn,
+        );
         let result = super::majit::kernel::run_persistent(
             key,
             &slots,
@@ -679,6 +683,139 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
             unsafe { sp.get::<i64>(Slot::from(0)) }
         }
         Err(_) => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+            0
+        }
+    }
+}
+
+/// Execute an imported function call from the majit kernel.
+/// Resolves the `Func` handle through the store. If the target is a Wasm
+/// function, delegates to `call_runner_fn` via its `FuncEntry` pointer.
+/// Host functions are not yet supported (trap).
+#[cfg(feature = "majit-jit")]
+fn call_imported_runner_fn(data: *mut (), func_index: u32, params: &[i64]) -> i64 {
+    let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
+    let store = unsafe { &mut *ctx.store };
+
+    // Resolve Func from the instance.
+    let func_handle =
+        utils::fetch_func(ctx.instance, crate::ir::index::Func::from(func_index));
+    let result = run_resolved_func(data, store, func_handle, params);
+
+    // Re-extract MEM_CTX: the callee (especially a host function) may have
+    // triggered memory.grow, invalidating the kernel's cached mem0 pointer.
+    let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+    super::majit::kernel::update_mem_ctx(mem0.addr() as i64, mem0_len.get() as i64);
+
+    result
+}
+
+/// Execute an indirect function call from the majit kernel.
+/// Performs table lookup, null check, type check, then dispatches.
+#[cfg(feature = "majit-jit")]
+fn call_indirect_runner_fn(
+    data: *mut (),
+    table_idx: u32,
+    func_type_idx: u32,
+    runtime_index: u64,
+    params: &[i64],
+) -> i64 {
+    let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
+    let store = unsafe { &mut *ctx.store };
+
+    // Table lookup → Func handle.
+    let func_handle = match resolve_indirect(ctx, store, table_idx, func_type_idx, runtime_index) {
+        Some(f) => f,
+        None => return 0, // trap already set
+    };
+    let result = run_resolved_func(data, store, func_handle, params);
+
+    // Re-extract MEM_CTX after the call.
+    let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+    super::majit::kernel::update_mem_ctx(mem0.addr() as i64, mem0_len.get() as i64);
+
+    result
+}
+
+/// Resolve an indirect call: table lookup + null check + type check.
+/// Returns `None` on error (trap code already set).
+#[cfg(feature = "majit-jit")]
+fn resolve_indirect(
+    ctx: &CallRunnerCtx,
+    store: &mut crate::store::PrunedStore,
+    table_idx: u32,
+    func_type_idx: u32,
+    runtime_index: u64,
+) -> Option<Func> {
+    let table_handle = utils::fetch_table(ctx.instance, crate::ir::index::Table::from(table_idx));
+    let table = utils::resolve_table(store, &table_handle);
+    let raw_ref = match table.get(runtime_index as u64) {
+        Some(r) => r,
+        None => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::TableOutOfBounds);
+            return None;
+        }
+    };
+    // Extract the funcref from the raw table element.
+    // Use the same from_raw_parts + val() pattern as resolve_indirect_func.
+    debug_assert!(matches!(raw_ref.ty(), crate::RefType::Func));
+    let funcref = <crate::Nullable<Func>>::from_raw_parts(raw_ref.raw(), &*store);
+    let func = match funcref.val() {
+        Some(f) => *f,
+        None => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::IndirectCallToNull);
+            return None;
+        }
+    };
+
+    // Type check.
+    let expected_fnty =
+        utils::fetch_func_type(ctx.instance, crate::ir::index::FuncType::from(func_type_idx));
+    let actual_fnty = utils::resolve_func(store, &func).ty_dedup();
+    if *actual_fnty != expected_fnty {
+        super::majit::kernel::set_residual_trap(crate::TrapCode::BadSignature);
+        return None;
+    }
+
+    Some(func)
+}
+
+/// Run a resolved `Func` handle on the stock executor.
+/// Wasm functions: compile + execute_until_done on callee stack.
+/// Host functions: not yet supported (trap).
+#[cfg(feature = "majit-jit")]
+fn run_resolved_func(
+    data: *mut (),
+    store: &mut crate::store::PrunedStore,
+    func: Func,
+    params: &[i64],
+) -> i64 {
+    let func_entity = utils::resolve_func(store, &func);
+    match func_entity {
+        FuncEntity::Wasm(wasm_func) => {
+            // Resolve the wasm function to its FuncEntry and delegate to
+            // call_runner_fn via the raw pointer. This reuses the existing
+            // CALL_ASSEMBLER + stock fallback infrastructure.
+            let func_body = wasm_func.func_body();
+            // FuncEntry lives in the engine's append-only CodeMap. Recover
+            // its raw pointer the same way CallInternal encodes it.
+            let func_entry = match store.inner().engine().resolve_func(func_body) {
+                Some(entry) => entry,
+                None => {
+                    super::majit::kernel::set_residual_trap(
+                        crate::TrapCode::UnreachableCodeReached,
+                    );
+                    return 0;
+                }
+            };
+            let func_addr = core::ptr::from_ref(func_entry).expose_provenance();
+            call_runner_fn(data, func_addr, params)
+        }
+        FuncEntity::Host(_host_func) => {
+            // Host function call from inside the kernel is not yet supported.
+            // This would require preparing a host frame and invoking the
+            // trampoline. For now, trap.
             super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
             0
         }
