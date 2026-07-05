@@ -594,9 +594,8 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     // (CALLEE_DRIVER) instead of the stock handler-threaded executor. This
     // avoids the frame-push / VmState / handler-dispatch overhead and lets
     // the callee's hot loop benefit from majit compilation.
-    if let Some((callee_key, callee_num_slots, callee_uses_globals)) =
-        super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots)
-    {
+    let ca_result = super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots);
+    if let Some((callee_key, callee_num_slots, callee_uses_globals)) = ca_result {
         // Seed the callee's slot array: params first, rest zeroed.
         let total = callee_num_slots + super::majit::prepass::NUM_SCRATCH;
         let mut init_slots = alloc::vec![0i64; total];
@@ -662,19 +661,8 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
         ireg, freg32, freg64,
     ) {
         Ok(sp) => {
-            // The wasmi translator may leave the function's return value in
-            // the integer accumulator register (ireg) rather than slot 0.
-            // The stock executor's dispatch loop carries ireg as a local
-            // variable that is NOT synced back to the Stack. However, when
-            // the function ends via Return → pop_frame → DoneReason::Return,
-            // the handler passes ireg INTO the done! macro which captures it
-            // in the break reason.
-            //
-            // Since the stack's ireg is NOT updated by execute_until_done,
-            // and the break-reason ireg is not accessible from here, we read
-            // from slot 0 (which the translator copies the result to before
-            // Return for most functions). This is the existing convention
-            // and matches how WasmFuncCall::execute reads the result.
+            // The wasmi translator copies the result to slot 0 (via a
+            // U64Copy_S0r or equivalent) before emitting Return.
             unsafe { sp.get::<i64>(Slot::from(0)) }
         }
         Err(_) => {
