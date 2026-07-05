@@ -2106,7 +2106,7 @@ struct CachedFunc {
 }
 
 /// How many JIT / stock calls to time before committing a function to a tier.
-const PROBE_JIT_CALLS: u32 = 32;
+const PROBE_JIT_CALLS: u32 = 8;
 const PROBE_STOCK_CALLS: u32 = 4;
 
 /// Adaptive choice of execution tier for one wasm function.
