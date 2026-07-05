@@ -278,6 +278,15 @@ pub(crate) const MINI_MEMORY_SIZE: i64 = 160;
 /// `ireg = (slots[lhs] as u64 >> (slots[rhs] as u64 & 63)) as i64`.
 /// Unsigned 64-bit right shift with dynamic shift amount.
 pub(crate) const MINI_U64_SHR_SS_WR: i64 = 161;
+/// `[MINI_MEM_COPY_WITHIN, dst_slot, src_slot, len_slot]` (4 words):
+/// `memory.copy` within memory[0]. Reads dst/src/len from slots, performs
+/// bounds-checked `copy_within` through a `#[dont_look_inside]` residual
+/// helper. Out-of-bounds sets `MEM_TRAP`. This is same-memory only;
+/// cross-memory MemoryCopy bails the function.
+pub(crate) const MINI_MEM_COPY_WITHIN: i64 = 162;
+/// `[MINI_I64_OR_RI_WR, imm]` (2 words): `ireg = ireg | imm` (i64). Lowers
+/// wasmi `I64BitOr_Rsi` (`lhs` = accumulator, `rhs` = sign-extended Imm16).
+pub(crate) const MINI_I64_OR_RI_WR: i64 = 163;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -4206,12 +4215,7 @@ pub(crate) fn prepass(
                 let func_addr = usize::from(op.func) as i64;
                 let params_start = i64::from(u16::from(op.params.span().head()));
                 let params_len = i64::from(op.params.len());
-                words.extend_from_slice(&[
-                    MINI_CALL_RESIDUAL,
-                    func_addr,
-                    params_start,
-                    params_len,
-                ]);
+                words.extend_from_slice(&[MINI_CALL_RESIDUAL, func_addr, params_start, params_len]);
             }
             OpCode::Trap => {
                 // Unconditional trap (wasm `unreachable`). The kernel sets
@@ -4223,7 +4227,9 @@ pub(crate) fn prepass(
             }
             OpCode::MemorySize => {
                 let op = decode::MemorySize::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 // Result goes into ireg (RegInt). MINI_MEMORY_SIZE is 1 word.
                 words.push(MINI_MEMORY_SIZE);
             }
@@ -4235,22 +4241,23 @@ pub(crate) fn prepass(
             }
             OpCode::U32LoadExtend16_Ri => {
                 let op = decode::U32LoadExtend16_Ri::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 // _Ri = address is Immediate. Materialize → ireg, u16 load offset 0.
                 let addr = u64::from(op.address) as i64;
                 words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_U16_LOAD_MEM0_OFF, 0]);
             }
             OpCode::U64Store_Is => {
                 let op = decode::U64Store_Is::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 // _Is = address is Imm (Address), value in Slot.
                 // Decompose: address → ireg, then i64 store with value slot.
                 let addr = u64::from(op.address) as i64;
                 let val = i64::from(u16::from(op.value));
-                words.extend_from_slice(&[
-                    MINI_COPY_RI, addr,
-                    MINI_I64_STORE_RS, 0, val,
-                ]);
+                words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_I64_STORE_RS, 0, val]);
             }
             OpCode::CallIndirect_S => {
                 // Indirect call — yield to stock executor.
@@ -4271,10 +4278,17 @@ pub(crate) fn prepass(
                 let imm = i64::from(u32::from(op.lhs));
                 let target_field = words.len() + 9;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,      // scratch = imm (lhs)
-                    MINI_COPY_SR, scratch_base + 1,        // scratch+1 = ireg (rhs)
-                    MINI_U32_LT_SS_R, scratch_base, scratch_base + 1,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm, // scratch = imm (lhs)
+                    MINI_COPY_SR,
+                    scratch_base + 1, // scratch+1 = ireg (rhs)
+                    MINI_U32_LT_SS_R,
+                    scratch_base,
+                    scratch_base + 1,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4284,9 +4298,15 @@ pub(crate) fn prepass(
                 let op = decode::I64Add_Rs_ri::decode(&mut cursor).ok()?;
                 let dst = i64::from(u16::from(Slot::from(op.result)));
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,     // scratch = ireg
-                    MINI_COPY_SI, scratch_base + 1, op.rhs,  // scratch+1 = imm
-                    MINI_I64_ADD_SS_WB, dst, scratch_base, scratch_base + 1,
+                    MINI_COPY_SR,
+                    scratch_base, // scratch = ireg
+                    MINI_COPY_SI,
+                    scratch_base + 1,
+                    op.rhs, // scratch+1 = imm
+                    MINI_I64_ADD_SS_WB,
+                    dst,
+                    scratch_base,
+                    scratch_base + 1,
                 ]);
             }
             OpCode::U64LoadExtend32Mem0Offset16_Rs => {
@@ -4297,33 +4317,51 @@ pub(crate) fn prepass(
                 let ptr = i64::from(u16::from(op.ptr));
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[
-                    MINI_COPY_RS, ptr,
-                    MINI_I32_LOAD_MEM0_OFF, offset,
-                    MINI_COPY_SR, scratch_base,
-                    MINI_I64_AND_SI_WR, scratch_base, 0x_FFFF_FFFF_i64,
+                    MINI_COPY_RS,
+                    ptr,
+                    MINI_I32_LOAD_MEM0_OFF,
+                    offset,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I64_AND_SI_WR,
+                    scratch_base,
+                    0x_FFFF_FFFF_i64,
                 ]);
             }
             OpCode::U32Store_Ir => {
                 // i32.store at absolute address, value in ireg. Memory 0 only.
                 let op = decode::U32Store_Ir::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 let addr = u64::from(op.address) as i64;
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,   // scratch = ireg (value)
-                    MINI_COPY_RI, addr,           // ireg = address (ptr)
-                    MINI_I32_STORE_RS, 0, scratch_base,
+                    MINI_COPY_SR,
+                    scratch_base, // scratch = ireg (value)
+                    MINI_COPY_RI,
+                    addr, // ireg = address (ptr)
+                    MINI_I32_STORE_RS,
+                    0,
+                    scratch_base,
                 ]);
             }
             OpCode::U32Store_Ii => {
                 // i32.store at absolute address, value is immediate. Memory 0 only.
                 let op = decode::U32Store_Ii::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 let addr = u64::from(op.address) as i64;
                 let val = i64::from(u32::from(op.value));
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, val,  // scratch = value
-                    MINI_COPY_RI, addr,               // ireg = address (ptr)
-                    MINI_I32_STORE_RS, 0, scratch_base,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    val, // scratch = value
+                    MINI_COPY_RI,
+                    addr, // ireg = address (ptr)
+                    MINI_I32_STORE_RS,
+                    0,
+                    scratch_base,
                 ]);
             }
             OpCode::I64Lt_Rsr => {
@@ -4332,8 +4370,11 @@ pub(crate) fn prepass(
                 let op = decode::I64Lt_Rsr::decode(&mut cursor).ok()?;
                 let lhs = i64::from(u16::from(op.lhs));
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,  // scratch = ireg (rhs)
-                    MINI_I64_LT_SS_R, lhs, scratch_base,
+                    MINI_COPY_SR,
+                    scratch_base, // scratch = ireg (rhs)
+                    MINI_I64_LT_SS_R,
+                    lhs,
+                    scratch_base,
                 ]);
             }
             OpCode::BranchU32Lt_Rs => {
@@ -4345,9 +4386,14 @@ pub(crate) fn prepass(
                 let rhs = i64::from(u16::from(op.rhs));
                 let target_field = words.len() + 6;
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,  // scratch = ireg (lhs)
-                    MINI_U32_LT_SS_R, scratch_base, rhs,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SR,
+                    scratch_base, // scratch = ireg (lhs)
+                    MINI_U32_LT_SS_R,
+                    scratch_base,
+                    rhs,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4360,10 +4406,17 @@ pub(crate) fn prepass(
                 let imm = op.lhs as i64;
                 let target_field = words.len() + 9;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,
-                    MINI_COPY_SR, scratch_base + 1,
-                    MINI_U64_LT_SS_R, scratch_base, scratch_base + 1,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_COPY_SR,
+                    scratch_base + 1,
+                    MINI_U64_LT_SS_R,
+                    scratch_base,
+                    scratch_base + 1,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4377,8 +4430,12 @@ pub(crate) fn prepass(
                 let rhs = i64::from(u16::from(op.rhs));
                 let target_field = words.len() + 4;
                 words.extend_from_slice(&[
-                    MINI_U32_LT_SS_R, lhs, rhs,
-                    MINI_BR_I32_NE_RI, 0, 0, // target patched by fixup
+                    MINI_U32_LT_SS_R,
+                    lhs,
+                    rhs,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0, // target patched by fixup
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4396,9 +4453,14 @@ pub(crate) fn prepass(
                 let imm = i64::from(i32::from(op.rhs));
                 let target_field = words.len() + 6;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,
-                    MINI_I32_LT_RS_R, scratch_base,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_I32_LT_RS_R,
+                    scratch_base,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4411,11 +4473,17 @@ pub(crate) fn prepass(
                 let lhs = i64::from(u16::from(op.lhs));
                 let rhs = i64::from(u16::from(op.rhs));
                 words.extend_from_slice(&[
-                    MINI_COPY_RS, lhs,           // ireg = slot[lhs] (f64 bits as i64)
-                    MINI_F64_REINTERP_I64,       // freg = ireg (reinterpret to f64)
-                    MINI_F64_CMP_RS_R, 1, rhs,   // ireg = (freg <= slot[rhs]) ? 1 : 0
-                    MINI_COPY_SI, scratch_base, 0, // scratch = 0
-                    MINI_I32_EQ_RS_R, scratch_base, // ireg = (ireg == 0) ? 1 : 0 = !le
+                    MINI_COPY_RS,
+                    lhs,                   // ireg = slot[lhs] (f64 bits as i64)
+                    MINI_F64_REINTERP_I64, // freg = ireg (reinterpret to f64)
+                    MINI_F64_CMP_RS_R,
+                    1,
+                    rhs, // ireg = (freg <= slot[rhs]) ? 1 : 0
+                    MINI_COPY_SI,
+                    scratch_base,
+                    0, // scratch = 0
+                    MINI_I32_EQ_RS_R,
+                    scratch_base, // ireg = (ireg == 0) ? 1 : 0 = !le
                 ]);
             }
             OpCode::U32Select_Rsii => {
@@ -4426,10 +4494,17 @@ pub(crate) fn prepass(
                 let t = i64::from(u32::from(op.true_val));
                 let f = i64::from(u32::from(op.false_val));
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, t,
-                    MINI_COPY_SI, scratch_base + 1, f,
-                    MINI_COPY_RS, cond,
-                    MINI_SELECT, scratch_base, scratch_base + 1,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    t,
+                    MINI_COPY_SI,
+                    scratch_base + 1,
+                    f,
+                    MINI_COPY_RS,
+                    cond,
+                    MINI_SELECT,
+                    scratch_base,
+                    scratch_base + 1,
                 ]);
             }
             OpCode::I32Eq_Rss => {
@@ -4448,9 +4523,15 @@ pub(crate) fn prepass(
                 let imm = op.rhs as i64;
                 let target_field = words.len() + 7;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,
-                    MINI_U64_LT_SS_R, lhs, scratch_base,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_U64_LT_SS_R,
+                    lhs,
+                    scratch_base,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4460,9 +4541,14 @@ pub(crate) fn prepass(
                 // Decompose: materialize both into scratch, then U64_SHR_SS_WR.
                 let op = decode::U64Shr_Rir::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, op.lhs as i64, // scratch = imm (lhs value)
-                    MINI_COPY_SR, scratch_base + 1,         // scratch+1 = ireg (shift amt)
-                    MINI_U64_SHR_SS_WR, scratch_base, scratch_base + 1,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    op.lhs as i64, // scratch = imm (lhs value)
+                    MINI_COPY_SR,
+                    scratch_base + 1, // scratch+1 = ireg (shift amt)
+                    MINI_U64_SHR_SS_WR,
+                    scratch_base,
+                    scratch_base + 1,
                 ]);
             }
             OpCode::I64Lt_Rss => {
@@ -4478,8 +4564,11 @@ pub(crate) fn prepass(
                 let op = decode::I32Shl_Rri::decode(&mut cursor).ok()?;
                 let shift = i64::from(u8::from(op.rhs));
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,
-                    MINI_I32_SHL_SI, scratch_base, shift,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I32_SHL_SI,
+                    scratch_base,
+                    shift,
                 ]);
             }
             OpCode::U64Select_Rrrs => {
@@ -4488,8 +4577,11 @@ pub(crate) fn prepass(
                 let op = decode::U64Select_Rrrs::decode(&mut cursor).ok()?;
                 let false_slot = i64::from(u16::from(op.false_val));
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,         // scratch = ireg (true_val)
-                    MINI_SELECT, scratch_base, false_slot,
+                    MINI_COPY_SR,
+                    scratch_base, // scratch = ireg (true_val)
+                    MINI_SELECT,
+                    scratch_base,
+                    false_slot,
                 ]);
             }
             OpCode::CallIndirect_R => {
@@ -4508,9 +4600,15 @@ pub(crate) fn prepass(
                 let imm = i64::from(u32::from(op.rhs));
                 let target_field = words.len() + 7;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,
-                    MINI_U32_LT_SS_R, lhs, scratch_base,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_U32_LT_SS_R,
+                    lhs,
+                    scratch_base,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4518,7 +4616,9 @@ pub(crate) fn prepass(
                 // i32.load8_u at absolute address. Memory 0 only.
                 // Decompose: address → ireg, then u8 load offset 0.
                 let op = decode::U32LoadExtend8_Ri::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 let addr = u64::from(op.address) as i64;
                 words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_U8_LOAD_MEM0_OFF, 0]);
             }
@@ -4529,22 +4629,33 @@ pub(crate) fn prepass(
                 let lhs = i64::from(u16::from(op.lhs));
                 let imm = i64::from(op.rhs);
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, imm,
-                    MINI_I32_AND_SS_WR, lhs, scratch_base,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_I32_AND_SS_WR,
+                    lhs,
+                    scratch_base,
                 ]);
             }
             OpCode::U32Store_Is => {
                 // i32.store at absolute address, value in slot. Memory 0 only.
                 // Decompose: address → ireg, then i32 store with value slot.
                 let op = decode::U32Store_Is::decode(&mut cursor).ok()?;
-                if u32::from(op.memory) != 0 { return None; }
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
                 let addr = u64::from(op.address) as i64;
                 let val = i64::from(u16::from(op.value));
                 words.extend_from_slice(&[
-                    MINI_COPY_RS, val,
-                    MINI_COPY_SR, scratch_base,
-                    MINI_COPY_RI, addr,
-                    MINI_I32_STORE_RS, 0, scratch_base,
+                    MINI_COPY_RS,
+                    val,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_COPY_RI,
+                    addr,
+                    MINI_I32_STORE_RS,
+                    0,
+                    scratch_base,
                 ]);
             }
             OpCode::BranchI32Eq_Rs => {
@@ -4565,8 +4676,11 @@ pub(crate) fn prepass(
                 // scratch, then use I64_EQ_RS_R.
                 let op = decode::I64Eq_Rri::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[
-                    MINI_COPY_SI, scratch_base, op.rhs,
-                    MINI_I64_EQ_RS_R, scratch_base,
+                    MINI_COPY_SI,
+                    scratch_base,
+                    op.rhs,
+                    MINI_I64_EQ_RS_R,
+                    scratch_base,
                 ]);
             }
             OpCode::BranchI64Lt_Rs => {
@@ -4577,10 +4691,7 @@ pub(crate) fn prepass(
                 let target_byte = pos.checked_add_signed(offset)?;
                 let rhs = i64::from(u16::from(op.rhs));
                 let target_field = words.len() + 3;
-                words.extend_from_slice(&[
-                    MINI_I64_LT_RS_R, rhs,
-                    MINI_BR_I32_NE_RI, 0, 0,
-                ]);
+                words.extend_from_slice(&[MINI_I64_LT_RS_R, rhs, MINI_BR_I32_NE_RI, 0, 0]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::CallImported => {
@@ -4591,11 +4702,17 @@ pub(crate) fn prepass(
                 has_yield_or_bail = true;
             }
             OpCode::MemoryCopy => {
-                // memory.copy is complex (bulk memory). Currently the DRIVER
-                // re-entrancy guard cannot handle nested calls from functions
-                // that become eligible via this yield. Bail the function.
-                let _op = decode::MemoryCopy::decode(&mut cursor).ok()?;
-                return None;
+                // memory.copy within the same linear memory — handled natively
+                // by the mem_copy_within residual helper. Cross-memory copy
+                // (dst_memory != src_memory) bails the function.
+                let op = decode::MemoryCopy::decode(&mut cursor).ok()?;
+                if op.dst_memory != op.src_memory {
+                    return None;
+                }
+                let dst = i64::from(u16::from(op.dst));
+                let src = i64::from(u16::from(op.src));
+                let len = i64::from(u16::from(op.len));
+                words.extend_from_slice(&[MINI_MEM_COPY_WITHIN, dst, src, len]);
             }
             OpCode::BranchI64Le_Rs => {
                 // if ireg <=s slot[rhs] (i64 signed) goto target.
@@ -4606,9 +4723,14 @@ pub(crate) fn prepass(
                 // Spill ireg to scratch, then use I64_LE_SS_R (lhs=scratch, rhs=rhs).
                 let target_field = words.len() + 6;
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,
-                    MINI_I64_LE_SS_R, scratch_base, rhs,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I64_LE_SS_R,
+                    scratch_base,
+                    rhs,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4621,9 +4743,14 @@ pub(crate) fn prepass(
                 let lhs = i64::from(u16::from(op.lhs));
                 let target_field = words.len() + 6;
                 words.extend_from_slice(&[
-                    MINI_COPY_SR, scratch_base,
-                    MINI_U32_LT_SS_R, lhs, scratch_base,
-                    MINI_BR_I32_NE_RI, 0, 0,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_U32_LT_SS_R,
+                    lhs,
+                    scratch_base,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
@@ -4633,6 +4760,97 @@ pub(crate) fn prepass(
                 let _op = decode::I64Shr_Rsi::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
+            }
+            OpCode::BranchU32Le_Sr => {
+                // if slot[lhs] <=u ireg goto target. Spill ireg to scratch,
+                // then compare slot vs scratch with U32_LE_SS_R.
+                let op = decode::BranchU32Le_Sr::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = i64::from(u16::from(op.lhs));
+                let target_field = words.len() + 6;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_U32_LE_SS_R,
+                    lhs,
+                    scratch_base,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
+                ]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::I64BitOr_Rsi => {
+                // ireg = slot[lhs] | sign_extend(imm16). Decompose as
+                // COPY_RS(lhs) + I64_OR_RI_WR(imm).
+                let op = decode::I64BitOr_Rsi::decode(&mut cursor).ok()?;
+                let lhs = i64::from(u16::from(op.lhs));
+                words.extend_from_slice(&[MINI_COPY_RS, lhs, MINI_I64_OR_RI_WR, op.rhs]);
+            }
+            OpCode::BranchU32Le_Ir => {
+                // if imm <=u ireg goto target. Materialize both into scratch,
+                // compute comparison, branch.
+                let op = decode::BranchU32Le_Ir::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = i64::from(u32::from(op.lhs));
+                let target_field = words.len() + 9;
+                words.extend_from_slice(&[
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm, // scratch = imm (lhs)
+                    MINI_COPY_SR,
+                    scratch_base + 1, // scratch+1 = ireg (rhs)
+                    MINI_U32_LE_SS_R,
+                    scratch_base,
+                    scratch_base + 1,
+                    MINI_BR_I32_NE_RI,
+                    0,
+                    0,
+                ]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::I32Eq_Rri => {
+                // ireg = (ireg == imm) ? 1 : 0 (i32). Materialize imm into
+                // scratch, then use I32_EQ_RS_R.
+                let op = decode::I32Eq_Rri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[
+                    MINI_COPY_SI,
+                    scratch_base,
+                    i64::from(op.rhs),
+                    MINI_I32_EQ_RS_R,
+                    scratch_base,
+                ]);
+            }
+            OpCode::U64LoadExtend8_Rs => {
+                // u8 load from slot ptr + offset, zero-extend to u64.
+                // Memory 0 only.
+                let op = decode::U64LoadExtend8_Rs::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_U8_LOAD_MEM0_OFF, offset]);
+            }
+            OpCode::U64LoadExtend32_Ri => {
+                // u32 load from absolute address, zero-extend to u64.
+                // Materialize the address into ireg, then i32 load, then mask
+                // to u32 (the i32 load sign-extends, but we want zero-extend).
+                let op = decode::U64LoadExtend32_Ri::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 {
+                    return None;
+                }
+                let addr = u64::from(op.address) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_RI,
+                    addr,
+                    MINI_I32_LOAD_MEM0_OFF,
+                    0,
+                    MINI_I64_AND_RI_WR,
+                    0x0000_0000_FFFF_FFFFi64,
+                ]);
             }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
@@ -5002,6 +5220,12 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::BranchI64Le_Rs => dec!(BranchI64Le_Rs),
             OpCode::BranchU32Lt_Sr => dec!(BranchU32Lt_Sr),
             OpCode::I64Shr_Rsi => dec!(I64Shr_Rsi),
+            OpCode::BranchU32Le_Sr => dec!(BranchU32Le_Sr),
+            OpCode::BranchU32Le_Ir => dec!(BranchU32Le_Ir),
+            OpCode::I64BitOr_Rsi => dec!(I64BitOr_Rsi),
+            OpCode::I32Eq_Rri => dec!(I32Eq_Rri),
+            OpCode::U64LoadExtend8_Rs => dec!(U64LoadExtend8_Rs),
+            OpCode::U64LoadExtend32_Ri => dec!(U64LoadExtend32_Ri),
             other => {
                 let rest = &cursor[..cursor.len().min(16)];
                 std::eprintln!("  @{pos:>3}: UNKNOWN {other:?}  next_bytes={rest:02x?}");
