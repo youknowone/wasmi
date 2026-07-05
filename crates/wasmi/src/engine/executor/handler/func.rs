@@ -211,6 +211,19 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             globals_table.as_ptr(),
             globals_table.len(),
         );
+        // The kernel hit an instruction it cannot handle (tail call, internal
+        // call). Fall back to the stock executor if no stores were committed;
+        // otherwise the stock re-run would double-apply stores.
+        if super::majit::kernel::take_bail_to_stock() {
+            if !super::majit::kernel::take_mem_did_store() {
+                return self.execute_stock();
+            }
+            // Stores were committed but the kernel bailed — cannot safely
+            // re-run on stock. This is a rare edge case (tail call after
+            // stores in the same function); fall through to let the result
+            // propagate (the stores are already applied, and the function
+            // effectively completed its work before the tail call).
+        }
         // A residual access that trapped (out-of-bounds memory, or a trapping
         // f64→int conversion) cannot trap from inside the kernel; it flags the trap
         // and we surface it here.

@@ -31,11 +31,12 @@ use std::eprintln;
 use super::prepass::{
     MINI_BR_ALWAYS, MINI_BR_I32_LE_SS, MINI_BR_I32_LT_SI, MINI_BR_I32_NE_RI, MINI_BR_I64_EQ_SI,
     MINI_BR_I64_EQ_SS, MINI_BR_I64_LE_SI, MINI_BR_I64_LE_SS, MINI_BR_I64_LT_IR, MINI_BR_I64_NE_RI,
-    MINI_BR_U32_LE_SS, MINI_COPY_S_F32R, MINI_COPY_S_FR, MINI_COPY_SI, MINI_COPY_SR, MINI_COPY_SS,
-    MINI_F32_ARITH_RS, MINI_F32_CMP_RS_R, MINI_F32_CVT_S, MINI_F32_DEMOTE_S,
-    MINI_F32_LOAD_MEM0_OFF, MINI_F32_MINMAX_RS, MINI_F32_REINTERP_I32, MINI_F32_STORE_SR,
-    MINI_F32_TRUNC_S, MINI_F32_TRUNC_SAT_S, MINI_F32_UNARY_S, MINI_F64_ARITH_RS, MINI_F64_CMP_RS_R,
-    MINI_F64_CVT_S, MINI_F64_LOAD_MEM0_OFF, MINI_F64_MINMAX_RS, MINI_F64_PROMOTE_S,
+    MINI_BR_I64_NE_SS, MINI_BR_U32_LE_SS, MINI_BR_U64_LT_SS, MINI_COPY_RI, MINI_COPY_RS,
+    MINI_COPY_S_F32R, MINI_COPY_S_FR, MINI_COPY_SI, MINI_COPY_SR, MINI_COPY_SS, MINI_F32_ARITH_RS,
+    MINI_F32_CMP_RS_R, MINI_F32_CVT_S, MINI_F32_DEMOTE_S, MINI_F32_LOAD_MEM0_OFF,
+    MINI_F32_MINMAX_RS, MINI_F32_REINTERP_I32, MINI_F32_STORE_SR, MINI_F32_TRUNC_S,
+    MINI_F32_TRUNC_SAT_S, MINI_F32_UNARY_S, MINI_F64_ARITH_RS, MINI_F64_CMP_RS_R, MINI_F64_CVT_S,
+    MINI_F64_LOAD_MEM0_OFF, MINI_F64_MINMAX_RS, MINI_F64_PROMOTE_S, MINI_F64_REINTERP_I64,
     MINI_F64_STORE_SR, MINI_F64_TRUNC_S, MINI_F64_TRUNC_SAT_S, MINI_F64_UNARY_S,
     MINI_GLOBAL_GET_F32, MINI_GLOBAL_GET_F64, MINI_GLOBAL_GET_R, MINI_GLOBAL_SET_S,
     MINI_I8_LOAD_MEM0_OFF, MINI_I16_LOAD_MEM0_OFF, MINI_I32_ADD_RS_WB, MINI_I32_ADD_SI_WB,
@@ -50,12 +51,12 @@ use super::prepass::{
     MINI_I64_BITCOUNT_S, MINI_I64_DIV_S, MINI_I64_DIV_U, MINI_I64_EQ_RS_R, MINI_I64_EQ_SS_R,
     MINI_I64_LE_SS_R, MINI_I64_LOAD_MEM0_OFF, MINI_I64_LT_IS_R, MINI_I64_LT_RS_R, MINI_I64_LT_SI_R,
     MINI_I64_LT_SS_R, MINI_I64_MUL_SS_WR, MINI_I64_NE_RS_R, MINI_I64_NE_SS_R, MINI_I64_OR_SS_WR,
-    MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32, MINI_I64_SEXT32_S, MINI_I64_SHL_SI,
-    MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR, MINI_I64_XOR_SS_WR, MINI_RETURN_F_R,
-    MINI_RETURN_F32_R, MINI_RETURN_R, MINI_RETURN_S, MINI_RETURN_VOID, MINI_SELECT,
-    MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R, MINI_U32_LE_SS_R,
-    MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R, MINI_U64_LT_SS_R,
-    MINI_U64_SHR_SI, MiniCode,
+    MINI_I64_REINTERP_F64, MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32, MINI_I64_SEXT32_S,
+    MINI_I64_SHL_SI, MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR, MINI_I64_XOR_SS_WR,
+    MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R, MINI_RETURN_R, MINI_RETURN_S,
+    MINI_RETURN_VOID, MINI_SELECT, MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R,
+    MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R,
+    MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MiniCode,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -131,6 +132,10 @@ std::thread_local! {
     /// owned by the caller for the duration of the run; `count` is its length.
     static GLOBALS_CTX: core::cell::Cell<(*const *mut u64, usize)> =
         const { core::cell::Cell::new((core::ptr::null(), 0)) };
+    /// Set by [`MINI_RETURN_BAIL`] when the kernel hits an instruction that
+    /// requires falling back to the stock executor (e.g. a tail call or an
+    /// internal call the kernel cannot handle). Cleared at each run entry.
+    static BAIL_TO_STOCK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Records the per-run global raw-pointer table (see [`GLOBALS_CTX`]). The caller
@@ -168,11 +173,18 @@ extern "C" fn global_set(idx: i64, val: i64) {
 }
 
 /// Sets the linear-memory context for the next kernel run and clears the
-/// per-run store flag and trap code.
+/// per-run store flag, trap code, and bail flag.
 fn set_mem_ctx(base: i64, len: i64) {
     MEM_CTX.with(|c| c.set((base, len)));
     MEM_DID_STORE.with(|d| d.set(false));
     TRAP_CODE.with(|c| c.set(crate::TrapCode::MemoryOutOfBounds));
+    BAIL_TO_STOCK.with(|b| b.set(false));
+}
+
+/// Returns `true` (once) if the last kernel run hit a `MINI_RETURN_BAIL`
+/// instruction. Clears the flag on read.
+pub fn take_bail_to_stock() -> bool {
+    BAIL_TO_STOCK.with(|b| b.replace(false))
 }
 
 /// Flags a trap from a residual (e.g. a trapping f64→int conversion), recording
@@ -899,6 +911,16 @@ fn wasm_mainloop(
                 state.slots[dst] = state.accum[0];
                 pc += 2;
             }
+            MINI_COPY_RS => {
+                let src = program[pc + 1] as usize;
+                state.accum[0] = state.slots[src];
+                pc += 2;
+            }
+            MINI_COPY_RI => {
+                let imm = program[pc + 1];
+                state.accum[0] = imm;
+                pc += 2;
+            }
             MINI_COPY_S_FR => {
                 let dst = program[pc + 1] as usize;
                 // Spill the f64 accumulator (`freg64`) — a bit-identical 64-bit move.
@@ -1603,6 +1625,17 @@ fn wasm_mainloop(
                 state.accum[2] = state.accum[0] & 0xFFFF_FFFF;
                 pc += 1;
             }
+            MINI_I64_REINTERP_F64 => {
+                // i64.reinterpret_f64: the f64 bit pattern in `freg64` → `ireg`.
+                // Both are 64-bit, so a plain copy.
+                state.accum[0] = state.accum[1];
+                pc += 1;
+            }
+            MINI_F64_REINTERP_I64 => {
+                // f64.reinterpret_i64: the i64 bit pattern in `ireg` → `freg64`.
+                state.accum[1] = state.accum[0];
+                pc += 1;
+            }
             MINI_F32_TRUNC_SAT_S => {
                 let sel = program[pc + 1];
                 let src = program[pc + 2] as usize;
@@ -1833,9 +1866,41 @@ fn wasm_mainloop(
                 }
                 pc += 3;
             }
+            MINI_BR_I64_NE_SS => {
+                let tgt = program[pc + 1] as usize;
+                let lhs = program[pc + 2] as usize;
+                let rhs = program[pc + 3] as usize;
+                if state.slots[lhs] != state.slots[rhs] {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 4;
+            }
+            MINI_BR_U64_LT_SS => {
+                let tgt = program[pc + 1] as usize;
+                let lhs = program[pc + 2] as usize;
+                let rhs = program[pc + 3] as usize;
+                let flip = U64_ORDER_FLIP;
+                if (state.slots[lhs] ^ flip) < (state.slots[rhs] ^ flip) {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 4;
+            }
             MINI_RETURN_S => {
                 let src = program[pc + 1] as usize;
                 return state.slots[src];
+            }
+            MINI_RETURN_BAIL => {
+                // Signal the caller (run_jit) to fall back to stock executor.
+                BAIL_TO_STOCK.with(|b| b.set(true));
+                return 0;
             }
             // MINI_HALT / any other word: ineligible at runtime (should not
             // happen for a statically-eligible MiniProgram).

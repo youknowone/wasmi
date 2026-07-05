@@ -227,6 +227,31 @@ pub(crate) const MINI_U64_LT_SS_R: i64 = 148;
 /// `[MINI_U64_LE_SS_R, lhs_slot, rhs_slot]` (3 words): an unsigned i64 `<=` used
 /// as a 0/1 value into the int accumulator.
 pub(crate) const MINI_U64_LE_SS_R: i64 = 149;
+/// `[MINI_COPY_RS, src_slot]` (2 words): `ireg = slots[src]`. The inverse of
+/// [`MINI_COPY_SR`] — loads a slot value into the integer accumulator.
+pub(crate) const MINI_COPY_RS: i64 = 150;
+/// `[MINI_COPY_RI, imm]` (2 words): `ireg = imm`. Loads an immediate constant
+/// into the integer accumulator.
+pub(crate) const MINI_COPY_RI: i64 = 151;
+/// `[MINI_I64_REINTERP_F64]` (1 word): `ireg = freg64-bits` — a pure 64-bit
+/// bit move from the f64 accumulator to the integer accumulator. Lowers
+/// `I64ReinterpretF64_Rr`.
+pub(crate) const MINI_I64_REINTERP_F64: i64 = 152;
+/// `[MINI_F64_REINTERP_I64]` (1 word): `freg64 = ireg-bits` — a pure 64-bit
+/// bit move from the integer accumulator to the f64 accumulator. Lowers
+/// `F64ReinterpretI64_Rr`.
+pub(crate) const MINI_F64_REINTERP_I64: i64 = 153;
+/// `[MINI_BR_I64_NE_SS, target, lhs_slot, rhs_slot]` (4 words): branch to
+/// `target` if `slots[lhs] != slots[rhs]` (i64 comparison). Also valid for
+/// canonical i32 values (sign-extended i64).
+pub(crate) const MINI_BR_I64_NE_SS: i64 = 154;
+/// `[MINI_BR_U64_LT_SS, target, lhs_slot, rhs_slot]` (4 words): branch to
+/// `target` if `(slots[lhs] as u64) < (slots[rhs] as u64)` (unsigned i64).
+pub(crate) const MINI_BR_U64_LT_SS: i64 = 155;
+/// `[MINI_RETURN_BAIL]` (1 word): signals to the caller that the kernel hit
+/// an instruction it cannot execute (tail call, internal call). The kernel
+/// returns a sentinel and the caller falls back to the stock executor.
+pub(crate) const MINI_RETURN_BAIL: i64 = 156;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -725,6 +750,60 @@ pub(crate) fn prepass(
                 words.extend_from_slice(&[MINI_BR_I32_NE_RI, 0, imm]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
+            // Branch if slot != immediate: load the slot into ireg and use the
+            // accumulator-sourced not-equal branch.
+            OpCode::BranchI32NotEq_Si => {
+                let op = decode::BranchI32NotEq_Si::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = i64::from(u16::from(op.lhs));
+                let imm = i64::from(op.rhs);
+                words.push(MINI_COPY_RS);
+                words.push(lhs);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I32_NE_RI, 0, imm]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if ireg != slot (i32): spill ireg to scratch, then use
+            // the i64 slot-sourced not-equal branch (canonical i32 = sign-extended
+            // i64, so i32 NE = i64 NE).
+            OpCode::BranchI32NotEq_Rs => {
+                let op = decode::BranchI32NotEq_Rs::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let rhs = i64::from(u16::from(op.rhs));
+                words.push(MINI_COPY_SR);
+                words.push(scratch_base);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_SS, 0, scratch_base, rhs]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if slot == immediate (i32): spill slot to ireg, then spill
+            // ireg to scratch, and use the i64 slot-sourced equality branch
+            // (canonical i32 is sign-extended so the i64 comparison is correct).
+            OpCode::BranchI32Eq_Si => {
+                let op = decode::BranchI32Eq_Si::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = i64::from(u16::from(op.lhs));
+                let imm = i64::from(op.rhs);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_EQ_SI, 0, lhs, imm]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if ireg == immediate (i32): spill ireg to scratch and use
+            // the i64 slot-sourced equality branch.
+            OpCode::BranchI32Eq_Ri => {
+                let op = decode::BranchI32Eq_Ri::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = i64::from(op.rhs);
+                words.push(MINI_COPY_SR);
+                words.push(scratch_base);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_EQ_SI, 0, scratch_base, imm]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
             OpCode::Return => {
                 // Every `return` is a bare operand-less op: the translator has
                 // already copied the result (if any) into slot 0 (`Slot::from(0)`,
@@ -807,6 +886,28 @@ pub(crate) fn prepass(
                 let op = decode::U64Copy_Sr::decode(&mut cursor).ok()?;
                 let dst = i64::from(u16::from(op.result));
                 words.extend_from_slice(&[MINI_COPY_SR, dst]);
+            }
+            // Slot-to-accumulator and immediate-to-accumulator copies.
+            OpCode::U64Copy_Rs => {
+                let op = decode::U64Copy_Rs::decode(&mut cursor).ok()?;
+                let src = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_COPY_RS, src]);
+            }
+            OpCode::U64Copy_Ri => {
+                let op = decode::U64Copy_Ri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_COPY_RI, op.value as i64]);
+            }
+            // i32 copy forms: sign-extend to canonical i32 representation.
+            OpCode::U32Copy_Si => {
+                let op = decode::U32Copy_Si::decode(&mut cursor).ok()?;
+                let dst = i64::from(u16::from(op.result));
+                let imm = i64::from(op.value as i32);
+                words.extend_from_slice(&[MINI_COPY_SI, dst, imm]);
+            }
+            OpCode::U32Copy_Ri => {
+                let op = decode::U32Copy_Ri::decode(&mut cursor).ok()?;
+                let imm = i64::from(op.value as i32);
+                words.extend_from_slice(&[MINI_COPY_RI, imm]);
             }
             OpCode::F64Copy_Sr => {
                 let op = decode::F64Copy_Sr::decode(&mut cursor).ok()?;
@@ -1088,6 +1189,21 @@ pub(crate) fn prepass(
                 let rhs = i64::from(u16::from(op.rhs));
                 words.extend_from_slice(&[MINI_I32_ADD_RS_WB, dst, rhs]);
             }
+            // i32 add with accumulator + immediate: pre-materialize the immediate
+            // into a scratch slot, then use the accumulator+slot add.
+            OpCode::I32Add_Rs_ri => {
+                let op = decode::I32Add_Rs_ri::decode(&mut cursor).ok()?;
+                let dst = i64::from(u16::from(Slot::from(op.result)));
+                let imm = i64::from(op.rhs);
+                words.extend_from_slice(&[
+                    MINI_COPY_SI,
+                    scratch_base,
+                    imm,
+                    MINI_I32_ADD_RS_WB,
+                    dst,
+                    scratch_base,
+                ]);
+            }
             OpCode::BranchU32Le_Ss => {
                 let op = decode::BranchU32Le_Ss::decode(&mut cursor).ok()?;
                 let offset = i32::from(op.offset) as isize;
@@ -1096,6 +1212,32 @@ pub(crate) fn prepass(
                 let rhs = i64::from(u16::from(op.rhs));
                 let target_field = words.len() + 1;
                 words.extend_from_slice(&[MINI_BR_U32_LE_SS, 0, lhs, rhs]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if ireg <=_u slot: spill ireg to scratch and use the
+            // slot-slot unsigned LE branch.
+            OpCode::BranchU32Le_Rs => {
+                let op = decode::BranchU32Le_Rs::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let rhs = i64::from(u16::from(op.rhs));
+                words.push(MINI_COPY_SR);
+                words.push(scratch_base);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_U32_LE_SS, 0, scratch_base, rhs]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if imm <_u slot (unsigned i64): materialize the immediate
+            // into a scratch slot and use a slot-slot unsigned LT branch.
+            OpCode::BranchU64Lt_Is => {
+                let op = decode::BranchU64Lt_Is::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = op.lhs as i64;
+                let rhs = i64::from(u16::from(op.rhs));
+                words.extend_from_slice(&[MINI_COPY_SI, scratch_base, imm]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_U64_LT_SS, 0, scratch_base, rhs]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::Branch => {
@@ -1666,6 +1808,18 @@ pub(crate) fn prepass(
                 let op = decode::I64Lt_Rsi::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_I64_LT_SI_R, i64::from(u16::from(op.lhs)), op.rhs]);
             }
+            // i64 compare-as-value with accumulator < immediate: spill ireg to
+            // scratch, then use the slot-sourced lt.
+            OpCode::I64Lt_Rri => {
+                let op = decode::I64Lt_Rri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I64_LT_SI_R,
+                    scratch_base,
+                    op.rhs,
+                ]);
+            }
             OpCode::I32Eq_Rsi => {
                 let op = decode::I32Eq_Rsi::decode(&mut cursor).ok()?;
                 dr_si!(
@@ -2028,6 +2182,13 @@ pub(crate) fn prepass(
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[MINI_F64_LOAD_MEM0_OFF, offset]);
             }
+            // f64 load with pointer from a slot: copy slot to ireg, then load.
+            OpCode::F64LoadMem0Offset16_Rs => {
+                let op = decode::F64LoadMem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_F64_LOAD_MEM0_OFF, offset]);
+            }
             OpCode::F64Add_Rsr => {
                 // f64 add: left operand in a slot, right in the accumulator. Add is
                 // commutative, so `slot + acc` maps to the `acc OP slot` selector arm.
@@ -2067,11 +2228,42 @@ pub(crate) fn prepass(
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[MINI_F32_LOAD_MEM0_OFF, offset]);
             }
+            // f32 load with pointer from a slot: copy slot to ireg, then load.
+            OpCode::F32LoadMem0Offset16_Rs => {
+                let op = decode::F32LoadMem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_F32_LOAD_MEM0_OFF, offset]);
+            }
             OpCode::F32StoreMem0Offset16_Sr => {
                 let op = decode::F32StoreMem0Offset16_Sr::decode(&mut cursor).ok()?;
                 let ptr = i64::from(u16::from(op.ptr));
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[MINI_F32_STORE_SR, ptr, offset]);
+            }
+            // f64 store with pointer in ireg, value in freg64: save ptr to scratch.
+            OpCode::F64StoreMem0Offset16_Rr => {
+                let op = decode::F64StoreMem0Offset16_Rr::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_F64_STORE_SR,
+                    scratch_base,
+                    offset,
+                ]);
+            }
+            // f32 store with pointer in ireg, value in freg32: save ptr to scratch.
+            OpCode::F32StoreMem0Offset16_Rr => {
+                let op = decode::F32StoreMem0Offset16_Rr::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_F32_STORE_SR,
+                    scratch_base,
+                    offset,
+                ]);
             }
             OpCode::F32Add_Rsr => {
                 // f32 add: left operand in a slot, right in the accumulator. Add is
@@ -2461,6 +2653,16 @@ pub(crate) fn prepass(
             OpCode::F32ReinterpretI32_Rr => {
                 let _op = decode::F32ReinterpretI32_Rr::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_F32_REINTERP_I32]);
+            }
+            // Bit-reinterpret between i64 and f64 (accumulator forms only). Pure bit
+            // moves between `ireg` and `freg64`; no residual, no operand word.
+            OpCode::I64ReinterpretF64_Rr => {
+                let _op = decode::I64ReinterpretF64_Rr::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_I64_REINTERP_F64]);
+            }
+            OpCode::F64ReinterpretI64_Rr => {
+                let _op = decode::F64ReinterpretI64_Rr::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_F64_REINTERP_I64]);
             }
             // Saturating f32→integer truncations (never trap). Slot-input (`_Rs`)
             // maps directly; accumulator-input (`_Rr`) copies the f32 accumulator
@@ -3060,6 +3262,49 @@ pub(crate) fn prepass(
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[MINI_I16_LOAD_MEM0_OFF, offset]);
             }
+            // Sub-word loads with pointer from a slot: copy slot to ireg first.
+            OpCode::U32LoadExtend8Mem0Offset16_Rs => {
+                let op = decode::U32LoadExtend8Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_U8_LOAD_MEM0_OFF, offset]);
+            }
+            OpCode::I32LoadExtend8Mem0Offset16_Rs => {
+                let op = decode::I32LoadExtend8Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_I8_LOAD_MEM0_OFF, offset]);
+            }
+            OpCode::U32LoadExtend16Mem0Offset16_Rs => {
+                let op = decode::U32LoadExtend16Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_U16_LOAD_MEM0_OFF, offset]);
+            }
+            OpCode::I32LoadExtend16Mem0Offset16_Rs => {
+                let op = decode::I32LoadExtend16Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_I16_LOAD_MEM0_OFF, offset]);
+            }
+            // Generic load with pre-computed absolute address (not Mem0Offset16).
+            // Only memory 0 is supported by the kernel; bail otherwise.
+            OpCode::U32Load_Ri => {
+                let op = decode::U32Load_Ri::decode(&mut cursor).ok()?;
+                if !op.memory.is_default() {
+                    return None;
+                }
+                let addr = u64::from(op.address) as i64;
+                words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_I32_LOAD_MEM0_OFF, 0]);
+            }
+            OpCode::U64Load_Ri => {
+                let op = decode::U64Load_Ri::decode(&mut cursor).ok()?;
+                if !op.memory.is_default() {
+                    return None;
+                }
+                let addr = u64::from(op.address) as i64;
+                words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_I64_LOAD_MEM0_OFF, 0]);
+            }
             OpCode::U32StoreMem0Offset16_Sr => {
                 // i32.store: pointer in a slot, value in the accumulator.
                 let op = decode::U32StoreMem0Offset16_Sr::decode(&mut cursor).ok()?;
@@ -3124,6 +3369,149 @@ pub(crate) fn prepass(
                 let val = i64::from(u16::from(op.value));
                 words.extend_from_slice(&[MINI_I32_STORE16_RS, offset, val]);
             }
+            // i64.store32: truncate a 64-bit value to 32 bits and store. The
+            // existing 4-byte store residuals handle this identically to i32.store.
+            OpCode::I64StoreWrap32Mem0Offset16_Rs => {
+                let op = decode::I64StoreWrap32Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_I32_STORE_RS, offset, val]);
+            }
+            // --- Narrow store with immediate value (ptr=slot, val=immediate) ---
+            OpCode::I32StoreWrap8Mem0Offset16_Si => {
+                let op = decode::I32StoreWrap8Mem0Offset16_Si::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value as i8);
+                words.extend_from_slice(&[MINI_COPY_RI, imm, MINI_I32_STORE8_SR, ptr, offset]);
+            }
+            OpCode::I32StoreWrap16Mem0Offset16_Si => {
+                let op = decode::I32StoreWrap16Mem0Offset16_Si::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value as i16);
+                words.extend_from_slice(&[MINI_COPY_RI, imm, MINI_I32_STORE16_SR, ptr, offset]);
+            }
+            // --- Narrow store with both operands in slots ---
+            OpCode::I32StoreWrap8Mem0Offset16_Ss => {
+                let op = decode::I32StoreWrap8Mem0Offset16_Ss::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_COPY_RS, val, MINI_I32_STORE8_SR, ptr, offset]);
+            }
+            OpCode::I32StoreWrap16Mem0Offset16_Ss => {
+                let op = decode::I32StoreWrap16Mem0Offset16_Ss::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_COPY_RS, val, MINI_I32_STORE16_SR, ptr, offset]);
+            }
+            // --- Narrow store with ptr in accumulator, val immediate ---
+            OpCode::I32StoreWrap8Mem0Offset16_Ri => {
+                let op = decode::I32StoreWrap8Mem0Offset16_Ri::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value as i8);
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_COPY_RI,
+                    imm,
+                    MINI_I32_STORE8_SR,
+                    scratch_base,
+                    offset,
+                ]);
+            }
+            OpCode::I32StoreWrap16Mem0Offset16_Ri => {
+                let op = decode::I32StoreWrap16Mem0Offset16_Ri::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value as i16);
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_COPY_RI,
+                    imm,
+                    MINI_I32_STORE16_SR,
+                    scratch_base,
+                    offset,
+                ]);
+            }
+            // --- Store with immediate value (ptr=slot, val=immediate) ---
+            // Decompose: load imm into ireg, then use the existing _SR store.
+            OpCode::U64StoreMem0Offset16_Si => {
+                let op = decode::U64StoreMem0Offset16_Si::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let imm = op.value as i64;
+                words.extend_from_slice(&[MINI_COPY_RI, imm, MINI_I64_STORE_SR, ptr, offset]);
+            }
+            OpCode::U32StoreMem0Offset16_Si => {
+                let op = decode::U32StoreMem0Offset16_Si::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value);
+                words.extend_from_slice(&[MINI_COPY_RI, imm, MINI_I32_STORE_SR, ptr, offset]);
+            }
+            // --- Store with both operands in slots (ptr=slot, val=slot) ---
+            // Decompose: load val slot into ireg, then use the existing _SR store.
+            OpCode::U64StoreMem0Offset16_Ss => {
+                let op = decode::U64StoreMem0Offset16_Ss::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_COPY_RS, val, MINI_I64_STORE_SR, ptr, offset]);
+            }
+            OpCode::U32StoreMem0Offset16_Ss => {
+                let op = decode::U32StoreMem0Offset16_Ss::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_COPY_RS, val, MINI_I32_STORE_SR, ptr, offset]);
+            }
+            // --- Store with immediate value (ptr=accumulator, val=immediate) ---
+            // Decompose: save ptr(ireg) to scratch, load imm into ireg, then _SR.
+            OpCode::U64StoreMem0Offset16_Ri => {
+                let op = decode::U64StoreMem0Offset16_Ri::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                let imm = op.value as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_COPY_RI,
+                    imm,
+                    MINI_I64_STORE_SR,
+                    scratch_base,
+                    offset,
+                ]);
+            }
+            OpCode::U32StoreMem0Offset16_Ri => {
+                let op = decode::U32StoreMem0Offset16_Ri::decode(&mut cursor).ok()?;
+                let offset = u64::from(op.offset) as i64;
+                let imm = i64::from(op.value);
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_COPY_RI,
+                    imm,
+                    MINI_I32_STORE_SR,
+                    scratch_base,
+                    offset,
+                ]);
+            }
+            // --- Load with pointer from a slot (ptr=slot, result=accumulator) ---
+            // Decompose: copy slot to ireg, then use existing load (reads ptr from ireg).
+            OpCode::U64LoadMem0Offset16_Rs => {
+                let op = decode::U64LoadMem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_I64_LOAD_MEM0_OFF, offset]);
+            }
+            OpCode::U32LoadMem0Offset16_Rs => {
+                let op = decode::U32LoadMem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_I32_LOAD_MEM0_OFF, offset]);
+            }
             OpCode::I32Add_Rss => {
                 // slot + slot -> reg (no slot result): reuse the slot-and-reg add
                 // and route its slot write to a throwaway scratch slot.
@@ -3138,6 +3526,18 @@ pub(crate) fn prepass(
             }
             OpCode::I64Sext32_Rs => {
                 let op = decode::I64Sext32_Rs::decode(&mut cursor).ok()?;
+                let src = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[MINI_I64_SEXT32_S, src]);
+            }
+            // i32.wrap_i64: truncate i64 to i32. In the kernel's canonical i32
+            // representation (sign-extended low 32 bits), this is equivalent to
+            // i64.extend_i32_s — reuse the same MINI op.
+            OpCode::I32WrapI64_Rr => {
+                decode::I32WrapI64_Rr::decode(&mut cursor).ok()?;
+                words.push(MINI_I64_SEXT32);
+            }
+            OpCode::I32WrapI64_Rs => {
+                let op = decode::I32WrapI64_Rs::decode(&mut cursor).ok()?;
                 let src = i64::from(u16::from(op.value));
                 words.extend_from_slice(&[MINI_I64_SEXT32_S, src]);
             }
@@ -3225,6 +3625,18 @@ pub(crate) fn prepass(
                 let target_byte = pos.checked_add_signed(offset)?;
                 let target_field = words.len() + 1;
                 words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, op.rhs]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Branch if ireg == immediate: spill ireg to scratch and use the
+            // slot-sourced equality branch.
+            OpCode::BranchI64Eq_Ri => {
+                let op = decode::BranchI64Eq_Ri::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                words.push(MINI_COPY_SR);
+                words.push(scratch_base);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_EQ_SI, 0, scratch_base, op.rhs]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
             // Integer global read: `ireg = global_get(idx)`. Only `GlobalGetU64_R`
@@ -3327,8 +3739,41 @@ pub(crate) fn prepass(
                 ]);
                 uses_globals = true;
             }
+            // Tail calls and internal calls: the kernel cannot handle these
+            // directly. Emit MINI_RETURN_BAIL so the kernel runs the code
+            // before the call/tail-call and then signals the caller to fall
+            // back to the stock executor. This makes the function eligible
+            // (the hot loop body before the call benefits from JIT) instead of
+            // rejecting the entire function.
+            OpCode::ReturnCallIndirect_R => {
+                let _op = decode::ReturnCallIndirect_R::decode(&mut cursor).ok()?;
+                words.push(MINI_RETURN_BAIL);
+            }
+            OpCode::ReturnCallIndirect_S => {
+                let _op = decode::ReturnCallIndirect_S::decode(&mut cursor).ok()?;
+                words.push(MINI_RETURN_BAIL);
+            }
+            OpCode::ReturnCallInternal => {
+                let _op = decode::ReturnCallInternal::decode(&mut cursor).ok()?;
+                words.push(MINI_RETURN_BAIL);
+            }
+            OpCode::CallInternal => {
+                // Bail the entire function — CallInternal requires frame
+                // management the kernel cannot perform. The stock executor
+                // handles it natively.
+                let _op = decode::CallInternal::decode(&mut cursor).ok()?;
+                return None;
+            }
             // Any other op makes the function ineligible for the JIT tier.
-            _ => return None,
+            #[allow(unused_variables)]
+            other => {
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    let pos = total - cursor.len();
+                    std::eprintln!("[majit-prepass] bail at op {other:?} (byte ~{pos})");
+                }
+                return None;
+            }
         }
     }
 
@@ -3561,6 +4006,38 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::U64StoreMem0Offset16_Rs => dec!(U64StoreMem0Offset16_Rs),
             OpCode::I32StoreWrap8Mem0Offset16_Rs => dec!(I32StoreWrap8Mem0Offset16_Rs),
             OpCode::I32StoreWrap16Mem0Offset16_Rs => dec!(I32StoreWrap16Mem0Offset16_Rs),
+            OpCode::U64StoreMem0Offset16_Si => dec!(U64StoreMem0Offset16_Si),
+            OpCode::U32StoreMem0Offset16_Si => dec!(U32StoreMem0Offset16_Si),
+            OpCode::U64StoreMem0Offset16_Ss => dec!(U64StoreMem0Offset16_Ss),
+            OpCode::U32StoreMem0Offset16_Ss => dec!(U32StoreMem0Offset16_Ss),
+            OpCode::U64StoreMem0Offset16_Ri => dec!(U64StoreMem0Offset16_Ri),
+            OpCode::U32StoreMem0Offset16_Ri => dec!(U32StoreMem0Offset16_Ri),
+            OpCode::U64LoadMem0Offset16_Rs => dec!(U64LoadMem0Offset16_Rs),
+            OpCode::U32LoadMem0Offset16_Rs => dec!(U32LoadMem0Offset16_Rs),
+            OpCode::I32WrapI64_Rr => dec!(I32WrapI64_Rr),
+            OpCode::I32WrapI64_Rs => dec!(I32WrapI64_Rs),
+            OpCode::F64LoadMem0Offset16_Rs => dec!(F64LoadMem0Offset16_Rs),
+            OpCode::F32LoadMem0Offset16_Rs => dec!(F32LoadMem0Offset16_Rs),
+            OpCode::F64StoreMem0Offset16_Rr => dec!(F64StoreMem0Offset16_Rr),
+            OpCode::F32StoreMem0Offset16_Rr => dec!(F32StoreMem0Offset16_Rr),
+            OpCode::U32LoadExtend8Mem0Offset16_Rs => dec!(U32LoadExtend8Mem0Offset16_Rs),
+            OpCode::I32LoadExtend8Mem0Offset16_Rs => dec!(I32LoadExtend8Mem0Offset16_Rs),
+            OpCode::U32LoadExtend16Mem0Offset16_Rs => dec!(U32LoadExtend16Mem0Offset16_Rs),
+            OpCode::I32LoadExtend16Mem0Offset16_Rs => dec!(I32LoadExtend16Mem0Offset16_Rs),
+            OpCode::I32StoreWrap8Mem0Offset16_Si => dec!(I32StoreWrap8Mem0Offset16_Si),
+            OpCode::I32StoreWrap16Mem0Offset16_Si => dec!(I32StoreWrap16Mem0Offset16_Si),
+            OpCode::I32StoreWrap8Mem0Offset16_Ss => dec!(I32StoreWrap8Mem0Offset16_Ss),
+            OpCode::I32StoreWrap16Mem0Offset16_Ss => dec!(I32StoreWrap16Mem0Offset16_Ss),
+            OpCode::I32StoreWrap8Mem0Offset16_Ri => dec!(I32StoreWrap8Mem0Offset16_Ri),
+            OpCode::I32StoreWrap16Mem0Offset16_Ri => dec!(I32StoreWrap16Mem0Offset16_Ri),
+            OpCode::I32Add_Rs_ri => dec!(I32Add_Rs_ri),
+            OpCode::BranchI32NotEq_Si => dec!(BranchI32NotEq_Si),
+            OpCode::BranchI32Eq_Si => dec!(BranchI32Eq_Si),
+            OpCode::BranchI32Eq_Ri => dec!(BranchI32Eq_Ri),
+            OpCode::BranchI64Eq_Ri => dec!(BranchI64Eq_Ri),
+            OpCode::BranchU32Le_Rs => dec!(BranchU32Le_Rs),
+            OpCode::I64Lt_Rri => dec!(I64Lt_Rri),
+            OpCode::I64StoreWrap32Mem0Offset16_Rs => dec!(I64StoreWrap32Mem0Offset16_Rs),
             OpCode::I64Sext32_Rr => dec!(I64Sext32_Rr),
             OpCode::I64Sext32_Rs => dec!(I64Sext32_Rs),
             OpCode::I64Add_Rs_rs => dec!(I64Add_Rs_rs),
@@ -3607,6 +4084,15 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::BranchI64NotEq_Ri => dec!(BranchI64NotEq_Ri),
             OpCode::BranchI64NotEq_Ss => dec!(BranchI64NotEq_Ss),
             OpCode::BranchI64NotEq_Si => dec!(BranchI64NotEq_Si),
+            OpCode::I64ReinterpretF64_Rr => dec!(I64ReinterpretF64_Rr),
+            OpCode::F64ReinterpretI64_Rr => dec!(F64ReinterpretI64_Rr),
+            OpCode::U32Load_Ri => dec!(U32Load_Ri),
+            OpCode::U64Load_Ri => dec!(U64Load_Ri),
+            OpCode::BranchU64Lt_Is => dec!(BranchU64Lt_Is),
+            OpCode::CallInternal => dec!(CallInternal),
+            OpCode::ReturnCallIndirect_R => dec!(ReturnCallIndirect_R),
+            OpCode::ReturnCallIndirect_S => dec!(ReturnCallIndirect_S),
+            OpCode::ReturnCallInternal => dec!(ReturnCallInternal),
             other => {
                 let rest = &cursor[..cursor.len().min(16)];
                 std::eprintln!("  @{pos:>3}: UNKNOWN {other:?}  next_bytes={rest:02x?}");
@@ -6302,14 +6788,16 @@ mod tests {
     /// caller will fall back to the stock executor.
     #[test]
     fn prepass_rejects_unsupported_ops() {
-        // `memory.size` / loads are not in the subset.
-        const MEM_WAT: &str = r#"
+        // `call_indirect` without a table (host-provided) is not in the
+        // subset — the prepass cannot handle it.
+        const INDIRECT_WAT: &str = r#"
             (module
-                (memory 1)
+                (type $ft (func (param i32) (result i32)))
+                (table $t 10 funcref)
                 (func (export "f") (param $p i32) (result i32)
-                    (i32.load (local.get $p))))
+                    (call_indirect $t (type $ft) (local.get $p) (i32.const 0))))
         "#;
-        let wasm = wat::parse_str(MEM_WAT).expect("wat parse");
+        let wasm = wat::parse_str(INDIRECT_WAT).expect("wat parse");
         let engine = Engine::default();
         let module = Module::new(&engine, &wasm[..]).expect("module");
         let ef = module.engine_func_by_index(0).expect("engine func 0");
@@ -6318,7 +6806,7 @@ mod tests {
             .expect("function compiled");
         assert!(
             result.is_none(),
-            "memory op must make the function ineligible"
+            "call_indirect op must make the function ineligible"
         );
     }
 }
