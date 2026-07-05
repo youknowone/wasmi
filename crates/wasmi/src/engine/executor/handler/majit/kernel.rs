@@ -2924,25 +2924,17 @@ fn new_driver(
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
             eprintln!(
-                "[majit-kernel] COMPILE #{} green={:?} (ops {} → {})",
+                "[majit-kernel] COMPILE #{} (ops {} → {})",
                 KERNEL_COMPILES.load(Ordering::Relaxed),
-                _green_key,
-                _ops_before,
-                _ops_after,
+                _ops_before, _ops_after,
             );
         }
     });
-    driver.set_on_guard_failure(|_green_key, _fail_index, _fail_count| {
+    driver.set_on_guard_failure(|_green_key, _a, _b| {
         let n = KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "std")]
         if n < 5 && std::env::var_os("WASMI_MAJIT_STATS").is_some() {
-            eprintln!(
-                "[majit-kernel] GUARD_FAIL #{} green={:?} fail_index={} fail_count={}",
-                n + 1,
-                _green_key,
-                _fail_index,
-                _fail_count,
-            );
+            eprintln!("[majit-kernel] GUARD_FAIL #{}", n + 1);
         }
     });
     let seed = WasmKernelState {
