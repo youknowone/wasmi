@@ -50,8 +50,8 @@ use super::prepass::{
     MINI_I64_LT_SS_R, MINI_I64_MUL_SS_WR, MINI_I64_NE_RS_R, MINI_I64_NE_SS_R, MINI_I64_OR_SS_WR,
     MINI_I64_REINTERP_F64, MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32, MINI_I64_SEXT32_S,
     MINI_I64_SHL_SI, MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR, MINI_I64_XOR_SS_WR,
-    MINI_CALL_RESIDUAL, MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R, MINI_RETURN_R,
-    MINI_RETURN_S, MINI_YIELD_STOCK,
+    MINI_CALL_RESIDUAL, MINI_MEMORY_SIZE, MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R,
+    MINI_RETURN_R, MINI_RETURN_S, MINI_TRAP, MINI_YIELD_STOCK,
     MINI_RETURN_VOID, MINI_SELECT, MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R,
     MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R,
     MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MiniCode,
@@ -2365,6 +2365,22 @@ fn wasm_mainloop(
                 CALL_STAGING_LEN.with(|c| c.set(n));
                 state.accum[0] = call_internal_residual(func_addr, n as i64);
                 pc += 4;
+            }
+            MINI_TRAP => {
+                // Unconditional trap (wasm `unreachable`). Set the trap code
+                // and return so run_jit can surface the trap.
+                let code = program[pc + 1];
+                set_residual_trap(
+                    crate::TrapCode::try_from(code as u8)
+                        .unwrap_or(crate::TrapCode::UnreachableCodeReached),
+                );
+                return 0;
+            }
+            MINI_MEMORY_SIZE => {
+                // Return memory size in pages (mem_len / 65536) into ireg.
+                let (_base, len) = MEM_CTX.with(|c| c.get());
+                state.accum[0] = if len > 0 { len / 65536 } else { 0 };
+                pc += 1;
             }
             MINI_YIELD_STOCK => {
                 // Yield to the stock executor at the recorded byte offset.
