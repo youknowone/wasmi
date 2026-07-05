@@ -274,49 +274,9 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             globals_table.as_ptr(),
             globals_table.len(),
         );
-        super::majit::kernel::clear_call_runner();
-        // Return the callee Stack to the TLS cache for reuse.
-        CALLEE_STACK_CACHE.with(|c| {
-            *c.borrow_mut() = Some(call_ctx.callee_stack);
-        });
-        // DRIVER was already borrowed (nested call from a yield-to-stock
-        // resume). Fall back to the stock executor for this call.
-        let result = match result {
-            Some(r) => r,
-            None => return self.execute_stock(),
-        };
-        // The kernel yielded at a CallInternal. Flush the kernel's computed
-        // slots to the real frame and resume the stock executor AT that
-        // instruction — not from byte 0. This avoids double-applying side
-        // effects the kernel already committed via residual calls.
-        if super::majit::kernel::take_yield_to_stock() {
-            // A yield after a residual trap is not safe: the kernel continued
-            // with dummy values after the trap and the flushed slots may be
-            // corrupted. Fall back to the trap/stock-from-start path instead.
-            if super::majit::kernel::take_mem_trap() {
-                if super::majit::kernel::take_mem_did_store() {
-                    return Err(ExecutionOutcome::from(
-                        super::majit::kernel::take_trap_code(),
-                    ));
-                }
-                return self.execute_stock();
-            }
-            let flushed = super::majit::kernel::take_yield_slots();
-            let byte_offset = super::majit::kernel::take_yield_offset() as usize;
-            // Flush kernel slots to the real frame so the CallInternal handler
-            // reads correct parameter values from the frame. Each dense slot
-            // maps to its original frame position via slot_map.
-            for (dense_idx, &val) in flushed.iter().enumerate() {
-                let orig = slot_map.get(dense_idx).copied().unwrap_or(dense_idx as u16);
-                unsafe { self.callee_sp.set::<i64>(Slot::from(orig), val) };
-            }
-            // Resume the stock executor at the CallInternal instruction.
-            let yield_ip = unsafe { self.callee_ip.add(byte_offset) };
-            return self.execute_stock_at(yield_ip);
-        }
-        // The kernel hit a tail call it cannot handle. Fall back to the stock
-        // executor if no stores were committed; otherwise the stock re-run
-        // would double-apply stores.
+        // The kernel hit an instruction it cannot handle (tail call, internal
+        // call). Fall back to the stock executor if no stores were committed;
+        // otherwise the stock re-run would double-apply stores.
         if super::majit::kernel::take_bail_to_stock() {
             if !super::majit::kernel::take_mem_did_store() {
                 return self.execute_stock();
