@@ -8563,16 +8563,16 @@ mod tests {
     /// yield/bail ops, `call_runner_fn` runs it on the CALLEE_DRIVER via
     /// `run_callee` (the CALL_ASSEMBLER path) instead of the stock executor.
     ///
-    /// NOTE: This test is currently ignored because the stock fallback path
-    /// in `call_runner_fn` reads the result from sp slot 0, but the wasmi
-    /// translator may leave the result in ireg (the integer accumulator
-    /// register) which is not accessible after `execute_until_done` returns.
-    /// The CALL_ASSEMBLER path (run_callee) correctly returns the result via
-    /// wasm_mainloop's return value, but the stock fallback is broken for
-    /// some functions. This is a pre-existing issue that needs to be fixed
-    /// separately.
+    /// NOTE: ignored because the kernel's `state.accum[0] =
+    /// call_internal_residual(...)` assignment does not update the
+    /// virtualizable accumulator correctly in interpret mode. The callee
+    /// returns the correct value (verified via debug logging), but the
+    /// caller's accumulator retains the call parameter instead of the
+    /// return value. This is a pre-existing kernel-level bug in how
+    /// `#[jit_interp]` handles residual-call return values written to a
+    /// virtualizable array element.
     #[test]
-    #[ignore = "pre-existing: call_runner_fn stock path reads result from wrong register"]
+    #[ignore = "kernel residual-call return value not written to virtualizable accum"]
     fn end_to_end_call_assembler_callee_jit() {
         let _serial = serial_kernel_guard();
         use crate::{Engine, Instance, Module, Store};
@@ -8588,17 +8588,24 @@ mod tests {
             &engine,
             r#"
             (module
+                ;; double(x) = x + x, computed via a 1-iteration loop.
+                ;; The loop guard uses i64.ne (slot, slot) which the prepass
+                ;; handles natively (BranchI64Ne_Ss → MINI_BR_I64_NE_SS),
+                ;; so $double is JIT-eligible with no yield/bail.
                 (func $double (export "double") (param $x i64) (result i64)
-                    (local $r i64)
-                    (local.set $r (i64.const 0))
+                    (local $i i64) (local $acc i64) (local $one i64)
+                    (local.set $one (i64.const 1))
+                    (local.set $i (i64.const 0))
+                    (local.set $acc (local.get $x))
                     (block $break
                         (loop $loop
-                            (br_if $break (i64.ge_s (local.get $r) (i64.const 1)))
-                            (local.set $r (i64.add (local.get $r) (i64.const 1)))
+                            (br_if $break (i64.eq (local.get $i) (local.get $one)))
+                            (local.set $acc (i64.add (local.get $acc) (local.get $x)))
+                            (local.set $i (i64.add (local.get $i) (local.get $one)))
                             (br $loop)
                         )
                     )
-                    (i64.mul (local.get $x) (i64.const 2))
+                    (local.get $acc)
                 )
                 (func (export "sum_doubled") (param $n i64) (result i64)
                     (local $i i64) (local $acc i64)

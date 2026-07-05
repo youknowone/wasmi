@@ -695,6 +695,10 @@ pub(crate) fn prepass(
     // Set true by the first lowered `global.get`/`global.set` so the caller only
     // resolves the instance's global raw pointers when the function needs them.
     let mut uses_globals = false;
+    // Set true when the prepass emits any MINI_YIELD_STOCK, MINI_RETURN_BAIL,
+    // or MINI_TRAP word. Functions with these ops cannot run as callees on the
+    // CALL_ASSEMBLER path (no stock executor to fall back to).
+    let mut has_yield_or_bail = false;
 
     // Integer division / remainder emission helpers, one per addressing form.
     // Each lowers onto a two-slot `$m` kernel arm (`ireg = op(slots[lhs],
@@ -3775,14 +3779,17 @@ pub(crate) fn prepass(
             OpCode::ReturnCallIndirect_R => {
                 let _op = decode::ReturnCallIndirect_R::decode(&mut cursor).ok()?;
                 words.push(MINI_RETURN_BAIL);
+                has_yield_or_bail = true;
             }
             OpCode::ReturnCallIndirect_S => {
                 let _op = decode::ReturnCallIndirect_S::decode(&mut cursor).ok()?;
                 words.push(MINI_RETURN_BAIL);
+                has_yield_or_bail = true;
             }
             OpCode::ReturnCallInternal => {
                 let _op = decode::ReturnCallInternal::decode(&mut cursor).ok()?;
                 words.push(MINI_RETURN_BAIL);
+                has_yield_or_bail = true;
             }
             OpCode::CallInternal => {
                 // Execute the call via a #[dont_look_inside] residual. The
@@ -3814,6 +3821,7 @@ pub(crate) fn prepass(
                 // ptr+offset both dynamic (Reg operands). Yield to stock.
                 let _op = decode::U32LoadExtend8_Rr::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U32LoadExtend16_Ri => {
                 let op = decode::U32LoadExtend16_Ri::decode(&mut cursor).ok()?;
@@ -3838,6 +3846,7 @@ pub(crate) fn prepass(
                 // Indirect call — yield to stock executor.
                 let _op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             // -- Bail ops that unblock runtime infrastructure functions --
             // These addressing forms are uncommon but appear in 788-1590 byte
@@ -3846,66 +3855,82 @@ pub(crate) fn prepass(
             OpCode::BranchU32Lt_Ir => {
                 let _op = decode::BranchU32Lt_Ir::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::I64Add_Rs_ri => {
                 let _op = decode::I64Add_Rs_ri::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U64LoadExtend32Mem0Offset16_Rs => {
                 let _op = decode::U64LoadExtend32Mem0Offset16_Rs::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U32Store_Ir => {
                 let _op = decode::U32Store_Ir::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U32Store_Ii => {
                 let _op = decode::U32Store_Ii::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::I64Lt_Rsr => {
                 let _op = decode::I64Lt_Rsr::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchU32Lt_Rs => {
                 let _op = decode::BranchU32Lt_Rs::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchU64Lt_Ir => {
                 let _op = decode::BranchU64Lt_Ir::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchU32Lt_Ss => {
                 let _op = decode::BranchU32Lt_Ss::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchTable_R => {
                 let _op = decode::BranchTable_R::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchI32Lt_Ri => {
                 let _op = decode::BranchI32Lt_Ri::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::F64NotLe_Rss => {
                 let _op = decode::F64NotLe_Rss::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U32Select_Rsii => {
                 let _op = decode::U32Select_Rsii::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::I32Eq_Rss => {
                 let _op = decode::I32Eq_Rss::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::BranchU64Lt_Si => {
                 let _op = decode::BranchU64Lt_Si::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             OpCode::U64Shr_Rir => {
                 let _op = decode::U64Shr_Rir::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                has_yield_or_bail = true;
             }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
@@ -3930,9 +3955,6 @@ pub(crate) fn prepass(
         }
     }
 
-    let has_yield_or_bail = words
-        .iter()
-        .any(|&w| w == MINI_YIELD_STOCK || w == MINI_RETURN_BAIL || w == MINI_TRAP);
     Some(MiniProgram {
         words,
         num_slots: usize::from(len_local_slots) + usize::from(len_stack_slots),
