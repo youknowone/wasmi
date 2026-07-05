@@ -4210,8 +4210,12 @@ pub(crate) fn prepass(
                 ]);
             }
             OpCode::Trap => {
-                let _op = decode::Trap::decode(&mut cursor).ok()?;
-                return None;
+                // Unconditional trap (wasm `unreachable`). The kernel sets
+                // the trap code and returns; run_jit surfaces it.
+                let op = decode::Trap::decode(&mut cursor).ok()?;
+                let code = u8::from(op.trap_code) as i64;
+                words.extend_from_slice(&[MINI_TRAP, code]);
+                has_yield_or_bail = true;
             }
             OpCode::MemorySize => {
                 let op = decode::MemorySize::decode(&mut cursor).ok()?;
@@ -4282,19 +4286,41 @@ pub(crate) fn prepass(
                 ]);
             }
             OpCode::U64LoadExtend32Mem0Offset16_Rs => {
-                let _op = decode::U64LoadExtend32Mem0Offset16_Rs::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // i64.load32_u: load 4 bytes from mem[slot[ptr]+offset],
+                // zero-extend to i64. Decompose: i32 load (sign-extends)
+                // then mask to zero-extend.
+                let op = decode::U64LoadExtend32Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                let ptr = i64::from(u16::from(op.ptr));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_RS, ptr,
+                    MINI_I32_LOAD_MEM0_OFF, offset,
+                    MINI_COPY_SR, scratch_base,
+                    MINI_I64_AND_SI_WR, scratch_base, 0x_FFFF_FFFF_i64,
+                ]);
             }
             OpCode::U32Store_Ir => {
-                let _op = decode::U32Store_Ir::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // i32.store at absolute address, value in ireg. Memory 0 only.
+                let op = decode::U32Store_Ir::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 { return None; }
+                let addr = u64::from(op.address) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_SR, scratch_base,   // scratch = ireg (value)
+                    MINI_COPY_RI, addr,           // ireg = address (ptr)
+                    MINI_I32_STORE_RS, 0, scratch_base,
+                ]);
             }
             OpCode::U32Store_Ii => {
-                let _op = decode::U32Store_Ii::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // i32.store at absolute address, value is immediate. Memory 0 only.
+                let op = decode::U32Store_Ii::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 { return None; }
+                let addr = u64::from(op.address) as i64;
+                let val = i64::from(u32::from(op.value));
+                words.extend_from_slice(&[
+                    MINI_COPY_SI, scratch_base, val,  // scratch = value
+                    MINI_COPY_RI, addr,               // ireg = address (ptr)
+                    MINI_I32_STORE_RS, 0, scratch_base,
+                ]);
             }
             OpCode::I64Lt_Rsr => {
                 // ireg = (slot[lhs] < ireg) (signed i64 comparison, 0/1 value).
@@ -4373,14 +4399,25 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::F64NotLe_Rss => {
+                // !(lhs <= rhs) for f64. Requires slot→freg64 copy which has
+                // no dedicated MINI op; yield to stock.
                 let _op = decode::F64NotLe_Rss::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
             }
             OpCode::U32Select_Rsii => {
-                let _op = decode::U32Select_Rsii::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // ireg = slot[condition] ? true_val : false_val (both u32 imm).
+                // Materialize both into scratch, load condition into ireg, select.
+                let op = decode::U32Select_Rsii::decode(&mut cursor).ok()?;
+                let cond = i64::from(u16::from(op.condition));
+                let t = i64::from(u32::from(op.true_val));
+                let f = i64::from(u32::from(op.false_val));
+                words.extend_from_slice(&[
+                    MINI_COPY_SI, scratch_base, t,
+                    MINI_COPY_SI, scratch_base + 1, f,
+                    MINI_COPY_RS, cond,
+                    MINI_SELECT, scratch_base, scratch_base + 1,
+                ]);
             }
             OpCode::I32Eq_Rss => {
                 // ireg = (slot[lhs] == slot[rhs]) (i32 comparison, 0/1 value).
