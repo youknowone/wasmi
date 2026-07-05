@@ -2333,9 +2333,21 @@ fn new_driver(
     driver.set_trace_eagerness(u32::MAX);
     driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
         KERNEL_COMPILES.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "std")]
+        if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+            eprintln!(
+                "[majit-kernel] COMPILE #{} (ops {} → {})",
+                KERNEL_COMPILES.load(Ordering::Relaxed),
+                _ops_before, _ops_after,
+            );
+        }
     });
     driver.set_on_guard_failure(|_green_key, _a, _b| {
-        KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        let n = KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "std")]
+        if n < 5 && std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+            eprintln!("[majit-kernel] GUARD_FAIL #{}", n + 1);
+        }
     });
     let seed = WasmKernelState {
         slots: init_slots.to_vec(),
