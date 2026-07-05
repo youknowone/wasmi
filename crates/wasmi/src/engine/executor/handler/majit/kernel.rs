@@ -31,33 +31,33 @@ use std::eprintln;
 use super::prepass::{
     MINI_BR_ALWAYS, MINI_BR_I32_LE_SS, MINI_BR_I32_LT_SI, MINI_BR_I32_NE_RI, MINI_BR_I64_EQ_SI,
     MINI_BR_I64_EQ_SS, MINI_BR_I64_LE_SI, MINI_BR_I64_LE_SS, MINI_BR_I64_LT_IR, MINI_BR_I64_NE_RI,
-    MINI_BR_I64_NE_SS, MINI_BR_U32_LE_SS, MINI_BR_U64_LT_SS, MINI_COPY_RI, MINI_COPY_RS,
-    MINI_COPY_S_F32R, MINI_COPY_S_FR, MINI_COPY_SI, MINI_COPY_SR, MINI_COPY_SS, MINI_F32_ARITH_RS,
-    MINI_F32_CMP_RS_R, MINI_F32_CVT_S, MINI_F32_DEMOTE_S, MINI_F32_LOAD_MEM0_OFF,
-    MINI_F32_MINMAX_RS, MINI_F32_REINTERP_I32, MINI_F32_STORE_SR, MINI_F32_TRUNC_S,
-    MINI_F32_TRUNC_SAT_S, MINI_F32_UNARY_S, MINI_F64_ARITH_RS, MINI_F64_CMP_RS_R, MINI_F64_CVT_S,
-    MINI_F64_LOAD_MEM0_OFF, MINI_F64_MINMAX_RS, MINI_F64_PROMOTE_S, MINI_F64_REINTERP_I64,
-    MINI_F64_STORE_SR, MINI_F64_TRUNC_S, MINI_F64_TRUNC_SAT_S, MINI_F64_UNARY_S,
-    MINI_GLOBAL_GET_F32, MINI_GLOBAL_GET_F64, MINI_GLOBAL_GET_R, MINI_GLOBAL_SET_S,
-    MINI_I8_LOAD_MEM0_OFF, MINI_I16_LOAD_MEM0_OFF, MINI_I32_ADD_RS_WB, MINI_I32_ADD_SI_WB,
-    MINI_I32_ADD_SS_WB, MINI_I32_AND_SS_WR, MINI_I32_BITCOUNT_S, MINI_I32_DIV_S, MINI_I32_DIV_U,
-    MINI_I32_EQ_RS_R, MINI_I32_EQ_SS_R, MINI_I32_LE_RS_R, MINI_I32_LE_SS_R, MINI_I32_LOAD_MEM0_OFF,
-    MINI_I32_LT_RS_R, MINI_I32_LT_SI_R, MINI_I32_LT_SR_R, MINI_I32_LT_SS_R, MINI_I32_MUL_SS_WR,
-    MINI_I32_NE_RS_R, MINI_I32_NE_SS_R, MINI_I32_OR_SS_WR, MINI_I32_REINTERP_F32, MINI_I32_REM_S,
-    MINI_I32_REM_U, MINI_I32_ROTL_SI, MINI_I32_ROTR_SI, MINI_I32_SHL_SI, MINI_I32_STORE_RS,
-    MINI_I32_STORE_SR, MINI_I32_STORE8_RS, MINI_I32_STORE8_SR, MINI_I32_STORE16_RS,
-    MINI_I32_STORE16_SR, MINI_I32_SUB_SS_WR, MINI_I32_XOR_SS_WR, MINI_I64_ADD_RS_WB,
-    MINI_I64_ADD_SS_WB, MINI_I64_ADD_SS_WR, MINI_I64_AND_RI_WR, MINI_I64_AND_SI_WR,
-    MINI_I64_BITCOUNT_S, MINI_I64_DIV_S, MINI_I64_DIV_U, MINI_I64_EQ_RS_R, MINI_I64_EQ_SS_R,
-    MINI_I64_LE_SS_R, MINI_I64_LOAD_MEM0_OFF, MINI_I64_LT_IS_R, MINI_I64_LT_RS_R, MINI_I64_LT_SI_R,
-    MINI_I64_LT_SS_R, MINI_I64_MUL_SS_WR, MINI_I64_NE_RS_R, MINI_I64_NE_SS_R, MINI_I64_OR_SS_WR,
-    MINI_I64_REINTERP_F64, MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32, MINI_I64_SEXT32_S,
-    MINI_I64_SHL_SI, MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR, MINI_I64_XOR_SS_WR,
-    MINI_CALL_RESIDUAL, MINI_MEMORY_SIZE, MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R,
-    MINI_RETURN_R, MINI_RETURN_S, MINI_TRAP, MINI_YIELD_STOCK,
-    MINI_RETURN_VOID, MINI_SELECT, MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R,
-    MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R,
-    MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR, MiniCode,
+    MINI_BR_I64_NE_SS, MINI_BR_U32_LE_SS, MINI_BR_U64_LT_SS, MINI_CALL_RESIDUAL, MINI_COPY_RI,
+    MINI_COPY_RS, MINI_COPY_S_F32R, MINI_COPY_S_FR, MINI_COPY_SI, MINI_COPY_SR, MINI_COPY_SS,
+    MINI_F32_ARITH_RS, MINI_F32_CMP_RS_R, MINI_F32_CVT_S, MINI_F32_DEMOTE_S,
+    MINI_F32_LOAD_MEM0_OFF, MINI_F32_MINMAX_RS, MINI_F32_REINTERP_I32, MINI_F32_STORE_SR,
+    MINI_F32_TRUNC_S, MINI_F32_TRUNC_SAT_S, MINI_F32_UNARY_S, MINI_F64_ARITH_RS, MINI_F64_CMP_RS_R,
+    MINI_F64_CVT_S, MINI_F64_LOAD_MEM0_OFF, MINI_F64_MINMAX_RS, MINI_F64_PROMOTE_S,
+    MINI_F64_REINTERP_I64, MINI_F64_STORE_SR, MINI_F64_TRUNC_S, MINI_F64_TRUNC_SAT_S,
+    MINI_F64_UNARY_S, MINI_GLOBAL_GET_F32, MINI_GLOBAL_GET_F64, MINI_GLOBAL_GET_R,
+    MINI_GLOBAL_SET_S, MINI_I8_LOAD_MEM0_OFF, MINI_I16_LOAD_MEM0_OFF, MINI_I32_ADD_RS_WB,
+    MINI_I32_ADD_SI_WB, MINI_I32_ADD_SS_WB, MINI_I32_AND_SS_WR, MINI_I32_BITCOUNT_S,
+    MINI_I32_DIV_S, MINI_I32_DIV_U, MINI_I32_EQ_RS_R, MINI_I32_EQ_SS_R, MINI_I32_LE_RS_R,
+    MINI_I32_LE_SS_R, MINI_I32_LOAD_MEM0_OFF, MINI_I32_LT_RS_R, MINI_I32_LT_SI_R, MINI_I32_LT_SR_R,
+    MINI_I32_LT_SS_R, MINI_I32_MUL_SS_WR, MINI_I32_NE_RS_R, MINI_I32_NE_SS_R, MINI_I32_OR_SS_WR,
+    MINI_I32_REINTERP_F32, MINI_I32_REM_S, MINI_I32_REM_U, MINI_I32_ROTL_SI, MINI_I32_ROTR_SI,
+    MINI_I32_SHL_SI, MINI_I32_STORE_RS, MINI_I32_STORE_SR, MINI_I32_STORE8_RS, MINI_I32_STORE8_SR,
+    MINI_I32_STORE16_RS, MINI_I32_STORE16_SR, MINI_I32_SUB_SS_WR, MINI_I32_XOR_SS_WR,
+    MINI_I64_ADD_RS_WB, MINI_I64_ADD_SS_WB, MINI_I64_ADD_SS_WR, MINI_I64_AND_RI_WR,
+    MINI_I64_AND_SI_WR, MINI_I64_BITCOUNT_S, MINI_I64_DIV_S, MINI_I64_DIV_U, MINI_I64_EQ_RS_R,
+    MINI_I64_EQ_SS_R, MINI_I64_LE_SS_R, MINI_I64_LOAD_MEM0_OFF, MINI_I64_LT_IS_R, MINI_I64_LT_RS_R,
+    MINI_I64_LT_SI_R, MINI_I64_LT_SS_R, MINI_I64_MUL_SS_WR, MINI_I64_NE_RS_R, MINI_I64_NE_SS_R,
+    MINI_I64_OR_SS_WR, MINI_I64_REINTERP_F64, MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32,
+    MINI_I64_SEXT32_S, MINI_I64_SHL_SI, MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR,
+    MINI_I64_XOR_SS_WR, MINI_MEMORY_SIZE, MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R,
+    MINI_RETURN_R, MINI_RETURN_S, MINI_RETURN_VOID, MINI_SELECT, MINI_TRAP, MINI_U8_LOAD_MEM0_OFF,
+    MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R, MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R,
+    MINI_U32_SHR_RI, MINI_U64_LE_SS_R, MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR,
+    MINI_I64_OR_RI_WR, MINI_MEM_COPY_WITHIN, MINI_YIELD_STOCK, MiniCode,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -497,6 +497,36 @@ extern "C" fn mem_store_u16(ea: i64, val: i64) {
             (base as usize).wrapping_add(ea as usize) as *mut u16,
             val as u16,
         );
+    }
+    MEM_DID_STORE.with(|d| d.set(true));
+}
+
+/// Residual `memory.copy` within the same linear memory (memory[0]).
+/// Performs bounds-checked `copy_within` (handles overlapping regions).
+/// Out-of-bounds sets `MEM_TRAP`. Skipped if a prior trap already occurred.
+#[majit_macros::dont_look_inside]
+extern "C" fn mem_copy_within(dst: i64, src: i64, copy_len: i64) {
+    if MEM_TRAP.with(|t| t.get()) {
+        return;
+    }
+    let (base, mem_len) = MEM_CTX.with(|c| c.get());
+    let n = copy_len as u64;
+    let d = dst as u64;
+    let s = src as u64;
+    if d.checked_add(n).is_none_or(|end| end as i64 > mem_len)
+        || s.checked_add(n).is_none_or(|end| end as i64 > mem_len)
+    {
+        MEM_TRAP.with(|t| t.set(true));
+        return;
+    }
+    let base = base as usize;
+    let d = d as usize;
+    let s = s as usize;
+    let n = n as usize;
+    // SAFETY: bounds checked above; base is the linear memory allocation.
+    unsafe {
+        let ptr = base as *mut u8;
+        core::ptr::copy(ptr.add(s), ptr.add(d), n);
     }
     MEM_DID_STORE.with(|d| d.set(true));
 }
@@ -1257,6 +1287,11 @@ fn wasm_mainloop(
             MINI_I64_AND_RI_WR => {
                 let imm = program[pc + 1];
                 state.accum[0] = state.accum[0] & imm;
+                pc += 2;
+            }
+            MINI_I64_OR_RI_WR => {
+                let imm = program[pc + 1];
+                state.accum[0] = state.accum[0] | imm;
                 pc += 2;
             }
             MINI_I64_AND_SI_WR => {
@@ -2031,7 +2066,11 @@ fn wasm_mainloop(
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
                 let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS { params_len } else { MAX_CALL_PARAMS };
+                let n = if params_len < MAX_CALL_PARAMS {
+                    params_len
+                } else {
+                    MAX_CALL_PARAMS
+                };
                 let mut i = 0;
                 while i < n {
                     buf[i] = state.slots[params_start + i];
@@ -2063,8 +2102,20 @@ fn wasm_mainloop(
             MINI_U64_SHR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = ((state.slots[lhs] as u64) >> ((state.slots[rhs] as u64) & 63)) as i64;
+                state.accum[0] =
+                    ((state.slots[lhs] as u64) >> ((state.slots[rhs] as u64) & 63)) as i64;
                 pc += 3;
+            }
+            MINI_MEM_COPY_WITHIN => {
+                let dst_slot = program[pc + 1] as usize;
+                let src_slot = program[pc + 2] as usize;
+                let len_slot = program[pc + 3] as usize;
+                mem_copy_within(
+                    state.slots[dst_slot],
+                    state.slots[src_slot],
+                    state.slots[len_slot],
+                );
+                pc += 4;
             }
             MINI_YIELD_STOCK => {
                 // Yield to the stock executor at the recorded byte offset.
@@ -2360,7 +2411,7 @@ pub(crate) fn run_persistent(
     mem_len: i64,
     globals_table: *const *mut u64,
     globals_count: usize,
-) -> i64 {
+) -> Option<i64> {
     set_mem_ctx(mem_base, mem_len);
     set_globals_ctx(globals_table, globals_count);
     // Extract a raw pointer to the program's words and drop the PROGRAMS
@@ -2382,13 +2433,21 @@ pub(crate) fn run_persistent(
     // is stable (no resize after prepass). The pointer is valid for the
     // duration of the run.
     let words: &MiniCode = unsafe { core::slice::from_raw_parts(words_data, words_len) };
+    // try_borrow_mut: when a yield-to-stock op (e.g. MemoryCopy) resumes the
+    // stock executor and the stock executor calls another eligible function,
+    // DRIVER is still borrowed by the outer run_persistent. Return None so the
+    // caller falls back to the stock executor for the nested call.
     DRIVER.with(|d| {
-        let mut slot = d.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(new_driver(THRESHOLD, words, init_slots));
+        match d.try_borrow_mut() {
+            Ok(mut slot) => {
+                if slot.is_none() {
+                    *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                }
+                let driver = slot.as_mut().unwrap();
+                Some(wasm_mainloop(driver, words, init_slots))
+            }
+            Err(_) => None, // nested call — fall back to stock
         }
-        let driver = slot.as_mut().unwrap();
-        wasm_mainloop(driver, words, init_slots)
     })
 }
 
@@ -2504,7 +2563,8 @@ fn new_driver(
             eprintln!(
                 "[majit-kernel] COMPILE #{} (ops {} → {})",
                 KERNEL_COMPILES.load(Ordering::Relaxed),
-                _ops_before, _ops_after,
+                _ops_before,
+                _ops_after,
             );
         }
     });
@@ -8646,5 +8706,4 @@ mod tests {
             assert_eq!(got, expected, "sum_doubled({n}) must be {expected}");
         }
     }
-
 }

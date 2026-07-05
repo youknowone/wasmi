@@ -238,9 +238,9 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         // Take the cached callee Stack from TLS (or create one). Avoids
         // re-allocating a Stack on every run_jit call.
         let callee_stack = CALLEE_STACK_CACHE.with(|c| {
-            c.borrow_mut().take().unwrap_or_else(|| {
-                Stack::new(&crate::engine::limits::StackConfig::default())
-            })
+            c.borrow_mut()
+                .take()
+                .unwrap_or_else(|| Stack::new(&crate::engine::limits::StackConfig::default()))
         });
         let mut call_ctx = CallRunnerCtx {
             store: self.store.prune() as *mut crate::store::PrunedStore,
@@ -262,7 +262,15 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         );
         super::majit::kernel::clear_call_runner();
         // Return the callee Stack to the TLS cache for reuse.
-        CALLEE_STACK_CACHE.with(|c| { *c.borrow_mut() = Some(call_ctx.callee_stack); });
+        CALLEE_STACK_CACHE.with(|c| {
+            *c.borrow_mut() = Some(call_ctx.callee_stack);
+        });
+        // DRIVER was already borrowed (nested call from a yield-to-stock
+        // resume). Fall back to the stock executor for this call.
+        let result = match result {
+            Some(r) => r,
+            None => return self.execute_stock(),
+        };
         // The kernel yielded at a CallInternal. Flush the kernel's computed
         // slots to the real frame and resume the stock executor AT that
         // instruction — not from byte 0. This avoids double-applying side
@@ -559,16 +567,14 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     };
 
     // Compile/fetch the callee.
-    let compiled = match func.get_or_compile(
-        Some(store.inner_mut().fuel_mut()),
-        ctx.code.features(),
-    ) {
-        Ok(c) => c,
-        Err(_) => {
-            super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
-            return 0;
-        }
-    };
+    let compiled =
+        match func.get_or_compile(Some(store.inner_mut().fuel_mut()), ctx.code.features()) {
+            Ok(c) => c,
+            Err(_) => {
+                super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+                return 0;
+            }
+        };
     let callee_ops = compiled.ops();
     let len_local_slots = compiled.len_local_slots();
     let len_stack_slots = compiled.len_stack_slots();
@@ -578,7 +584,8 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     // (CALLEE_DRIVER) instead of the stock handler-threaded executor. This
     // avoids the frame-push / VmState / handler-dispatch overhead and lets
     // the callee's hot loop benefit from majit compilation.
-    let ca_result = super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots);
+    let ca_result =
+        super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots);
     if let Some((callee_key, callee_num_slots, callee_uses_globals)) = ca_result {
         // Seed the callee's slot array: params first, rest zeroed.
         let total = callee_num_slots + super::majit::prepass::NUM_SCRATCH;
@@ -640,9 +647,15 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     let (ireg, freg32, freg64) = ctx.callee_stack.regs();
     let mut vm = VmState::new(store, &mut ctx.callee_stack, ctx.code);
     match execute_until_done(
-        &mut vm, callee_ip, callee_sp,
-        mem0, mem0_len, ctx.instance,
-        ireg, freg32, freg64,
+        &mut vm,
+        callee_ip,
+        callee_sp,
+        mem0,
+        mem0_len,
+        ctx.instance,
+        ireg,
+        freg32,
+        freg64,
     ) {
         Ok(sp) => {
             // The wasmi translator copies the result to slot 0 (via a
