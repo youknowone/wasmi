@@ -57,7 +57,7 @@ use super::prepass::{
     MINI_RETURN_R, MINI_RETURN_S, MINI_TRAP, MINI_YIELD_STOCK,
     MINI_RETURN_VOID, MINI_SELECT, MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R,
     MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R,
-    MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MiniCode,
+    MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR, MiniCode,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -2059,6 +2059,12 @@ fn wasm_mainloop(
                 let (_base, len) = MEM_CTX.with(|c| c.get());
                 state.accum[0] = if len > 0 { len / 65536 } else { 0 };
                 pc += 1;
+            }
+            MINI_U64_SHR_SS_WR => {
+                let lhs = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                state.accum[0] = ((state.slots[lhs] as u64) >> ((state.slots[rhs] as u64) & 63)) as i64;
+                pc += 3;
             }
             MINI_YIELD_STOCK => {
                 // Yield to the stock executor at the recorded byte offset.
