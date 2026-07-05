@@ -120,6 +120,28 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         self.execute_stock()
     }
 
+    /// Run this call on the stock executor starting at a specific instruction
+    /// pointer (not the function's entry point). Used by the yield-to-stock
+    /// pathway when the kernel has already executed the prefix of the function
+    /// and committed its side effects.
+    #[cfg(feature = "majit-jit")]
+    fn execute_stock_at(&mut self, ip: Ip) -> Result<Sp, ExecutionOutcome> {
+        let store = self.store.prune();
+        let (mem0, mem0_len) = utils::extract_mem0(store, self.instance);
+        let mut state = VmState::new(store, self.stack, self.code);
+        execute_until_done(
+            &mut state,
+            ip,
+            self.callee_sp,
+            mem0,
+            mem0_len,
+            self.instance,
+            self.ireg,
+            self.freg32,
+            self.freg64,
+        )
+    }
+
     /// Run this call on the stock handler-threaded executor.
     fn execute_stock(&mut self) -> Result<Sp, ExecutionOutcome> {
         let store = self.store.prune();
@@ -203,6 +225,18 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         // load resolves through its residual helper. Re-read each call so a
         // `memory.grow` relocation is reflected rather than baked into the trace.
         let (mem0, mem0_len) = utils::extract_mem0(self.store.prune(), self.instance);
+        // Register the call runner so the kernel's call_internal_residual
+        // can execute CallInternal instructions via the stock executor.
+        let mut call_ctx = CallRunnerCtx {
+            store: self.store.prune() as *mut crate::store::PrunedStore,
+            code: self.code,
+            instance: self.instance,
+            callee_stack: Stack::new(&crate::engine::limits::StackConfig::default()),
+        };
+        super::majit::kernel::set_call_runner(
+            call_runner_fn,
+            &mut call_ctx as *mut CallRunnerCtx as *mut (),
+        );
         let result = super::majit::kernel::run_persistent(
             key,
             &slots,
@@ -211,9 +245,37 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             globals_table.as_ptr(),
             globals_table.len(),
         );
-        // The kernel hit an instruction it cannot handle (tail call, internal
-        // call). Fall back to the stock executor if no stores were committed;
-        // otherwise the stock re-run would double-apply stores.
+        super::majit::kernel::clear_call_runner();
+        // The kernel yielded at a CallInternal. Flush the kernel's computed
+        // slots to the real frame and resume the stock executor AT that
+        // instruction — not from byte 0. This avoids double-applying side
+        // effects the kernel already committed via residual calls.
+        if super::majit::kernel::take_yield_to_stock() {
+            // A yield after a residual trap is not safe: the kernel continued
+            // with dummy values after the trap and the flushed slots may be
+            // corrupted. Fall back to the trap/stock-from-start path instead.
+            if super::majit::kernel::take_mem_trap() {
+                if super::majit::kernel::take_mem_did_store() {
+                    return Err(ExecutionOutcome::from(
+                        super::majit::kernel::take_trap_code(),
+                    ));
+                }
+                return self.execute_stock();
+            }
+            let flushed = super::majit::kernel::take_yield_slots();
+            let byte_offset = super::majit::kernel::take_yield_offset() as usize;
+            // Flush kernel slots to the real frame so the CallInternal handler
+            // reads correct parameter values from the frame.
+            for (i, &val) in flushed.iter().enumerate() {
+                unsafe { self.callee_sp.set::<i64>(Slot::from(i as u16), val) };
+            }
+            // Resume the stock executor at the CallInternal instruction.
+            let yield_ip = unsafe { self.callee_ip.add(byte_offset) };
+            return self.execute_stock_at(yield_ip);
+        }
+        // The kernel hit a tail call it cannot handle. Fall back to the stock
+        // executor if no stores were committed; otherwise the stock re-run
+        // would double-apply stores.
         if super::majit::kernel::take_bail_to_stock() {
             if !super::majit::kernel::take_mem_did_store() {
                 return self.execute_stock();
@@ -446,5 +508,91 @@ impl<'a, T> HostFuncCall<'a, T, state::Done> {
             panic!("failed to load result value from cells")
         };
         value
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Call runner: executes a CallInternal on behalf of the majit kernel.
+// ---------------------------------------------------------------------------
+
+/// Context for [`call_runner_fn`], capturing references from `run_jit` that
+/// callee execution needs. Lives on `run_jit`'s stack frame; its raw pointer
+/// is registered via [`super::majit::kernel::set_call_runner`] and valid for
+/// the entire `run_persistent` duration.
+#[cfg(feature = "majit-jit")]
+struct CallRunnerCtx<'a> {
+    store: *mut crate::store::PrunedStore,
+    code: CodeView<'a>,
+    instance: Inst,
+    callee_stack: Stack,
+}
+
+/// The [`super::majit::kernel::CallRunnerFn`] callback. Executes a wasm
+/// internal call by pushing a root frame on a separate Stack and running
+/// `execute_until_done` on the stock executor.
+#[cfg(feature = "majit-jit")]
+fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
+    let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
+    let store = unsafe { &mut *ctx.store };
+
+    // Recover the FuncEntry from the exposed pointer address.
+    let func = unsafe {
+        &*core::ptr::with_exposed_provenance::<crate::engine::code_map::FuncEntry>(func_addr)
+    };
+
+    // Compile/fetch the callee.
+    let compiled = match func.get_or_compile(
+        Some(store.inner_mut().fuel_mut()),
+        ctx.code.features(),
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+            return 0;
+        }
+    };
+    let callee_ip = Ip::from(compiled.ops());
+    let len_local_slots = compiled.len_local_slots();
+    let len_stack_slots = compiled.len_stack_slots();
+
+    // Reset the callee stack for reuse.
+    ctx.callee_stack.reset();
+
+    // Push a root frame (caller_ip = None → pop returns None → done).
+    let callee_params = BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), params.len() as u16);
+    let callee_sp = match ctx.callee_stack.push_frame(
+        None,
+        callee_ip,
+        callee_params,
+        len_local_slots,
+        len_stack_slots,
+        Some(ctx.instance),
+    ) {
+        Ok(sp) => sp,
+        Err(_) => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::StackOverflow);
+            return 0;
+        }
+    };
+
+    // Write the staged params into the callee frame.
+    for (i, &val) in params.iter().enumerate() {
+        unsafe { callee_sp.set::<i64>(Slot::from(i as u16), val) };
+    }
+
+    // Execute the callee on the stock executor.
+    let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+    let (ireg, freg32, freg64) = ctx.callee_stack.regs();
+    let mut vm = VmState::new(store, &mut ctx.callee_stack, ctx.code);
+    match execute_until_done(
+        &mut vm, callee_ip, callee_sp,
+        mem0, mem0_len, ctx.instance,
+        ireg, freg32, freg64,
+    ) {
+        Ok(sp) => unsafe { sp.get::<i64>(Slot::from(0)) },
+        Err(_) => {
+            super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+            0
+        }
     }
 }

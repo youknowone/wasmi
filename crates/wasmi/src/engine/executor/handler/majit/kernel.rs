@@ -53,7 +53,8 @@ use super::prepass::{
     MINI_I64_LT_SS_R, MINI_I64_MUL_SS_WR, MINI_I64_NE_RS_R, MINI_I64_NE_SS_R, MINI_I64_OR_SS_WR,
     MINI_I64_REINTERP_F64, MINI_I64_REM_S, MINI_I64_REM_U, MINI_I64_SEXT32, MINI_I64_SEXT32_S,
     MINI_I64_SHL_SI, MINI_I64_STORE_RS, MINI_I64_STORE_SR, MINI_I64_SUB_SS_WR, MINI_I64_XOR_SS_WR,
-    MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R, MINI_RETURN_R, MINI_RETURN_S,
+    MINI_CALL_RESIDUAL, MINI_RETURN_BAIL, MINI_RETURN_F_R, MINI_RETURN_F32_R, MINI_RETURN_R,
+    MINI_RETURN_S, MINI_YIELD_STOCK,
     MINI_RETURN_VOID, MINI_SELECT, MINI_U8_LOAD_MEM0_OFF, MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R,
     MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R, MINI_U32_SHR_RI, MINI_U64_LE_SS_R,
     MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MiniCode,
@@ -133,15 +134,101 @@ std::thread_local! {
     static GLOBALS_CTX: core::cell::Cell<(*const *mut u64, usize)> =
         const { core::cell::Cell::new((core::ptr::null(), 0)) };
     /// Set by [`MINI_RETURN_BAIL`] when the kernel hits an instruction that
-    /// requires falling back to the stock executor (e.g. a tail call or an
-    /// internal call the kernel cannot handle). Cleared at each run entry.
+    /// requires falling back to the stock executor (e.g. a tail call). Cleared
+    /// at each run entry.
     static BAIL_TO_STOCK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Set by [`MINI_YIELD_STOCK`] when the kernel hits a CallInternal. Unlike
+    /// [`BAIL_TO_STOCK`], the yield carries the byte offset and a slot snapshot
+    /// so the caller can resume the stock executor at the exact instruction
+    /// rather than re-running from the start. Cleared at each run entry.
+    static YIELD_TO_STOCK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// The byte offset of the CallInternal instruction in the op stream,
+    /// recorded by [`MINI_YIELD_STOCK`]. Valid only when [`YIELD_TO_STOCK`] is
+    /// true.
+    static YIELD_BYTE_OFFSET: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+}
+
+std::thread_local! {
+    /// Snapshot of the kernel's slot array at the yield point, set by
+    /// [`MINI_YIELD_STOCK`]. The caller reads it via [`take_yield_slots`] and
+    /// flushes it to the real frame before resuming the stock executor.
+    static YIELD_SLOTS: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
+
+    /// Staging buffer for callee params set by the [`MINI_CALL_RESIDUAL`]
+    /// dispatch arm before calling [`call_internal_residual`]. The residual
+    /// reads params from here and writes them to the callee's fresh Stack.
+    static CALL_STAGING: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
+
+    /// Per-run reusable Stack for callee execution via [`call_internal_residual`].
+    /// Allocated on first use, reset between calls.
+    static CALLEE_STACK: core::cell::RefCell<Option<super::super::state::Stack>> =
+        core::cell::RefCell::new(None);
+}
+
+/// Opaque execution context for [`call_internal_residual`], set by `run_jit`
+/// via [`set_call_runner`]. Stores a function pointer + data pointer to a
+/// closure-like struct that lives on `run_jit`'s stack — valid for the entire
+/// kernel run.
+///
+/// We use a concrete fn pointer + `*mut ()` instead of `*mut dyn Trait` to
+/// avoid fat pointer complexity. The fn pointer signature is:
+/// `fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64`
+type CallRunnerFn = fn(*mut (), usize, &[i64]) -> i64;
+
+std::thread_local! {
+    static CALL_RUNNER_FN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CALL_RUNNER_DATA: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Register the call runner for the current kernel run.
+pub(crate) fn set_call_runner(f: CallRunnerFn, data: *mut ()) {
+    CALL_RUNNER_FN.with(|c| c.set(f as usize));
+    CALL_RUNNER_DATA.with(|c| c.set(data as usize));
+}
+
+/// Clear the call runner (called after `run_persistent` returns).
+pub(crate) fn clear_call_runner() {
+    CALL_RUNNER_FN.with(|c| c.set(0));
+    CALL_RUNNER_DATA.with(|c| c.set(0));
 }
 
 /// Records the per-run global raw-pointer table (see [`GLOBALS_CTX`]). The caller
 /// owns the backing slice for the run's duration.
 fn set_globals_ctx(table: *const *mut u64, count: usize) {
     GLOBALS_CTX.with(|c| c.set((table, count)));
+}
+
+/// Stage a single callee parameter into [`CALL_STAGING`]. Called from the
+/// [`MINI_CALL_RESIDUAL`] dispatch arm before invoking
+/// [`call_internal_residual`]. Isolated from the kernel loop so the
+/// `#[jit_interp]` proc macro does not parse RefCell borrows capturing state.
+fn call_stage_params(params: Vec<i64>) {
+    CALL_STAGING.with(|c| {
+        *c.borrow_mut() = params;
+    });
+}
+
+/// Residual: execute an internal function call. Reads the staged params from
+/// [`CALL_STAGING`] and delegates to the [`CallRunnerFn`] registered by
+/// `run_jit`. The call runner pushes a root frame on a separate Stack, runs
+/// `execute_until_done`, and returns the callee's i64 return value.
+///
+/// Marked `#[dont_look_inside]` so the JIT treats this as an opaque call —
+/// the callee's bytecode is not traced, matching PyPy's `ll_portal_runner`
+/// residual semantics.
+#[majit_macros::dont_look_inside]
+extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
+    let runner_fn = CALL_RUNNER_FN.with(|c| c.get());
+    let runner_data = CALL_RUNNER_DATA.with(|c| c.get());
+    if runner_fn == 0 {
+        // No call runner registered — should not happen for an eligible function.
+        set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+        return 0;
+    }
+    let f: CallRunnerFn = unsafe { core::mem::transmute::<usize, CallRunnerFn>(runner_fn) };
+    let data = runner_data as *mut ();
+    let params = CALL_STAGING.with(|c| c.borrow().clone());
+    f(data, func_addr as usize, &params)
 }
 
 /// Residual read of an integer global's raw `lo64` bits by wasm global index.
@@ -179,6 +266,7 @@ fn set_mem_ctx(base: i64, len: i64) {
     MEM_DID_STORE.with(|d| d.set(false));
     TRAP_CODE.with(|c| c.set(crate::TrapCode::MemoryOutOfBounds));
     BAIL_TO_STOCK.with(|b| b.set(false));
+    YIELD_TO_STOCK.with(|y| y.set(false));
 }
 
 /// Returns `true` (once) if the last kernel run hit a `MINI_RETURN_BAIL`
@@ -187,10 +275,28 @@ pub fn take_bail_to_stock() -> bool {
     BAIL_TO_STOCK.with(|b| b.replace(false))
 }
 
+/// Returns `true` (once) if the last kernel run hit a [`MINI_YIELD_STOCK`]
+/// instruction (a CallInternal). Clears the flag on read.
+pub fn take_yield_to_stock() -> bool {
+    YIELD_TO_STOCK.with(|y| y.replace(false))
+}
+
+/// The byte offset recorded by the last [`MINI_YIELD_STOCK`]. Valid only when
+/// [`take_yield_to_stock`] returned true.
+pub(crate) fn take_yield_offset() -> i64 {
+    YIELD_BYTE_OFFSET.with(|c| c.get())
+}
+
+/// Takes the kernel's slot snapshot from the last [`MINI_YIELD_STOCK`], leaving
+/// an empty Vec behind.
+pub(crate) fn take_yield_slots() -> Vec<i64> {
+    YIELD_SLOTS.with(|c| c.replace(Vec::new()))
+}
+
 /// Flags a trap from a residual (e.g. a trapping f64→int conversion), recording
 /// the exact trap code. Latches on [`MEM_TRAP`] so the first trap in program
 /// order keeps its code and stops any later store, matching the stock executor.
-fn set_residual_trap(code: crate::TrapCode) {
+pub(crate) fn set_residual_trap(code: crate::TrapCode) {
     if !MEM_TRAP.with(|t| t.get()) {
         MEM_TRAP.with(|t| t.set(true));
         TRAP_CODE.with(|c| c.set(code));
@@ -784,6 +890,15 @@ struct WasmKernelState {
     accum: Vec<i64>,
 }
 
+/// Stores a slot snapshot for [`MINI_YIELD_STOCK`]. Isolated from the kernel
+/// loop so the `#[jit_interp]` proc macro does not need to parse RefCell
+/// borrows in a closure that captures mutable state.
+fn yield_set_slots(slots: Vec<i64>) {
+    YIELD_SLOTS.with(|c| {
+        *c.borrow_mut() = slots;
+    });
+}
+
 #[majit_macros::jit_interp(
     state = WasmKernelState,
     env = MiniCode,
@@ -826,6 +941,7 @@ struct WasmKernelState {
         f32_trunc => residual_int,
         global_get => residual_int,
         global_set => residual_void_cannot_raise,
+        call_internal_residual => residual_int,
     },
     greens = [pc, program],
     state_fields = {
@@ -1896,6 +2012,40 @@ fn wasm_mainloop(
             MINI_RETURN_S => {
                 let src = program[pc + 1] as usize;
                 return state.slots[src];
+            }
+            MINI_CALL_RESIDUAL => {
+                // Execute an internal function call via the registered call
+                // runner. Stage params from kernel slots, call the residual,
+                // and store the return value in the integer accumulator.
+                let func_addr = program[pc + 1];
+                let params_start = program[pc + 2] as usize;
+                let params_len = program[pc + 3] as usize;
+                let mut params = alloc::vec![0i64; params_len];
+                let mut i = 0;
+                while i < params_len {
+                    params[i] = state.slots[params_start + i];
+                    i += 1;
+                }
+                call_stage_params(params);
+                state.accum[0] = call_internal_residual(func_addr, params_len as i64);
+                pc += 4;
+            }
+            MINI_YIELD_STOCK => {
+                // Yield to the stock executor at the recorded byte offset.
+                // The caller flushes the slot snapshot to the real frame and
+                // resumes the stock executor at the CallInternal instruction.
+                let byte_offset = program[pc + 1];
+                let num_slots = program[pc + 2] as usize;
+                YIELD_TO_STOCK.with(|y| y.set(true));
+                YIELD_BYTE_OFFSET.with(|c| c.set(byte_offset));
+                let mut slots_copy = alloc::vec![0i64; num_slots];
+                let mut i = 0;
+                while i < num_slots {
+                    slots_copy[i] = state.slots[i];
+                    i += 1;
+                }
+                yield_set_slots(slots_copy);
+                return 0;
             }
             MINI_RETURN_BAIL => {
                 // Signal the caller (run_jit) to fall back to stock executor.
