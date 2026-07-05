@@ -2350,7 +2350,10 @@ fn wasm_mainloop(
             MINI_CALL_RESIDUAL => {
                 // Execute an internal function call via the registered call
                 // runner. Stage params into the fixed-size TLS buffer (no heap
-                // allocation), call the residual, store the return value in ireg.
+                // allocation), call the residual, store the return value in
+                // the params area head slot — wasmi's calling convention
+                // places the result at params.span().head(), and the
+                // translator's subsequent instructions read it from there.
                 let func_addr = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
@@ -2363,7 +2366,9 @@ fn wasm_mainloop(
                 }
                 CALL_STAGING.with(|c| c.set(buf));
                 CALL_STAGING_LEN.with(|c| c.set(n));
-                state.accum[0] = call_internal_residual(func_addr, n as i64);
+                let result = call_internal_residual(func_addr, n as i64);
+                state.slots[params_start] = result;
+                state.accum[0] = result;
                 pc += 4;
             }
             MINI_TRAP => {
@@ -8981,16 +8986,7 @@ mod tests {
     /// yield/bail ops, `call_runner_fn` runs it on the CALLEE_DRIVER via
     /// `run_callee` (the CALL_ASSEMBLER path) instead of the stock executor.
     ///
-    /// NOTE: ignored because the kernel's `state.accum[0] =
-    /// call_internal_residual(...)` assignment does not update the
-    /// virtualizable accumulator correctly in interpret mode. The callee
-    /// returns the correct value (verified via debug logging), but the
-    /// caller's accumulator retains the call parameter instead of the
-    /// return value. This is a pre-existing kernel-level bug in how
-    /// `#[jit_interp]` handles residual-call return values written to a
-    /// virtualizable array element.
     #[test]
-    #[ignore = "kernel residual-call return value not written to virtualizable accum"]
     fn end_to_end_call_assembler_callee_jit() {
         let _serial = serial_kernel_guard();
         use crate::{Engine, Instance, Module, Store};
@@ -9062,4 +9058,5 @@ mod tests {
             assert_eq!(got, expected, "sum_doubled({n}) must be {expected}");
         }
     }
+
 }
