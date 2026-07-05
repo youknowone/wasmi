@@ -274,6 +274,10 @@ pub(crate) const MINI_TRAP: i64 = 159;
 /// `[MINI_MEMORY_SIZE]` (1 word): return the current memory size in pages
 /// (`mem_len / 65536`) into ireg. Reads from the [`MEM_CTX`] TLS.
 pub(crate) const MINI_MEMORY_SIZE: i64 = 160;
+/// `[MINI_U64_SHR_SS_WR, lhs_slot, rhs_slot]` (3 words):
+/// `ireg = (slots[lhs] as u64 >> (slots[rhs] as u64 & 63)) as i64`.
+/// Unsigned 64-bit right shift with dynamic shift amount.
+pub(crate) const MINI_U64_SHR_SS_WR: i64 = 161;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -4399,11 +4403,20 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::F64NotLe_Rss => {
-                // !(lhs <= rhs) for f64. Requires slot→freg64 copy which has
-                // no dedicated MINI op; yield to stock.
-                let _op = decode::F64NotLe_Rss::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // !(lhs <= rhs) for f64. Decompose:
+                // 1. slot[lhs] → ireg → freg (bit copy via reinterpret)
+                // 2. F64_CMP sel=1(le) with slot[rhs] → ireg = (freg <= slot[rhs]) ? 1 : 0
+                // 3. Negate: ireg = (ireg == 0) ? 1 : 0
+                let op = decode::F64NotLe_Rss::decode(&mut cursor).ok()?;
+                let lhs = i64::from(u16::from(op.lhs));
+                let rhs = i64::from(u16::from(op.rhs));
+                words.extend_from_slice(&[
+                    MINI_COPY_RS, lhs,           // ireg = slot[lhs] (f64 bits as i64)
+                    MINI_F64_REINTERP_I64,       // freg = ireg (reinterpret to f64)
+                    MINI_F64_CMP_RS_R, 1, rhs,   // ireg = (freg <= slot[rhs]) ? 1 : 0
+                    MINI_COPY_SI, scratch_base, 0, // scratch = 0
+                    MINI_I32_EQ_RS_R, scratch_base, // ireg = (ireg == 0) ? 1 : 0 = !le
+                ]);
             }
             OpCode::U32Select_Rsii => {
                 // ireg = slot[condition] ? true_val : false_val (both u32 imm).
@@ -4442,9 +4455,15 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::U64Shr_Rir => {
-                let _op = decode::U64Shr_Rir::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // ireg = (u64)imm >> ((u64)ireg & 63). Non-commutative:
+                // lhs is immediate, rhs (shift amount) is ireg.
+                // Decompose: materialize both into scratch, then U64_SHR_SS_WR.
+                let op = decode::U64Shr_Rir::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[
+                    MINI_COPY_SI, scratch_base, op.lhs as i64, // scratch = imm (lhs value)
+                    MINI_COPY_SR, scratch_base + 1,         // scratch+1 = ireg (shift amt)
+                    MINI_U64_SHR_SS_WR, scratch_base, scratch_base + 1,
+                ]);
             }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
