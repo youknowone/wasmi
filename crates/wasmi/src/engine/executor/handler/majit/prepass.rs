@@ -656,6 +656,11 @@ pub(crate) struct MiniProgram {
     /// `false` the caller skips resolving the instance's global raw pointers before
     /// a run, so a globals-free function pays nothing for the capability.
     pub uses_globals: bool,
+    /// Whether the program contains any yield-to-stock, bail, or trap ops
+    /// (MINI_YIELD_STOCK, MINI_RETURN_BAIL, MINI_TRAP). Functions with these
+    /// ops cannot run as callees on the CALL_ASSEMBLER path because there is
+    /// no stock executor to fall back to.
+    pub has_yield_or_bail: bool,
 }
 
 /// Decode `ops` (an `indirect-dispatch` op stream) into a [`MiniProgram`].
@@ -3925,12 +3930,16 @@ pub(crate) fn prepass(
         }
     }
 
+    let has_yield_or_bail = words
+        .iter()
+        .any(|&w| w == MINI_YIELD_STOCK || w == MINI_RETURN_BAIL || w == MINI_TRAP);
     Some(MiniProgram {
         words,
         num_slots: usize::from(len_local_slots) + usize::from(len_stack_slots),
         loop_header_word,
         writes_result,
         uses_globals,
+        has_yield_or_bail,
     })
 }
 
