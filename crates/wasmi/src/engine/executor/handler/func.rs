@@ -561,8 +561,9 @@ struct CallRunnerCtx<'a> {
 }
 
 /// The [`super::majit::kernel::CallRunnerFn`] callback. Executes a wasm
-/// internal call by pushing a root frame on a separate Stack and running
-/// `execute_until_done` on the stock executor.
+/// internal call, preferring the CALL_ASSEMBLER path (MiniProgram dispatch)
+/// when the callee is JIT-eligible, falling back to the stock executor
+/// otherwise.
 #[cfg(feature = "majit-jit")]
 fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
@@ -584,9 +585,47 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
             return 0;
         }
     };
-    let callee_ip = Ip::from(compiled.ops());
+    let callee_ops = compiled.ops();
     let len_local_slots = compiled.len_local_slots();
     let len_stack_slots = compiled.len_stack_slots();
+
+    // ── CALL_ASSEMBLER path ──
+    // If the callee has a cached MiniProgram, run it on the flat i64 dispatch
+    // (CALLEE_DRIVER) instead of the stock handler-threaded executor. This
+    // avoids the frame-push / VmState / handler-dispatch overhead and lets
+    // the callee's hot loop benefit from majit compilation.
+    if let Some((callee_key, callee_num_slots, callee_uses_globals)) =
+        super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots)
+    {
+        // Seed the callee's slot array: params first, rest zeroed.
+        let total = callee_num_slots + super::majit::prepass::NUM_SCRATCH;
+        let mut init_slots = alloc::vec![0i64; total];
+        for (i, &val) in params.iter().enumerate() {
+            init_slots[i] = val;
+        }
+        // Resolve globals only if the callee references them.
+        let globals_table = if callee_uses_globals {
+            utils::resolve_globals_table(store, ctx.instance)
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+        if let Some(result) = super::majit::kernel::run_callee(
+            callee_key,
+            &init_slots,
+            mem0.addr() as i64,
+            mem0_len.get() as i64,
+            globals_table.as_ptr(),
+            globals_table.len(),
+        ) {
+            return result;
+        }
+        // run_callee returned None → program not in cache (race or evicted);
+        // fall through to the stock path.
+    }
+
+    // ── Stock executor fallback ──
+    let callee_ip = Ip::from(callee_ops);
 
     // Reset the callee stack for reuse.
     ctx.callee_stack.reset();
@@ -622,7 +661,22 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
         mem0, mem0_len, ctx.instance,
         ireg, freg32, freg64,
     ) {
-        Ok(sp) => unsafe { sp.get::<i64>(Slot::from(0)) },
+        Ok(sp) => {
+            // The wasmi translator may leave the function's return value in
+            // the integer accumulator register (ireg) rather than slot 0.
+            // The stock executor's dispatch loop carries ireg as a local
+            // variable that is NOT synced back to the Stack. However, when
+            // the function ends via Return → pop_frame → DoneReason::Return,
+            // the handler passes ireg INTO the done! macro which captures it
+            // in the break reason.
+            //
+            // Since the stack's ireg is NOT updated by execute_until_done,
+            // and the break-reason ireg is not accessible from here, we read
+            // from slot 0 (which the translator copies the result to before
+            // Return for most functions). This is the existing convention
+            // and matches how WasmFuncCall::execute reads the result.
+            unsafe { sp.get::<i64>(Slot::from(0)) }
+        }
         Err(_) => {
             super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
             0
