@@ -3834,6 +3834,74 @@ pub(crate) fn prepass(
                 let _op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
             }
+            // -- Bail ops that unblock runtime infrastructure functions --
+            // These addressing forms are uncommon but appear in 788-1590 byte
+            // runtime functions. Yield-to-stock keeps them eligible (the hot
+            // loop body after the yield point benefits from JIT).
+            OpCode::BranchU32Lt_Ir => {
+                let _op = decode::BranchU32Lt_Ir::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::I64Add_Rs_ri => {
+                let _op = decode::I64Add_Rs_ri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U64LoadExtend32Mem0Offset16_Rs => {
+                let _op = decode::U64LoadExtend32Mem0Offset16_Rs::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U32Store_Ir => {
+                let _op = decode::U32Store_Ir::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U32Store_Ii => {
+                let _op = decode::U32Store_Ii::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::I64Lt_Rsr => {
+                let _op = decode::I64Lt_Rsr::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchU32Lt_Rs => {
+                let _op = decode::BranchU32Lt_Rs::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchU64Lt_Ir => {
+                let _op = decode::BranchU64Lt_Ir::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchU32Lt_Ss => {
+                let _op = decode::BranchU32Lt_Ss::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchTable_R => {
+                let _op = decode::BranchTable_R::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchI32Lt_Ri => {
+                let _op = decode::BranchI32Lt_Ri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::F64NotLe_Rss => {
+                let _op = decode::F64NotLe_Rss::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U32Select_Rsii => {
+                let _op = decode::U32Select_Rsii::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::I32Eq_Rss => {
+                let _op = decode::I32Eq_Rss::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::BranchU64Lt_Si => {
+                let _op = decode::BranchU64Lt_Si::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U64Shr_Rir => {
+                let _op = decode::U64Shr_Rir::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
             other => {
@@ -4160,6 +4228,28 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::U64Load_Ri => dec!(U64Load_Ri),
             OpCode::BranchU64Lt_Is => dec!(BranchU64Lt_Is),
             OpCode::CallInternal => dec!(CallInternal),
+            OpCode::Trap => dec!(Trap),
+            OpCode::MemorySize => dec!(MemorySize),
+            OpCode::U32LoadExtend8_Rr => dec!(U32LoadExtend8_Rr),
+            OpCode::U32LoadExtend16_Ri => dec!(U32LoadExtend16_Ri),
+            OpCode::U64Store_Is => dec!(U64Store_Is),
+            OpCode::CallIndirect_S => dec!(CallIndirect_S),
+            OpCode::BranchU32Lt_Ir => dec!(BranchU32Lt_Ir),
+            OpCode::I64Add_Rs_ri => dec!(I64Add_Rs_ri),
+            OpCode::U64LoadExtend32Mem0Offset16_Rs => dec!(U64LoadExtend32Mem0Offset16_Rs),
+            OpCode::U32Store_Ir => dec!(U32Store_Ir),
+            OpCode::U32Store_Ii => dec!(U32Store_Ii),
+            OpCode::I64Lt_Rsr => dec!(I64Lt_Rsr),
+            OpCode::BranchU32Lt_Rs => dec!(BranchU32Lt_Rs),
+            OpCode::BranchU64Lt_Ir => dec!(BranchU64Lt_Ir),
+            OpCode::BranchU32Lt_Ss => dec!(BranchU32Lt_Ss),
+            OpCode::BranchTable_R => dec!(BranchTable_R),
+            OpCode::BranchI32Lt_Ri => dec!(BranchI32Lt_Ri),
+            OpCode::F64NotLe_Rss => dec!(F64NotLe_Rss),
+            OpCode::U32Select_Rsii => dec!(U32Select_Rsii),
+            OpCode::I32Eq_Rss => dec!(I32Eq_Rss),
+            OpCode::BranchU64Lt_Si => dec!(BranchU64Lt_Si),
+            OpCode::U64Shr_Rir => dec!(U64Shr_Rir),
             OpCode::ReturnCallIndirect_R => dec!(ReturnCallIndirect_R),
             OpCode::ReturnCallIndirect_S => dec!(ReturnCallIndirect_S),
             OpCode::ReturnCallInternal => dec!(ReturnCallInternal),
