@@ -287,6 +287,17 @@ pub(crate) const MINI_MEM_COPY_WITHIN: i64 = 162;
 /// `[MINI_I64_OR_RI_WR, imm]` (2 words): `ireg = ireg | imm` (i64). Lowers
 /// wasmi `I64BitOr_Rsi` (`lhs` = accumulator, `rhs` = sign-extended Imm16).
 pub(crate) const MINI_I64_OR_RI_WR: i64 = 163;
+/// `[MINI_CALL_IMPORTED, func_idx, params_start, params_len]` (4 words):
+/// residual call to an imported function. `func_idx` is the `index::Func`
+/// (u32) resolved through the instance's function table at runtime.
+/// Result is written to `slots[params_start]` (wasmi calling convention).
+/// The residual re-extracts `MEM_CTX` after the call (host may `memory.grow`).
+pub(crate) const MINI_CALL_IMPORTED: i64 = 164;
+/// `[MINI_CALL_INDIRECT, table, func_type, index_slot, params_start, params_len]`
+/// (6 words): residual indirect call. Performs table lookup + null check +
+/// type check, then dispatches to Wasm or Host. `index_slot` is the slot
+/// holding the runtime table index. Result to `slots[params_start]`.
+pub(crate) const MINI_CALL_INDIRECT: i64 = 165;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -4183,7 +4194,7 @@ pub(crate) fn prepass(
                 ]);
             }
             OpCode::CallIndirect_R => {
-                // Indirect call via Reg index — yield to stock.
+                // Indirect call via Reg index — yield to stock executor.
                 let _op = decode::CallIndirect_R::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
@@ -4293,8 +4304,11 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::CallImported => {
-                // Host import call — yield to stock executor so the host
-                // function can run outside the JIT kernel.
+                // Imported function call — yield to stock executor.
+                // The target may be a host function that requires store
+                // access for the trampoline dispatch (not yet supported as
+                // a kernel residual). When the target is always a wasm
+                // function, use MINI_CALL_IMPORTED instead.
                 let _op = decode::CallImported::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;

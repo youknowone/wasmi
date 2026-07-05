@@ -57,7 +57,8 @@ use super::prepass::{
     MINI_RETURN_R, MINI_RETURN_S, MINI_RETURN_VOID, MINI_SELECT, MINI_TRAP, MINI_U8_LOAD_MEM0_OFF,
     MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R, MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R,
     MINI_U32_SHR_RI, MINI_U64_LE_SS_R, MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR,
-    MINI_I64_OR_RI_WR, MINI_MEM_COPY_WITHIN, MINI_YIELD_STOCK, MiniCode,
+    MINI_CALL_IMPORTED, MINI_CALL_INDIRECT, MINI_I64_OR_RI_WR, MINI_MEM_COPY_WITHIN,
+    MINI_YIELD_STOCK, MiniCode,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -179,22 +180,39 @@ std::thread_local! {
 /// avoid fat pointer complexity. The fn pointer signature is:
 /// `fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64`
 type CallRunnerFn = fn(*mut (), usize, &[i64]) -> i64;
+/// Imported-call runner: `fn(data, func_index: u32, params) -> i64`.
+type CallImportedRunnerFn = fn(*mut (), u32, &[i64]) -> i64;
+/// Indirect-call runner: `fn(data, table: u32, func_type: u32, runtime_index: u64, params) -> i64`.
+type CallIndirectRunnerFn = fn(*mut (), u32, u32, u64, &[i64]) -> i64;
 
 std::thread_local! {
     static CALL_RUNNER_FN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static CALL_RUNNER_DATA: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CALL_IMPORTED_RUNNER_FN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CALL_INDIRECT_RUNNER_FN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
-/// Register the call runner for the current kernel run.
+/// Register all call runners for the current kernel run.
 pub(crate) fn set_call_runner(f: CallRunnerFn, data: *mut ()) {
     CALL_RUNNER_FN.with(|c| c.set(f as usize));
     CALL_RUNNER_DATA.with(|c| c.set(data as usize));
+}
+
+/// Register imported/indirect call runners.
+pub(crate) fn set_imported_call_runners(
+    imported: CallImportedRunnerFn,
+    indirect: CallIndirectRunnerFn,
+) {
+    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(imported as usize));
+    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(indirect as usize));
 }
 
 /// Clear the call runner (called after `run_persistent` returns).
 pub(crate) fn clear_call_runner() {
     CALL_RUNNER_FN.with(|c| c.set(0));
     CALL_RUNNER_DATA.with(|c| c.set(0));
+    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(0));
+    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(0));
 }
 
 /// Records the per-run global raw-pointer table (see [`GLOBALS_CTX`]). The caller
@@ -238,6 +256,49 @@ extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
     f(data, func_addr as usize, &staging[..n])
 }
 
+/// Residual: execute an imported function call. Reads staged params and
+/// delegates to the [`CallImportedRunnerFn`] which resolves the `Func` handle
+/// through the store and dispatches to Wasm or Host.
+#[majit_macros::dont_look_inside]
+extern "C" fn call_imported_residual(func_index: i64, n_params: i64) -> i64 {
+    let runner_fn = CALL_IMPORTED_RUNNER_FN.with(|c| c.get());
+    let runner_data = CALL_RUNNER_DATA.with(|c| c.get());
+    if runner_fn == 0 {
+        set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+        return 0;
+    }
+    let f: CallImportedRunnerFn =
+        unsafe { core::mem::transmute::<usize, CallImportedRunnerFn>(runner_fn) };
+    let data = runner_data as *mut ();
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = CALL_STAGING_LEN.with(|c| c.get());
+    f(data, func_index as u32, &staging[..n])
+}
+
+/// Residual: execute an indirect function call. Reads staged params and
+/// delegates to the [`CallIndirectRunnerFn`] which performs table lookup,
+/// null check, type check, and Wasm/Host dispatch.
+#[majit_macros::dont_look_inside]
+extern "C" fn call_indirect_residual(
+    table: i64,
+    func_type: i64,
+    runtime_index: i64,
+    n_params: i64,
+) -> i64 {
+    let runner_fn = CALL_INDIRECT_RUNNER_FN.with(|c| c.get());
+    let runner_data = CALL_RUNNER_DATA.with(|c| c.get());
+    if runner_fn == 0 {
+        set_residual_trap(crate::TrapCode::UnreachableCodeReached);
+        return 0;
+    }
+    let f: CallIndirectRunnerFn =
+        unsafe { core::mem::transmute::<usize, CallIndirectRunnerFn>(runner_fn) };
+    let data = runner_data as *mut ();
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = CALL_STAGING_LEN.with(|c| c.get());
+    f(data, table as u32, func_type as u32, runtime_index as u64, &staging[..n])
+}
+
 /// Residual read of an integer global's raw `lo64` bits by wasm global index.
 /// Marked `#[dont_look_inside]` so it stays a real call in the compiled trace.
 /// The index is validated by wasm and the table covers every instance global, so
@@ -274,6 +335,12 @@ fn set_mem_ctx(base: i64, len: i64) {
     TRAP_CODE.with(|c| c.set(crate::TrapCode::MemoryOutOfBounds));
     BAIL_TO_STOCK.with(|b| b.set(false));
     YIELD_TO_STOCK.with(|y| y.set(false));
+}
+
+/// Update only the MEM_CTX base/len without resetting per-run flags.
+/// Called after a residual imported/indirect call that may trigger memory.grow.
+pub(crate) fn update_mem_ctx(base: i64, len: i64) {
+    MEM_CTX.with(|c| c.set((base, len)));
 }
 
 /// Returns `true` (once) if the last kernel run hit a `MINI_RETURN_BAIL`
@@ -2082,6 +2149,60 @@ fn wasm_mainloop(
                 state.slots[params_start] = result;
                 state.accum[0] = result;
                 pc += 4;
+            }
+            MINI_CALL_IMPORTED => {
+                // Execute an imported function call. Same param staging
+                // as MINI_CALL_RESIDUAL, but delegates to the imported-call
+                // runner which resolves the Func through the store.
+                let func_index = program[pc + 1];
+                let params_start = program[pc + 2] as usize;
+                let params_len = program[pc + 3] as usize;
+                let mut buf = [0i64; MAX_CALL_PARAMS];
+                let n = if params_len < MAX_CALL_PARAMS {
+                    params_len
+                } else {
+                    MAX_CALL_PARAMS
+                };
+                let mut i = 0;
+                while i < n {
+                    buf[i] = state.slots[params_start + i];
+                    i += 1;
+                }
+                CALL_STAGING.with(|c| c.set(buf));
+                CALL_STAGING_LEN.with(|c| c.set(n));
+                let result = call_imported_residual(func_index, n as i64);
+                state.slots[params_start] = result;
+                state.accum[0] = result;
+                pc += 4;
+            }
+            MINI_CALL_INDIRECT => {
+                // Execute an indirect function call. Reads the runtime
+                // table index from a slot, stages params, and delegates
+                // to the indirect-call runner for table lookup + type check.
+                let table = program[pc + 1];
+                let func_type = program[pc + 2];
+                let index_slot = program[pc + 3] as usize;
+                let params_start = program[pc + 4] as usize;
+                let params_len = program[pc + 5] as usize;
+                let runtime_index = state.slots[index_slot];
+                let mut buf = [0i64; MAX_CALL_PARAMS];
+                let n = if params_len < MAX_CALL_PARAMS {
+                    params_len
+                } else {
+                    MAX_CALL_PARAMS
+                };
+                let mut i = 0;
+                while i < n {
+                    buf[i] = state.slots[params_start + i];
+                    i += 1;
+                }
+                CALL_STAGING.with(|c| c.set(buf));
+                CALL_STAGING_LEN.with(|c| c.set(n));
+                let result =
+                    call_indirect_residual(table, func_type, runtime_index, n as i64);
+                state.slots[params_start] = result;
+                state.accum[0] = result;
+                pc += 6;
             }
             MINI_TRAP => {
                 // Unconditional trap (wasm `unreachable`). Set the trap code
