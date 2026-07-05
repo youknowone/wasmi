@@ -151,15 +151,20 @@ std::thread_local! {
     /// flushes it to the real frame before resuming the stock executor.
     static YIELD_SLOTS: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
 
-    /// Staging buffer for callee params set by the [`MINI_CALL_RESIDUAL`]
-    /// dispatch arm before calling [`call_internal_residual`]. The residual
-    /// reads params from here and writes them to the callee's fresh Stack.
-    static CALL_STAGING: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
+}
 
-    /// Per-run reusable Stack for callee execution via [`call_internal_residual`].
-    /// Allocated on first use, reset between calls.
-    static CALLEE_STACK: core::cell::RefCell<Option<super::super::state::Stack>> =
-        core::cell::RefCell::new(None);
+/// Maximum number of params for a single CallInternal. Wasm functions rarely
+/// exceed 8 params; 16 gives ample headroom without heap allocation.
+const MAX_CALL_PARAMS: usize = 16;
+
+std::thread_local! {
+    /// Fixed-size staging buffer for callee params. Written by the
+    /// [`MINI_CALL_RESIDUAL`] dispatch arm, read by [`call_internal_residual`].
+    /// No heap allocation.
+    static CALL_STAGING: core::cell::Cell<[i64; MAX_CALL_PARAMS]> =
+        const { core::cell::Cell::new([0i64; MAX_CALL_PARAMS]) };
+    /// The number of valid params in [`CALL_STAGING`].
+    static CALL_STAGING_LEN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// Opaque execution context for [`call_internal_residual`], set by `run_jit`
@@ -195,14 +200,15 @@ fn set_globals_ctx(table: *const *mut u64, count: usize) {
     GLOBALS_CTX.with(|c| c.set((table, count)));
 }
 
-/// Stage a single callee parameter into [`CALL_STAGING`]. Called from the
-/// [`MINI_CALL_RESIDUAL`] dispatch arm before invoking
-/// [`call_internal_residual`]. Isolated from the kernel loop so the
-/// `#[jit_interp]` proc macro does not parse RefCell borrows capturing state.
-fn call_stage_params(params: Vec<i64>) {
-    CALL_STAGING.with(|c| {
-        *c.borrow_mut() = params;
-    });
+/// Stage callee params into the fixed-size [`CALL_STAGING`] buffer. Called
+/// from the [`MINI_CALL_RESIDUAL`] dispatch arm before invoking
+/// [`call_internal_residual`]. No heap allocation.
+fn call_stage_params(buf: &[i64]) {
+    let mut arr = [0i64; MAX_CALL_PARAMS];
+    let n = buf.len().min(MAX_CALL_PARAMS);
+    arr[..n].copy_from_slice(&buf[..n]);
+    CALL_STAGING.with(|c| c.set(arr));
+    CALL_STAGING_LEN.with(|c| c.set(n));
 }
 
 /// Residual: execute an internal function call. Reads the staged params from
@@ -224,8 +230,9 @@ extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
     }
     let f: CallRunnerFn = unsafe { core::mem::transmute::<usize, CallRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let params = CALL_STAGING.with(|c| c.borrow().clone());
-    f(data, func_addr as usize, &params)
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = CALL_STAGING_LEN.with(|c| c.get());
+    f(data, func_addr as usize, &staging[..n])
 }
 
 /// Residual read of an integer global's raw `lo64` bits by wasm global index.
@@ -2342,19 +2349,21 @@ fn wasm_mainloop(
             }
             MINI_CALL_RESIDUAL => {
                 // Execute an internal function call via the registered call
-                // runner. Stage params from kernel slots, call the residual,
-                // and store the return value in the integer accumulator.
+                // runner. Stage params into the fixed-size TLS buffer (no heap
+                // allocation), call the residual, store the return value in ireg.
                 let func_addr = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
-                let mut params = alloc::vec![0i64; params_len];
+                let mut buf = [0i64; MAX_CALL_PARAMS];
+                let n = if params_len < MAX_CALL_PARAMS { params_len } else { MAX_CALL_PARAMS };
                 let mut i = 0;
-                while i < params_len {
-                    params[i] = state.slots[params_start + i];
+                while i < n {
+                    buf[i] = state.slots[params_start + i];
                     i += 1;
                 }
-                call_stage_params(params);
-                state.accum[0] = call_internal_residual(func_addr, params_len as i64);
+                CALL_STAGING.with(|c| c.set(buf));
+                CALL_STAGING_LEN.with(|c| c.set(n));
+                state.accum[0] = call_internal_residual(func_addr, n as i64);
                 pc += 4;
             }
             MINI_YIELD_STOCK => {

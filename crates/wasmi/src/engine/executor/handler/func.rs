@@ -245,11 +245,18 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         let (mem0, mem0_len) = utils::extract_mem0(self.store.prune(), self.instance);
         // Register the call runner so the kernel's call_internal_residual
         // can execute CallInternal instructions via the stock executor.
+        // Take the cached callee Stack from TLS (or create one). Avoids
+        // re-allocating a Stack on every run_jit call.
+        let callee_stack = CALLEE_STACK_CACHE.with(|c| {
+            c.borrow_mut().take().unwrap_or_else(|| {
+                Stack::new(&crate::engine::limits::StackConfig::default())
+            })
+        });
         let mut call_ctx = CallRunnerCtx {
             store: self.store.prune() as *mut crate::store::PrunedStore,
             code: self.code,
             instance: self.instance,
-            callee_stack: Stack::new(&crate::engine::limits::StackConfig::default()),
+            callee_stack,
         };
         super::majit::kernel::set_call_runner(
             call_runner_fn,
@@ -264,6 +271,8 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             globals_table.len(),
         );
         super::majit::kernel::clear_call_runner();
+        // Return the callee Stack to the TLS cache for reuse.
+        CALLEE_STACK_CACHE.with(|c| { *c.borrow_mut() = Some(call_ctx.callee_stack); });
         // The kernel yielded at a CallInternal. Flush the kernel's computed
         // slots to the real frame and resume the stock executor AT that
         // instruction — not from byte 0. This avoids double-applying side
