@@ -249,9 +249,24 @@ pub(crate) const MINI_BR_I64_NE_SS: i64 = 154;
 /// `target` if `(slots[lhs] as u64) < (slots[rhs] as u64)` (unsigned i64).
 pub(crate) const MINI_BR_U64_LT_SS: i64 = 155;
 /// `[MINI_RETURN_BAIL]` (1 word): signals to the caller that the kernel hit
-/// an instruction it cannot execute (tail call, internal call). The kernel
-/// returns a sentinel and the caller falls back to the stock executor.
+/// an instruction it cannot execute (tail call). The kernel returns and the
+/// caller falls back to the stock executor from the function start.
 pub(crate) const MINI_RETURN_BAIL: i64 = 156;
+/// `[MINI_YIELD_STOCK, byte_offset, num_slots]` (3 words): yield to the stock
+/// executor AT the indicated byte offset. Unlike [`MINI_RETURN_BAIL`] (which
+/// reruns the function from byte 0), this flushes the kernel's computed slots
+/// to the real frame and resumes the stock executor at `byte_offset` — the
+/// position of a CallInternal the kernel cannot handle. No double-apply of
+/// side effects because execution continues from the exact instruction, not
+/// from the start.
+pub(crate) const MINI_YIELD_STOCK: i64 = 157;
+/// `[MINI_CALL_RESIDUAL, func_addr, params_start, params_len]` (4 words):
+/// execute an internal function call via a `#[dont_look_inside]` residual.
+/// The kernel stages `slots[params_start..params_start+params_len]` into a
+/// TLS buffer, then calls `call_internal_residual(func_addr, params_len)`.
+/// The return value goes into `ireg` (integer accumulator). The JIT treats
+/// the residual as an opaque call — the callee is not traced.
+pub(crate) const MINI_CALL_RESIDUAL: i64 = 158;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -4437,11 +4452,20 @@ pub(crate) fn prepass(
                 words.push(MINI_RETURN_BAIL);
             }
             OpCode::CallInternal => {
-                // Bail the entire function — CallInternal requires frame
-                // management the kernel cannot perform. The stock executor
-                // handles it natively.
-                let _op = decode::CallInternal::decode(&mut cursor).ok()?;
-                return None;
+                // Execute the call via a #[dont_look_inside] residual. The
+                // kernel stages params from its slots, calls the residual which
+                // executes the callee on a separate Stack, and stores the return
+                // value in ireg. The kernel continues execution after the call.
+                let op = decode::CallInternal::decode(&mut cursor).ok()?;
+                let func_addr = usize::from(op.func) as i64;
+                let params_start = i64::from(u16::from(op.params.span().head()));
+                let params_len = i64::from(op.params.len());
+                words.extend_from_slice(&[
+                    MINI_CALL_RESIDUAL,
+                    func_addr,
+                    params_start,
+                    params_len,
+                ]);
             }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
