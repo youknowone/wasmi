@@ -267,6 +267,13 @@ pub(crate) const MINI_YIELD_STOCK: i64 = 157;
 /// The return value goes into `ireg` (integer accumulator). The JIT treats
 /// the residual as an opaque call — the callee is not traced.
 pub(crate) const MINI_CALL_RESIDUAL: i64 = 158;
+/// `[MINI_TRAP, trap_code_u8]` (2 words): unconditional trap. Sets the trap
+/// code via [`set_residual_trap`] and returns 0. The caller surfaces the trap
+/// directly.
+pub(crate) const MINI_TRAP: i64 = 159;
+/// `[MINI_MEMORY_SIZE]` (1 word): return the current memory size in pages
+/// (`mem_len / 65536`) into ireg. Reads from the [`MEM_CTX`] TLS.
+pub(crate) const MINI_MEMORY_SIZE: i64 = 160;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -3788,6 +3795,45 @@ pub(crate) fn prepass(
                     params_len,
                 ]);
             }
+            OpCode::Trap => {
+                let _op = decode::Trap::decode(&mut cursor).ok()?;
+                return None;
+            }
+            OpCode::MemorySize => {
+                let op = decode::MemorySize::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 { return None; }
+                // Result goes into ireg (RegInt). MINI_MEMORY_SIZE is 1 word.
+                words.push(MINI_MEMORY_SIZE);
+            }
+            OpCode::U32LoadExtend8_Rr => {
+                // ptr+offset both dynamic (Reg operands). Yield to stock.
+                let _op = decode::U32LoadExtend8_Rr::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
+            OpCode::U32LoadExtend16_Ri => {
+                let op = decode::U32LoadExtend16_Ri::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 { return None; }
+                // _Ri = address is Immediate. Materialize → ireg, u16 load offset 0.
+                let addr = u64::from(op.address) as i64;
+                words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_U16_LOAD_MEM0_OFF, 0]);
+            }
+            OpCode::U64Store_Is => {
+                let op = decode::U64Store_Is::decode(&mut cursor).ok()?;
+                if u32::from(op.memory) != 0 { return None; }
+                // _Is = address is Imm (Address), value in Slot.
+                // Decompose: address → ireg, then i64 store with value slot.
+                let addr = u64::from(op.address) as i64;
+                let val = i64::from(u16::from(op.value));
+                words.extend_from_slice(&[
+                    MINI_COPY_RI, addr,
+                    MINI_I64_STORE_RS, 0, val,
+                ]);
+            }
+            OpCode::CallIndirect_S => {
+                // Indirect call — yield to stock executor.
+                let _op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+            }
             // Any other op makes the function ineligible for the JIT tier.
             #[allow(unused_variables)]
             other => {
@@ -6812,14 +6858,13 @@ mod tests {
     /// caller will fall back to the stock executor.
     #[test]
     fn prepass_rejects_unsupported_ops() {
-        // `call_indirect` without a table (host-provided) is not in the
-        // subset — the prepass cannot handle it.
+        // `memory.grow` is not in the prepass subset — the function must be
+        // rejected as ineligible.
         const INDIRECT_WAT: &str = r#"
             (module
-                (type $ft (func (param i32) (result i32)))
-                (table $t 10 funcref)
+                (memory 1)
                 (func (export "f") (param $p i32) (result i32)
-                    (call_indirect $t (type $ft) (local.get $p) (i32.const 0))))
+                    (memory.grow (local.get $p))))
         "#;
         let wasm = wat::parse_str(INDIRECT_WAT).expect("wat parse");
         let engine = Engine::default();
@@ -6830,7 +6875,7 @@ mod tests {
             .expect("function compiled");
         assert!(
             result.is_none(),
-            "call_indirect op must make the function ineligible"
+            "memory.grow op must make the function ineligible"
         );
     }
 }
