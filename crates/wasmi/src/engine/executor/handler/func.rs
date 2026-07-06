@@ -34,12 +34,13 @@ pub struct WasmFuncCall<'a, T, State> {
     freg32: Freg32,
     freg64: Freg64,
     /// majit JIT tier handle if this function is eligible: `(cache_key,
-    /// num_slots, writes_result, action)`, where `cache_key = ops.as_ptr()`
+    /// num_slots, writes_result, action, slot_map)`, where `cache_key = ops.as_ptr()`
     /// indexes the per-function cache (prepassed once at call init), `writes_result`
-    /// is false for a no-result function, and `action` is this call's adaptive tier
-    /// decision. `None` -> stock executor (ineligible or majit disabled).
+    /// is false for a no-result function, `action` is this call's adaptive tier
+    /// decision, and `slot_map` maps dense slot indices to original frame slots.
+    /// `None` -> stock executor (ineligible or majit disabled).
     #[cfg(feature = "majit-jit")]
-    majit: Option<(usize, usize, bool, super::majit::kernel::TierAction)>,
+    majit: Option<(usize, usize, bool, super::majit::kernel::TierAction, alloc::vec::Vec<u16>)>,
 }
 
 impl<'a, T, State> WasmFuncCall<'a, T, State> {
@@ -122,8 +123,9 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         // `self.majit` is `Some` only when majit is enabled and the function is
         // eligible (decided once at call init, carrying this call's tier action).
         #[cfg(feature = "majit-jit")]
-        if let Some((key, num_slots, writes_result, action)) = self.majit {
-            return self.execute_majit(key, num_slots, writes_result, action);
+        if let Some((key, num_slots, writes_result, action, ref slot_map)) = self.majit {
+            let slot_map = slot_map.clone();
+            return self.execute_majit(key, num_slots, writes_result, action, &slot_map);
         }
         self.execute_stock()
     }
@@ -179,14 +181,15 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         num_slots: usize,
         writes_result: bool,
         action: super::majit::kernel::TierAction,
+        slot_map: &[u16],
     ) -> Result<Sp, ExecutionOutcome> {
         use super::majit::kernel::{self, TierAction};
         match action {
             TierAction::Stock => self.execute_stock(),
-            TierAction::Jit => self.run_jit(key, num_slots, writes_result),
+            TierAction::Jit => self.run_jit(key, num_slots, writes_result, slot_map),
             TierAction::ProbeJit => {
                 let t = std::time::Instant::now();
-                let r = self.run_jit(key, num_slots, writes_result);
+                let r = self.run_jit(key, num_slots, writes_result, slot_map);
                 kernel::record_probe_jit(key, t.elapsed().as_nanos() as u64);
                 r
             }
@@ -213,13 +216,14 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         key: usize,
         num_slots: usize,
         writes_result: bool,
+        slot_map: &[u16],
     ) -> Result<Sp, ExecutionOutcome> {
-        // Allocate the real frame slots plus the prepass's reserved scratch slots
-        // (used for operand pre-materialization); only the real slots are seeded
-        // from the caller's frame, the scratch tail stays zero.
+        // Allocate the dense slots plus the prepass's reserved scratch slots
+        // (used for operand pre-materialization); seed each dense slot from the
+        // original frame position via slot_map, the scratch tail stays zero.
         let mut slots = alloc::vec![0i64; num_slots + super::majit::prepass::NUM_SCRATCH];
-        for (i, slot) in slots.iter_mut().take(num_slots).enumerate() {
-            *slot = unsafe { self.callee_sp.get::<i64>(Slot::from(i as u16)) };
+        for (dense_idx, &orig) in slot_map.iter().enumerate() {
+            slots[dense_idx] = unsafe { self.callee_sp.get::<i64>(Slot::from(orig)) };
         }
         // The per-run table of raw pointers to the instance's globals (only built
         // when the function references globals). Kept alive across the run; the
@@ -294,9 +298,11 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             let flushed = super::majit::kernel::take_yield_slots();
             let byte_offset = super::majit::kernel::take_yield_offset() as usize;
             // Flush kernel slots to the real frame so the CallInternal handler
-            // reads correct parameter values from the frame.
-            for (i, &val) in flushed.iter().enumerate() {
-                unsafe { self.callee_sp.set::<i64>(Slot::from(i as u16), val) };
+            // reads correct parameter values from the frame. Each dense slot
+            // maps to its original frame position via slot_map.
+            for (dense_idx, &val) in flushed.iter().enumerate() {
+                let orig = slot_map.get(dense_idx).copied().unwrap_or(dense_idx as u16);
+                unsafe { self.callee_sp.set::<i64>(Slot::from(orig), val) };
             }
             // Resume the stock executor at the CallInternal instruction.
             let yield_ip = unsafe { self.callee_ip.add(byte_offset) };
@@ -393,8 +399,8 @@ pub fn init_wasm_func_call<'a, T>(
     // stock executor. `majit` carries `(cache_key, num_slots)` when eligible.
     #[cfg(feature = "majit-jit")]
     let majit = super::majit::kernel::ensure_cached(ops, len_local_slots, len_stack_slots).map(
-        |(num_slots, writes_result, action)| {
-            (ops.as_ptr() as usize, num_slots, writes_result, action)
+        |(num_slots, writes_result, action, slot_map)| {
+            (ops.as_ptr() as usize, num_slots, writes_result, action, slot_map)
         },
     );
     // Note: using a length of 0 for `callee_params` simply has the effect that all frame
@@ -590,12 +596,15 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
     // the callee's hot loop benefit from majit compilation.
     let ca_result =
         super::majit::kernel::ensure_callee_cached(callee_ops, len_local_slots, len_stack_slots);
-    if let Some((callee_key, callee_num_slots, callee_uses_globals)) = ca_result {
-        // Seed the callee's slot array: params first, rest zeroed.
+    if let Some((callee_key, callee_num_slots, callee_uses_globals, callee_slot_map)) = ca_result {
+        // Seed the callee's dense slot array: params go into the dense
+        // positions corresponding to original frame slots 0, 1, 2, ...
         let total = callee_num_slots + super::majit::prepass::NUM_SCRATCH;
         let mut init_slots = alloc::vec![0i64; total];
-        for (i, &val) in params.iter().enumerate() {
-            init_slots[i] = val;
+        for (dense_idx, &orig) in callee_slot_map.iter().enumerate() {
+            if (orig as usize) < params.len() {
+                init_slots[dense_idx] = params[orig as usize];
+            }
         }
         // Resolve globals only if the callee references them.
         let globals_table = if callee_uses_globals {

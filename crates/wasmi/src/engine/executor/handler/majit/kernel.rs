@@ -2370,6 +2370,12 @@ impl TierPolicy {
     /// [`TierPolicy::Stock`]; the probe counts themselves advance only when a
     /// timed run is recorded (`record_*`).
     fn next_action(&mut self) -> TierAction {
+        // Force JIT tier for all eligible functions (bypasses probing).
+        #[cfg(feature = "std")]
+        if std::env::var_os("WASMI_MAJIT_FORCE_JIT").is_some() {
+            *self = TierPolicy::Jit;
+            return TierAction::Jit;
+        }
         match self {
             TierPolicy::Jit => TierAction::Jit,
             TierPolicy::Stock => TierAction::Stock,
@@ -2422,19 +2428,21 @@ pub(crate) fn record_probe_stock(key: usize, ns: u64) {
 /// state machine, and report this call's dispatch — all under a single cache
 /// lookup.
 ///
-/// Returns `Some((num_slots, writes_result, action))` for a JIT-eligible
-/// function (its MiniProgram is cached under `ops.as_ptr()`), or `None` to run on
-/// the stock executor — either the prepass rejected the function or majit is
-/// disabled. `writes_result` is false for a no-result function (the caller must
-/// not write a result slot). The cache key for the matching [`run_persistent`]
-/// call is `ops.as_ptr() as usize`. Folding the prepass and tier decision into
-/// one [`PROGRAMS`] borrow avoids a second per-call map lookup on the committed
+/// Returns `Some((num_slots, writes_result, action, slot_map))` for a
+/// JIT-eligible function (its MiniProgram is cached under `ops.as_ptr()`),
+/// or `None` to run on the stock executor — either the prepass rejected the
+/// function or majit is disabled. `writes_result` is false for a no-result
+/// function (the caller must not write a result slot). `slot_map` maps each
+/// dense slot index to the original frame slot index (for seed/writeback).
+/// The cache key for the matching [`run_persistent`] call is
+/// `ops.as_ptr() as usize`. Folding the prepass and tier decision into one
+/// [`PROGRAMS`] borrow avoids a second per-call map lookup on the committed
 /// steady state.
 pub(crate) fn ensure_cached(
     ops: &[u8],
     len_local_slots: u16,
     len_stack_slots: u16,
-) -> Option<(usize, bool, TierAction)> {
+) -> Option<(usize, bool, TierAction, Vec<u16>)> {
     if !super::majit_enabled() {
         return None;
     }
@@ -2447,8 +2455,8 @@ pub(crate) fn ensure_cached(
             if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                 match &result {
                     Some(p) => eprintln!(
-                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}), yield_or_bail={}, globals={}, loop_header={:?}",
-                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
+                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}), yield_or_bail={}, globals={}, loop_header={:?}",
+                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
                     ),
                     None => eprintln!(
                         "[majit-prepass] INELIGIBLE key={:#x} ops={}",
@@ -2473,6 +2481,7 @@ pub(crate) fn ensure_cached(
             cached.program.num_slots,
             cached.program.writes_result,
             cached.policy.next_action(),
+            cached.program.slot_map.clone(),
         ))
     })
 }
@@ -2486,7 +2495,7 @@ pub(crate) fn ensure_callee_cached(
     ops: &[u8],
     len_local_slots: u16,
     len_stack_slots: u16,
-) -> Option<(usize, usize, bool)> {
+) -> Option<(usize, usize, bool, Vec<u16>)> {
     let key = ops.as_ptr() as usize;
     PROGRAMS.with(|p| {
         let mut progs = p.borrow_mut();
@@ -2509,7 +2518,7 @@ pub(crate) fn ensure_callee_cached(
         if cached.program.has_yield_or_bail {
             return None;
         }
-        Some((key, cached.program.num_slots, cached.program.uses_globals))
+        Some((key, cached.program.num_slots, cached.program.uses_globals, cached.program.slot_map.clone()))
     })
 }
 

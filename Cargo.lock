@@ -1126,6 +1126,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "indexmap",
  "majit-backend",
  "majit-gc",
  "majit-ir",
@@ -1137,6 +1138,7 @@ dependencies = [
 name = "majit-backend-wasm"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "majit-backend",
  "majit-gc",
  "majit-ir",
@@ -1156,6 +1158,7 @@ dependencies = [
 name = "majit-gc"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "libc",
  "majit-ir",
 ]
@@ -1164,6 +1167,7 @@ dependencies = [
 name = "majit-ir"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "serde",
  "smallvec",
  "vecmap-rs",
@@ -1182,6 +1186,7 @@ dependencies = [
 name = "majit-metainterp"
 version = "0.0.2"
 dependencies = [
+ "bit-set",
  "indexmap",
  "majit-backend",
  "majit-backend-cranelift",
@@ -1198,6 +1203,8 @@ dependencies = [
 name = "majit-trace"
 version = "0.0.2"
 dependencies = [
+ "bit-set",
+ "indexmap",
  "majit-backend",
  "majit-gc",
  "majit-ir",
