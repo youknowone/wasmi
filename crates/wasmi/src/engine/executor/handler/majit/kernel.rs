@@ -162,13 +162,11 @@ std::thread_local! {
 const MAX_CALL_PARAMS: usize = 16;
 
 std::thread_local! {
-    /// Fixed-size staging buffer for callee params. Written by the
-    /// [`MINI_CALL_RESIDUAL`] dispatch arm, read by [`call_internal_residual`].
-    /// No heap allocation.
-    static CALL_STAGING: core::cell::Cell<[i64; MAX_CALL_PARAMS]> =
-        const { core::cell::Cell::new([0i64; MAX_CALL_PARAMS]) };
-    /// The number of valid params in [`CALL_STAGING`].
-    static CALL_STAGING_LEN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Combined staging buffer + length for callee params. One TLS access
+    /// instead of two per read/write side. The full 128-byte array is copied
+    /// via Cell::set/get, but the merge halves the `.with()` call overhead.
+    static CALL_STAGING: core::cell::Cell<([i64; MAX_CALL_PARAMS], usize)> =
+        const { core::cell::Cell::new(([0i64; MAX_CALL_PARAMS], 0)) };
 }
 
 /// Opaque execution context for [`call_internal_residual`], set by `run_jit`
@@ -228,8 +226,7 @@ fn call_stage_params(buf: &[i64]) {
     let mut arr = [0i64; MAX_CALL_PARAMS];
     let n = buf.len().min(MAX_CALL_PARAMS);
     arr[..n].copy_from_slice(&buf[..n]);
-    CALL_STAGING.with(|c| c.set(arr));
-    CALL_STAGING_LEN.with(|c| c.set(n));
+    CALL_STAGING.with(|c| c.set((arr, n)));
 }
 
 /// Residual: execute an internal function call. Reads the staged params from
@@ -251,8 +248,7 @@ extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
     }
     let f: CallRunnerFn = unsafe { core::mem::transmute::<usize, CallRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let staging = CALL_STAGING.with(|c| c.get());
-    let n = CALL_STAGING_LEN.with(|c| c.get());
+    let (staging, n) = CALL_STAGING.with(|c| c.get());
     f(data, func_addr as usize, &staging[..n])
 }
 
@@ -270,8 +266,7 @@ extern "C" fn call_imported_residual(func_index: i64, n_params: i64) -> i64 {
     let f: CallImportedRunnerFn =
         unsafe { core::mem::transmute::<usize, CallImportedRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let staging = CALL_STAGING.with(|c| c.get());
-    let n = CALL_STAGING_LEN.with(|c| c.get());
+    let (staging, n) = CALL_STAGING.with(|c| c.get());
     f(data, func_index as u32, &staging[..n])
 }
 
@@ -294,8 +289,7 @@ extern "C" fn call_indirect_residual(
     let f: CallIndirectRunnerFn =
         unsafe { core::mem::transmute::<usize, CallIndirectRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let staging = CALL_STAGING.with(|c| c.get());
-    let n = CALL_STAGING_LEN.with(|c| c.get());
+    let (staging, n) = CALL_STAGING.with(|c| c.get());
     f(data, table as u32, func_type as u32, runtime_index as u64, &staging[..n])
 }
 
@@ -2143,8 +2137,7 @@ fn wasm_mainloop(
                     buf[i] = state.slots[params_start + i];
                     i += 1;
                 }
-                CALL_STAGING.with(|c| c.set(buf));
-                CALL_STAGING_LEN.with(|c| c.set(n));
+                CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_internal_residual(func_addr, n as i64);
                 state.slots[params_start] = result;
                 state.accum[0] = result;
@@ -2168,8 +2161,7 @@ fn wasm_mainloop(
                     buf[i] = state.slots[params_start + i];
                     i += 1;
                 }
-                CALL_STAGING.with(|c| c.set(buf));
-                CALL_STAGING_LEN.with(|c| c.set(n));
+                CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_imported_residual(func_index, n as i64);
                 state.slots[params_start] = result;
                 state.accum[0] = result;
@@ -2196,8 +2188,7 @@ fn wasm_mainloop(
                     buf[i] = state.slots[params_start + i];
                     i += 1;
                 }
-                CALL_STAGING.with(|c| c.set(buf));
-                CALL_STAGING_LEN.with(|c| c.set(n));
+                CALL_STAGING.with(|c| c.set((buf, n)));
                 let result =
                     call_indirect_residual(table, func_type, runtime_index, n as i64);
                 state.slots[params_start] = result;
