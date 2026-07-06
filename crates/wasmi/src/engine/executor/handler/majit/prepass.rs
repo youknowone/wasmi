@@ -3869,9 +3869,17 @@ pub(crate) fn prepass(
                 words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_I64_STORE_RS, 0, val]);
             }
             OpCode::CallIndirect_S => {
-                // Indirect call — yield to stock executor pending funcref bug fix.
-                let _op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                // Indirect call — residual through the kernel.
+                let op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
+                let table = u32::from(op.table) as i64;
+                let func_type = u32::from(op.func_type) as i64;
+                let index_slot = i64::from(u16::from(op.index));
+                let params_start = i64::from(u16::from(op.params.span().head()));
+                let params_len = i64::from(op.params.len());
+                words.extend_from_slice(&[
+                    MINI_CALL_INDIRECT, table, func_type, index_slot,
+                    params_start, params_len,
+                ]);
                 has_yield_or_bail = true;
             }
             // -- Bail ops that unblock runtime infrastructure functions --
@@ -4194,9 +4202,17 @@ pub(crate) fn prepass(
                 ]);
             }
             OpCode::CallIndirect_R => {
-                // Indirect call via Reg index — yield to stock executor pending funcref bug fix.
-                let _op = decode::CallIndirect_R::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                // Indirect call via Reg index — residual through the kernel.
+                let op = decode::CallIndirect_R::decode(&mut cursor).ok()?;
+                let table = u32::from(op.table) as i64;
+                let func_type = u32::from(op.func_type) as i64;
+                let params_start = i64::from(u16::from(op.params.span().head()));
+                let params_len = i64::from(op.params.len());
+                words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
+                words.extend_from_slice(&[
+                    MINI_CALL_INDIRECT, table, func_type, scratch_base,
+                    params_start, params_len,
+                ]);
                 has_yield_or_bail = true;
             }
             OpCode::BranchU32Lt_Si => {

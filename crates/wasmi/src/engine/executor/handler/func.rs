@@ -679,17 +679,21 @@ fn call_runner_fn(data: *mut (), func_addr: usize, params: &[i64]) -> i64 {
 /// Host functions are not yet supported (trap).
 #[cfg(feature = "majit-jit")]
 fn call_imported_runner_fn(data: *mut (), func_index: u32, params: &[i64]) -> i64 {
-    let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
-    let store = unsafe { &mut *ctx.store };
-
-    // Resolve Func from the instance.
-    let func_handle =
-        utils::fetch_func(ctx.instance, crate::ir::index::Func::from(func_index));
-    let result = run_resolved_func(data, store, func_handle, params);
+    // Resolve Func from the instance under a short borrow, then drop
+    // all borrows before run_resolved_func (which re-borrows via `data`).
+    let (func_handle, instance) = {
+        let ctx = unsafe { &*(data as *const CallRunnerCtx) };
+        let func =
+            utils::fetch_func(ctx.instance, crate::ir::index::Func::from(func_index));
+        (func, ctx.instance)
+    };
+    // All borrows dropped — run_resolved_func can safely re-borrow via data.
+    let result = run_resolved_func(data, func_handle, params);
 
     // Re-extract MEM_CTX: the callee (especially a host function) may have
     // triggered memory.grow, invalidating the kernel's cached mem0 pointer.
-    let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+    let store = unsafe { &mut *(*(data as *const CallRunnerCtx)).store };
+    let (mem0, mem0_len) = utils::extract_mem0(store, instance);
     super::majit::kernel::update_mem_ctx(mem0.addr() as i64, mem0_len.get() as i64);
 
     result
@@ -705,18 +709,23 @@ fn call_indirect_runner_fn(
     runtime_index: u64,
     params: &[i64],
 ) -> i64 {
-    let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
-    let store = unsafe { &mut *ctx.store };
-
-    // Table lookup → Func handle.
-    let func_handle = match resolve_indirect(ctx, store, table_idx, func_type_idx, runtime_index) {
-        Some(f) => f,
-        None => return 0, // trap already set
+    // Resolve the target under a short borrow, then drop all borrows
+    // before run_resolved_func (which re-borrows via `data`).
+    let (func_handle, instance) = {
+        let ctx = unsafe { &*(data as *const CallRunnerCtx) };
+        let store = unsafe { &mut *ctx.store };
+        let func = match resolve_indirect(ctx, store, table_idx, func_type_idx, runtime_index) {
+            Some(f) => f,
+            None => return 0, // trap already set
+        };
+        (func, ctx.instance)
     };
-    let result = run_resolved_func(data, store, func_handle, params);
+    // All borrows dropped.
+    let result = run_resolved_func(data, func_handle, params);
 
     // Re-extract MEM_CTX after the call.
-    let (mem0, mem0_len) = utils::extract_mem0(store, ctx.instance);
+    let store = unsafe { &mut *(*(data as *const CallRunnerCtx)).store };
+    let (mem0, mem0_len) = utils::extract_mem0(store, instance);
     super::majit::kernel::update_mem_ctx(mem0.addr() as i64, mem0_len.get() as i64);
 
     result
@@ -765,27 +774,45 @@ fn resolve_indirect(
     Some(func)
 }
 
-/// Run a resolved `Func` handle on the stock executor.
-/// Wasm functions: compile + execute_until_done on callee stack.
-/// Host functions: not yet supported (trap).
+/// Run a resolved `Func` handle. Borrows CallRunnerCtx via `data`.
+/// Wasm: resolves FuncEntry and delegates to call_runner_fn.
+/// Host: prepares host frame and calls trampoline.
 #[cfg(feature = "majit-jit")]
-fn run_resolved_func(
-    data: *mut (),
-    store: &mut crate::store::PrunedStore,
-    func: Func,
-    params: &[i64],
-) -> i64 {
-    let func_entity = utils::resolve_func(store, &func);
-    match func_entity {
-        FuncEntity::Wasm(wasm_func) => {
-            // Resolve the wasm function to its FuncEntry and delegate to
-            // call_runner_fn via the raw pointer. This reuses the existing
-            // CALL_ASSEMBLER + stock fallback infrastructure.
-            let func_body = wasm_func.func_body();
-            // FuncEntry lives in the engine's append-only CodeMap. Recover
-            // its raw pointer the same way CallInternal encodes it.
-            let func_entry = match store.inner().engine().resolve_func(func_body) {
-                Some(entry) => entry,
+fn run_resolved_func(data: *mut (), func: Func, params: &[i64]) -> i64 {
+    // Resolve the Func to determine Wasm vs Host, then extract only
+    // the data needed before dropping the store borrow.
+    enum Resolved {
+        Wasm(EngineFunc, Inst),
+        Host(HostFuncEntity),
+    }
+    let resolved = {
+        let store = unsafe { &mut *(*(data as *const CallRunnerCtx)).store };
+        let func_entity = utils::resolve_func(store, &func);
+        match func_entity {
+            FuncEntity::Wasm(wasm_func) => {
+                let func_body = wasm_func.func_body();
+                let callee_instance = *wasm_func.instance();
+                let callee_inst: Inst =
+                    resolve_instance(store, &callee_instance).into();
+                Resolved::Wasm(func_body, callee_inst)
+            }
+            FuncEntity::Host(host_func) => Resolved::Host(*host_func),
+        }
+    };
+    // Store borrow dropped.
+    match resolved {
+        Resolved::Wasm(func_body, callee_inst) => {
+            // Run the wasm callee on the stock executor (same path as
+            // call_runner_fn's stock fallback, without the FuncEntry
+            // pointer indirection that caused SIGSEGV).
+            let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
+            let store = unsafe { &mut *ctx.store };
+
+            // Recover a raw pointer to the FuncEntry, then drop the
+            // immutable store borrow so get_or_compile can mutably
+            // borrow fuel.
+            let func_entry_ptr = match store.inner().engine().resolve_func(func_body) {
+                Some(entry) => core::ptr::from_ref(entry),
                 None => {
                     super::majit::kernel::set_residual_trap(
                         crate::TrapCode::UnreachableCodeReached,
@@ -793,26 +820,72 @@ fn run_resolved_func(
                     return 0;
                 }
             };
-            let func_addr = core::ptr::from_ref(func_entry).expose_provenance();
-            call_runner_fn(data, func_addr, params)
+            // SAFETY: FuncEntry lives in the engine's append-only CodeMap;
+            // the pointer is stable (no resize after allocation).
+            let func_entry = unsafe { &*func_entry_ptr };
+            let compiled = match func_entry
+                .get_or_compile(
+                    Some(store.inner_mut().fuel_mut()),
+                    ctx.code.features(),
+                ) {
+                Ok(c) => c,
+                Err(_) => {
+                    super::majit::kernel::set_residual_trap(
+                        crate::TrapCode::UnreachableCodeReached,
+                    );
+                    return 0;
+                }
+            };
+
+            let callee_ip = Ip::from(compiled.ops());
+            ctx.callee_stack.reset();
+
+            let callee_params =
+                BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), params.len() as u16);
+            let callee_sp = match ctx.callee_stack.push_frame(
+                None,
+                callee_ip,
+                callee_params,
+                compiled.len_local_slots(),
+                compiled.len_stack_slots(),
+                Some(callee_inst),
+            ) {
+                Ok(sp) => sp,
+                Err(_) => {
+                    super::majit::kernel::set_residual_trap(crate::TrapCode::StackOverflow);
+                    return 0;
+                }
+            };
+
+            for (i, &val) in params.iter().enumerate() {
+                unsafe { callee_sp.set::<i64>(Slot::from(i as u16), val) };
+            }
+
+            let (mem0, mem0_len) = utils::extract_mem0(store, callee_inst);
+            let (ireg, freg32, freg64) = ctx.callee_stack.regs();
+            let mut vm = VmState::new(store, &mut ctx.callee_stack, ctx.code);
+            match execute_until_done(
+                &mut vm, callee_ip, callee_sp, mem0, mem0_len, callee_inst,
+                ireg, freg32, freg64,
+            ) {
+                Ok(sp) => unsafe { sp.get::<i64>(Slot::from(0)) },
+                Err(_) => {
+                    super::majit::kernel::set_residual_trap(
+                        crate::TrapCode::UnreachableCodeReached,
+                    );
+                    0
+                }
+            }
         }
-        FuncEntity::Host(host_func) => {
-            let host_func = *host_func;
+        Resolved::Host(host_func) => {
             let trampoline = *host_func.trampoline();
             let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
             let store = unsafe { &mut *ctx.store };
 
-            // Reset the callee stack. No push_frame needed: the host
-            // call path uses prepare_host_frame directly (same as
-            // init_host_func_call). On a freshly-reset stack the
-            // frame start is SpOffset(0), so params at head=0 alias
-            // the value-stack base.
             ctx.callee_stack.reset();
             let callee_params =
                 BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), params.len() as u16);
 
-            // prepare_host_frame grows the value stack and returns
-            // (sp, inout) where inout borrows the param/result cells.
             let (sp, inout) = match ctx.callee_stack.prepare_host_frame(
                 None,
                 callee_params,
@@ -825,14 +898,10 @@ fn run_resolved_func(
                 }
             };
 
-            // Write params into the frame: sp points to the base and
-            // the inout cells alias the same region, so the host
-            // trampoline will see them.
             for (i, &val) in params.iter().enumerate() {
                 unsafe { sp.set::<i64>(Slot::from(i as u16), val) };
             }
 
-            // Call the host function through the store trampoline.
             match store.call_host_func(trampoline, Some(ctx.instance), inout, CallHooks::Call) {
                 Ok(()) => unsafe { sp.get::<i64>(Slot::from(0)) },
                 Err(_) => {
