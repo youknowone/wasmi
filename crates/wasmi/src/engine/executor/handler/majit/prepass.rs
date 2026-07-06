@@ -3869,7 +3869,7 @@ pub(crate) fn prepass(
                 words.extend_from_slice(&[MINI_COPY_RI, addr, MINI_I64_STORE_RS, 0, val]);
             }
             OpCode::CallIndirect_S => {
-                // Indirect call — yield to stock executor.
+                // Indirect call — yield to stock executor pending funcref bug fix.
                 let _op = decode::CallIndirect_S::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
@@ -4194,7 +4194,7 @@ pub(crate) fn prepass(
                 ]);
             }
             OpCode::CallIndirect_R => {
-                // Indirect call via Reg index — yield to stock executor.
+                // Indirect call via Reg index — yield to stock executor pending funcref bug fix.
                 let _op = decode::CallIndirect_R::decode(&mut cursor).ok()?;
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
@@ -4304,13 +4304,19 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::CallImported => {
-                // Imported function call — yield to stock executor.
-                // The target may be a host function that requires store
-                // access for the trampoline dispatch (not yet supported as
-                // a kernel residual). When the target is always a wasm
-                // function, use MINI_CALL_IMPORTED instead.
-                let _op = decode::CallImported::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
+                // Imported function call — dispatch through the imported-call
+                // runner which resolves the Func handle via the store, then
+                // executes either the wasm callee or a host trampoline.
+                let op = decode::CallImported::decode(&mut cursor).ok()?;
+                let func_idx = u32::from(op.func) as i64;
+                let params_start = i64::from(u16::from(op.params.span().head()));
+                let params_len = i64::from(op.params.len());
+                words.extend_from_slice(&[
+                    MINI_CALL_IMPORTED,
+                    func_idx,
+                    params_start,
+                    params_len,
+                ]);
                 has_yield_or_bail = true;
             }
             OpCode::MemoryCopy => {

@@ -757,7 +757,7 @@ fn resolve_indirect(
     let expected_fnty =
         utils::fetch_func_type(ctx.instance, crate::ir::index::FuncType::from(func_type_idx));
     let actual_fnty = utils::resolve_func(store, &func).ty_dedup();
-    if *actual_fnty != expected_fnty {
+    if expected_fnty.ne(actual_fnty) {
         super::majit::kernel::set_residual_trap(crate::TrapCode::BadSignature);
         return None;
     }
@@ -796,12 +796,52 @@ fn run_resolved_func(
             let func_addr = core::ptr::from_ref(func_entry).expose_provenance();
             call_runner_fn(data, func_addr, params)
         }
-        FuncEntity::Host(_host_func) => {
-            // Host function call from inside the kernel is not yet supported.
-            // This would require preparing a host frame and invoking the
-            // trampoline. For now, trap.
-            super::majit::kernel::set_residual_trap(crate::TrapCode::UnreachableCodeReached);
-            0
+        FuncEntity::Host(host_func) => {
+            let host_func = *host_func;
+            let trampoline = *host_func.trampoline();
+            let ctx = unsafe { &mut *(data as *mut CallRunnerCtx) };
+            let store = unsafe { &mut *ctx.store };
+
+            // Reset the callee stack. No push_frame needed: the host
+            // call path uses prepare_host_frame directly (same as
+            // init_host_func_call). On a freshly-reset stack the
+            // frame start is SpOffset(0), so params at head=0 alias
+            // the value-stack base.
+            ctx.callee_stack.reset();
+            let callee_params =
+                BoundedSlotSpan::new(SlotSpan::new(Slot::from(0)), params.len() as u16);
+
+            // prepare_host_frame grows the value stack and returns
+            // (sp, inout) where inout borrows the param/result cells.
+            let (sp, inout) = match ctx.callee_stack.prepare_host_frame(
+                None,
+                callee_params,
+                host_func.len_result_cells(),
+            ) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    super::majit::kernel::set_residual_trap(crate::TrapCode::StackOverflow);
+                    return 0;
+                }
+            };
+
+            // Write params into the frame: sp points to the base and
+            // the inout cells alias the same region, so the host
+            // trampoline will see them.
+            for (i, &val) in params.iter().enumerate() {
+                unsafe { sp.set::<i64>(Slot::from(i as u16), val) };
+            }
+
+            // Call the host function through the store trampoline.
+            match store.call_host_func(trampoline, Some(ctx.instance), inout, CallHooks::Call) {
+                Ok(()) => unsafe { sp.get::<i64>(Slot::from(0)) },
+                Err(_) => {
+                    super::majit::kernel::set_residual_trap(
+                        crate::TrapCode::UnreachableCodeReached,
+                    );
+                    0
+                }
+            }
         }
     }
 }
