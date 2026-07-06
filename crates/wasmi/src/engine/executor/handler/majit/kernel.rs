@@ -971,30 +971,6 @@ struct WasmKernelState {
     accum1: i64,
     /// f32 accumulator (`Reg<f32>`, `freg32`, raw bits in the low 32).
     accum2: i64,
-    /// Linear memory base pointer, read once from [`MEM_CTX`] at loop entry
-    /// and passed to memory residual functions as a scalar state field so
-    /// the JIT trace promotes it to a register and avoids per-op TLS reads.
-    mem_base: i64,
-    /// Linear memory length (bytes), paired with [`mem_base`].
-    mem_len: i64,
-    /// Packed trap + did_store flags, encoding `(trap << 1) | did_store`
-    /// (bit 1 = OOB trap occurred, bit 0 = a store was committed this run).
-    /// The store `_sf` residuals already take and return this packed value,
-    /// so keeping it as a single state field lets it flow straight through
-    /// the JIT loop with no per-store pack/unpack ALU. Kept as a state field
-    /// so the trace promotes it to a register; unpacked back to [`MEM_TRAP`]
-    /// / [`MEM_DID_STORE`] TLS only at the cold return via [`sync_trap_to_tls`]
-    /// so `func.rs` can read it via [`take_mem_trap`] / [`take_mem_did_store`].
-    mem_trap_did: i64,
-}
-
-/// Stores a slot snapshot for [`MINI_YIELD_STOCK`]. Isolated from the kernel
-/// loop so the `#[jit_interp]` proc macro does not need to parse RefCell
-/// borrows in a closure that captures mutable state.
-fn yield_set_slots(slots: Vec<i64>) {
-    YIELD_SLOTS.with(|c| {
-        *c.borrow_mut() = slots;
-    });
 }
 
 /// Stores a slot snapshot for [`MINI_YIELD_STOCK`]. Isolated from the kernel
@@ -1069,9 +1045,6 @@ fn yield_set_slots(slots: Vec<i64>) {
         accum0: int,
         accum1: int,
         accum2: int,
-        mem_base: int,
-        mem_len: int,
-        mem_trap_did: int,
     },
     // Route pure forward-advancing arms (copy / ALU / compare / select) through
     // per-arm sub-JitCodes that RETURN the advanced pc, so the dispatch JitCode
@@ -1102,9 +1075,6 @@ fn wasm_mainloop(
         accum0: 0i64,
         accum1: 0i64,
         accum2: 0i64,
-        mem_base: init_mem_base,
-        mem_len: init_mem_len,
-        mem_trap_did: init_mem_trap_did,
     };
 
     loop {
@@ -1149,15 +1119,14 @@ fn wasm_mainloop(
                 pc += 3;
             }
             MINI_RETURN_R => {
-                sync_trap_to_tls(state.mem_trap_did);
                 return state.accum0;
             }
             MINI_RETURN_F_R => {
-                sync_trap_to_tls(state.mem_trap_did);
+                // Return the f64 accumulator bits as the result slot value.
                 return state.accum1;
             }
             MINI_RETURN_F32_R => {
-                sync_trap_to_tls(state.mem_trap_did);
+                // Return the f32 accumulator bits (low 32) as the result.
                 return state.accum2 & 0xFFFF_FFFF;
             }
             MINI_RETURN_VOID => {
@@ -1188,16 +1157,6 @@ fn wasm_mainloop(
             MINI_COPY_RI => {
                 let imm = program[pc + 1];
                 state.accum0 = imm;
-                pc += 2;
-            }
-            MINI_COPY_RS => {
-                let src = program[pc + 1] as usize;
-                state.accum[0] = state.slots[src];
-                pc += 2;
-            }
-            MINI_COPY_RI => {
-                let imm = program[pc + 1];
-                state.accum[0] = imm;
                 pc += 2;
             }
             MINI_COPY_S_FR => {
@@ -1418,11 +1377,6 @@ fn wasm_mainloop(
             MINI_I64_OR_RI_WR => {
                 let imm = program[pc + 1];
                 state.accum0 = state.accum0 | imm;
-                pc += 2;
-            }
-            MINI_I64_OR_RI_WR => {
-                let imm = program[pc + 1];
-                state.accum[0] = state.accum[0] | imm;
                 pc += 2;
             }
             MINI_I64_AND_SI_WR => {
@@ -1794,20 +1748,19 @@ fn wasm_mainloop(
             }
             MINI_I64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
+                // The dynamic address is the accumulator (an unsigned 32-bit wasm
+                // address); add the static offset, then load via the residual
+                // (which reads the memory base/len from the thread-local context).
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_i64(ea);
                 pc += 2;
             }
             MINI_F64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
+                // Same 8-byte read as `MINI_I64_LOAD_MEM0_OFF`, but the address is
+                // the integer accumulator and the f64 bits land in `freg64`.
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum1 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum1 = mem_load_i64(ea);
                 pc += 2;
             }
             MINI_F64_ARITH_RS => {
@@ -1823,24 +1776,18 @@ fn wasm_mainloop(
             }
             MINI_F32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
+                // 4-byte read (reuses the bounds-checked i32 load); the f32 bits
+                // land in the f32 accumulator (`freg32`, low 32). The address is
+                // the integer accumulator.
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum2 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum2 = mem_load_i32(ea);
                 pc += 2;
             }
             MINI_F32_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i32_sf(
-                    ea,
-                    state.accum2,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i32(ea, state.accum2);
                 pc += 3;
             }
             MINI_COPY_S_F32R => {
@@ -1928,17 +1875,6 @@ fn wasm_mainloop(
             MINI_F64_REINTERP_I64 => {
                 // f64.reinterpret_i64: the i64 bit pattern in `ireg` → `freg64`.
                 state.accum1 = state.accum0;
-                pc += 1;
-            }
-            MINI_I64_REINTERP_F64 => {
-                // i64.reinterpret_f64: the f64 bit pattern in `freg64` → `ireg`.
-                // Both are 64-bit, so a plain copy.
-                state.accum[0] = state.accum[1];
-                pc += 1;
-            }
-            MINI_F64_REINTERP_I64 => {
-                // f64.reinterpret_i64: the i64 bit pattern in `ireg` → `freg64`.
-                state.accum[1] = state.accum[0];
                 pc += 1;
             }
             MINI_F32_TRUNC_SAT_S => {
@@ -2033,163 +1969,94 @@ fn wasm_mainloop(
             MINI_I32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_i32(ea);
                 pc += 2;
             }
             MINI_U8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_u8(ea);
                 pc += 2;
             }
             MINI_I8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_i8(ea);
                 pc += 2;
             }
             MINI_U16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_u16(ea);
                 pc += 2;
             }
             MINI_I16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                state.accum0 = mem_load_i16(ea);
                 pc += 2;
             }
             MINI_I32_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i32_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i32(ea, state.accum0);
                 pc += 3;
             }
             MINI_I64_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i64(ea, state.accum0);
                 pc += 3;
             }
             MINI_F64_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum1,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i64(ea, state.accum1);
                 pc += 3;
             }
             MINI_I32_STORE8_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_u8_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_u8(ea, state.accum0);
                 pc += 3;
             }
             MINI_I32_STORE16_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_u16_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_u16(ea, state.accum0);
                 pc += 3;
             }
             MINI_I32_STORE_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i32_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i32(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I64_STORE_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_i64(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I32_STORE8_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_u8_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_u8(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I32_STORE16_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_u16_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                mem_store_u16(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I64_SEXT32 => {
@@ -2294,7 +2161,7 @@ fn wasm_mainloop(
                 CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_internal_residual(func_addr, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 4;
             }
             MINI_CALL_IMPORTED => {
@@ -2318,7 +2185,7 @@ fn wasm_mainloop(
                 CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_imported_residual(func_index, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 4;
             }
             MINI_CALL_INDIRECT => {
@@ -2346,7 +2213,7 @@ fn wasm_mainloop(
                 let result =
                     call_indirect_residual(table, func_type, runtime_index, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 6;
             }
             MINI_TRAP => {
@@ -2362,13 +2229,13 @@ fn wasm_mainloop(
             MINI_MEMORY_SIZE => {
                 // Return memory size in pages (mem_len / 65536) into ireg.
                 let (_base, len) = MEM_CTX.with(|c| c.get());
-                state.accum[0] = if len > 0 { len / 65536 } else { 0 };
+                state.accum0 = if len > 0 { len / 65536 } else { 0 };
                 pc += 1;
             }
             MINI_U64_SHR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] =
+                state.accum0 =
                     ((state.slots[lhs] as u64) >> ((state.slots[rhs] as u64) & 63)) as i64;
                 pc += 3;
             }
@@ -2911,9 +2778,6 @@ fn new_driver(
         accum0: 0i64,
         accum1: 0i64,
         accum2: 0i64,
-        mem_base: 0i64,
-        mem_len: 0i64,
-        mem_trap_did: 0i64,
     };
     {
         use majit_metainterp::JitState as _;
@@ -3071,9 +2935,6 @@ mod tests {
             accum0: 0i64,
             accum1: 0i64,
             accum2: 0i64,
-            mem_base: 0i64,
-            mem_len: 0i64,
-            mem_trap_did: 0i64,
         };
         {
             use majit_metainterp::JitState as _;
