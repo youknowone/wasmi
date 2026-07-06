@@ -2476,8 +2476,8 @@ pub(crate) fn ensure_cached(
             if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                 match &result {
                     Some(p) => eprintln!(
-                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, yield_or_bail={}, globals={}, loop_header={:?}",
-                        key, ops.len(), p.words.len(), p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
+                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}), yield_or_bail={}, globals={}, loop_header={:?}",
+                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
                     ),
                     None => eprintln!(
                         "[majit-prepass] INELIGIBLE key={:#x} ops={}",
