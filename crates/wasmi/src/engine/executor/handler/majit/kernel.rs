@@ -2454,10 +2454,22 @@ pub(crate) fn ensure_cached(
             #[cfg(feature = "std")]
             if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                 match &result {
-                    Some(p) => eprintln!(
-                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}), yield_or_bail={}, globals={}, loop_header={:?}",
-                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
-                    ),
+                    Some(p) => {
+                        // Find YIELD_STOCK word positions for diagnostics.
+                        let yield_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
+                            .filter(|(_, w)| **w == super::prepass::MINI_YIELD_STOCK)
+                            .map(|(i, _)| i).collect();
+                        let bail_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
+                            .filter(|(_, w)| **w == super::prepass::MINI_RETURN_BAIL)
+                            .map(|(i, _)| i).collect();
+                        let trap_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
+                            .filter(|(_, w)| **w == super::prepass::MINI_TRAP)
+                            .map(|(i, _)| i).collect();
+                        eprintln!(
+                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?}",
+                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos,
+                        );
+                    }
                     None => eprintln!(
                         "[majit-prepass] INELIGIBLE key={:#x} ops={}",
                         key, ops.len(),
@@ -2581,8 +2593,43 @@ pub(crate) fn run_persistent(
                 let driver = slot.as_mut().unwrap();
                 Some(wasm_mainloop(driver, words, init_slots))
             }
-            Err(_) => None, // nested call — fall back to stock
+            Err(_) => {
+                // DRIVER is busy (nested call via CALL_RESIDUAL). Fall through
+                // to CALLEE_DRIVER for one level of re-entrancy before giving
+                // up to stock.
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    eprintln!("[majit-kernel] DRIVER_BUSY key={:#x} words_len={} → try CALLEE_DRIVER", key, words_len);
+                }
+                None
+            }
         }
+    }).or_else(|| {
+        // DRIVER was busy — try CALLEE_DRIVER as a fallback, but ONLY for
+        // functions that have a loop (loop_header). Non-looping functions
+        // gain nothing from JIT and can cause miscompiles when run on a
+        // shared driver that was created for a different function shape.
+        let has_loop = PROGRAMS.with(|p| {
+            p.borrow()
+                .get(&key)
+                .and_then(|c| c.as_ref())
+                .is_some_and(|c| c.program.loop_header_word.is_some())
+        });
+        if !has_loop {
+            return None;
+        }
+        CALLEE_DRIVER.with(|d| {
+            match d.try_borrow_mut() {
+                Ok(mut slot) => {
+                    if slot.is_none() {
+                        *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                    }
+                    let driver = slot.as_mut().unwrap();
+                    Some(wasm_mainloop(driver, words, init_slots))
+                }
+                Err(_) => None, // both drivers busy — fall back to stock
+            }
+        })
     })
 }
 
