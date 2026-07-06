@@ -2476,8 +2476,8 @@ pub(crate) fn ensure_cached(
             if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                 match &result {
                     Some(p) => eprintln!(
-                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}), yield_or_bail={}, globals={}, loop_header={:?}",
-                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
+                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}), yield_or_bail={}, globals={}, loop_header={:?}",
+                        key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
                     ),
                     None => eprintln!(
                         "[majit-prepass] INELIGIBLE key={:#x} ops={}",
@@ -2539,48 +2539,7 @@ pub(crate) fn ensure_callee_cached(
         if cached.program.has_yield_or_bail {
             return None;
         }
-        Some((
-            key,
-            cached.program.num_slots,
-            cached.program.uses_globals,
-            cached.program.slot_map.clone(),
-        ))
-    })
-}
-
-/// Prepass (and cache) a callee function identified by its op stream. Returns
-/// `Some((key, num_slots, uses_globals))` if the callee is JIT-eligible AND
-/// has no yield/bail/trap ops (i.e., can run to completion on the MiniProgram
-/// dispatch without needing a stock executor fallback), or `None` otherwise.
-/// Used by the CALL_ASSEMBLER path in `call_runner_fn`.
-pub(crate) fn ensure_callee_cached(
-    ops: &[u8],
-    len_local_slots: u16,
-    len_stack_slots: u16,
-) -> Option<(usize, usize, bool)> {
-    let key = ops.as_ptr() as usize;
-    PROGRAMS.with(|p| {
-        let mut progs = p.borrow_mut();
-        let entry = progs.entry(key).or_insert_with(|| {
-            super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
-                CachedFunc {
-                    program,
-                    policy: TierPolicy::Probe {
-                        jit_calls: 0,
-                        min_jit_ns: u64::MAX,
-                        stock_calls: 0,
-                        min_stock_ns: u64::MAX,
-                    },
-                }
-            })
-        });
-        let cached = entry.as_ref()?;
-        // Reject callees that contain yield/bail/trap ops — they cannot run
-        // to completion on the CALL_ASSEMBLER path.
-        if cached.program.has_yield_or_bail {
-            return None;
-        }
-        Some((key, cached.program.num_slots, cached.program.uses_globals))
+        Some((key, cached.program.num_slots, cached.program.uses_globals, cached.program.slot_map.clone()))
     })
 }
 

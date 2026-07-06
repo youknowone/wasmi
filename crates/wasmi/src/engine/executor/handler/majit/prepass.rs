@@ -985,6 +985,8 @@ pub(crate) struct MiniProgram {
     /// ops cannot run as callees on the CALL_ASSEMBLER path because there is
     /// no stock executor to fall back to.
     pub has_yield_or_bail: bool,
+    /// Number of distinct slot indices referenced in the program (diagnostic).
+    pub unique_slot_count: usize,
 }
 
 /// Decode `ops` (an `indirect-dispatch` op stream) into a [`MiniProgram`].
@@ -1007,12 +1009,46 @@ pub(crate) fn prepass(
     // original `scratch_base` during emission so scratch indices can be
     // relocated in a single post-pass once `max_slot_seen` is known.
     let mut max_slot_seen: i64 = -1;
-    /// Convert a u16 slot operand to i64, tracking max index.
+    let mut unique_slots: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
+    // Sentinel base for real-slot references. During emission every s!() call
+    // emits `SLOT_SENTINEL + orig_idx` instead of the raw index. After the
+    // main decode loop, a post-pass replaces every SLOT_SENTINEL occurrence
+    // with its dense index (position in the sorted unique_slots set). This is
+    // the same pattern as SCRATCH_SENTINEL below but for real slots.
+    const SLOT_SENTINEL: i64 = i64::MIN / 4; // −2305843009213693952
+    /// Convert a u16 slot operand to a sentinel-tagged i64, tracking unique set.
     macro_rules! s {
         ($v:expr) => {{
             let idx = i64::from(u16::from($v));
             if idx > max_slot_seen { max_slot_seen = idx; }
-            idx
+            unique_slots.insert(idx);
+            SLOT_SENTINEL + idx
+        }};
+    }
+    /// Convert a literal slot index (i64) to a sentinel-tagged value, tracking
+    /// unique set. Used for opcodes with baked-in slot indices (U64Copy_S{N}r etc.).
+    macro_rules! si {
+        ($idx:expr) => {{
+            let idx: i64 = $idx;
+            if idx > max_slot_seen { max_slot_seen = idx; }
+            unique_slots.insert(idx);
+            SLOT_SENTINEL + idx
+        }};
+    }
+    /// Register a contiguous range of slot indices in the unique set (for CALL
+    /// ops whose params span consecutive frame slots). Returns the sentinel
+    /// for the first slot; the kernel's params staging relies on the sorted
+    /// BTreeSet preserving contiguous originals as contiguous dense indices.
+    macro_rules! s_contig {
+        ($head:expr, $len:expr) => {{
+            let head_idx = i64::from(u16::from($head));
+            let len = $len as i64;
+            for off in 0..len {
+                let idx = head_idx + off;
+                if idx > max_slot_seen { max_slot_seen = idx; }
+                unique_slots.insert(idx);
+            }
+            SLOT_SENTINEL + head_idx
         }};
     }
     // Sentinel base for scratch slots. During emission every reference to a
@@ -1188,9 +1224,7 @@ pub(crate) fn prepass(
                     // its dense index. Also update max_slot_seen since we
                     // bypass the s!() macro here.
                     unique_slots.insert(0);
-                    if max_slot_seen < 0 {
-                        max_slot_seen = 0;
-                    }
+                    if max_slot_seen < 0 { max_slot_seen = 0; }
                     words.extend_from_slice(&[MINI_RETURN_S, SLOT_SENTINEL + 0]);
                 } else {
                     words.push(MINI_RETURN_VOID);
@@ -1209,241 +1243,61 @@ pub(crate) fn prepass(
             }
             // Local-indexed accumulator spills (`U64Copy_S{N}r`): the slot index
             // N is baked into the opcode and the operands occupy zero bytes.
-            OpCode::U64Copy_S0r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S1r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S2r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S3r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S4r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(4));
-            }
-            OpCode::U64Copy_S5r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S6r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(6));
-            }
-            OpCode::U64Copy_S7r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(7));
-            }
-            OpCode::U64Copy_S8r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(8));
-            }
-            OpCode::U64Copy_S9r => {
-                words.push(MINI_COPY_SR);
-                words.push(si!(9));
-            }
+            OpCode::U64Copy_S0r => { words.push(MINI_COPY_SR); words.push(si!(0)); },
+            OpCode::U64Copy_S1r => { words.push(MINI_COPY_SR); words.push(si!(1)); },
+            OpCode::U64Copy_S2r => { words.push(MINI_COPY_SR); words.push(si!(2)); },
+            OpCode::U64Copy_S3r => { words.push(MINI_COPY_SR); words.push(si!(3)); },
+            OpCode::U64Copy_S4r => { words.push(MINI_COPY_SR); words.push(si!(4)); },
+            OpCode::U64Copy_S5r => { words.push(MINI_COPY_SR); words.push(si!(5)); },
+            OpCode::U64Copy_S6r => { words.push(MINI_COPY_SR); words.push(si!(6)); },
+            OpCode::U64Copy_S7r => { words.push(MINI_COPY_SR); words.push(si!(7)); },
+            OpCode::U64Copy_S8r => { words.push(MINI_COPY_SR); words.push(si!(8)); },
+            OpCode::U64Copy_S9r => { words.push(MINI_COPY_SR); words.push(si!(9)); },
             // Local-to-local copies (`U64Copy_S{N}s{M}`): both the destination
             // slot N and source slot M are baked into the opcode, so the operands
             // occupy zero bytes. Bit-identical slot move.
-            OpCode::U64Copy_S0s1 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(0));
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S0s2 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(0));
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S0s3 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(0));
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S0s4 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(0));
-                words.push(si!(4));
-            }
-            OpCode::U64Copy_S0s5 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(0));
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S1s0 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(1));
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S1s2 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(1));
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S1s3 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(1));
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S1s4 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(1));
-                words.push(si!(4));
-            }
-            OpCode::U64Copy_S1s5 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(1));
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S2s0 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(2));
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S2s1 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(2));
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S2s3 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(2));
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S2s4 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(2));
-                words.push(si!(4));
-            }
-            OpCode::U64Copy_S2s5 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(2));
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S3s0 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(3));
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S3s1 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(3));
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S3s2 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(3));
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S3s4 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(3));
-                words.push(si!(4));
-            }
-            OpCode::U64Copy_S3s5 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(3));
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S4s0 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(4));
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S4s1 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(4));
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S4s2 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(4));
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S4s3 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(4));
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S4s5 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(4));
-                words.push(si!(5));
-            }
-            OpCode::U64Copy_S5s0 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(5));
-                words.push(si!(0));
-            }
-            OpCode::U64Copy_S5s1 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(5));
-                words.push(si!(1));
-            }
-            OpCode::U64Copy_S5s2 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(5));
-                words.push(si!(2));
-            }
-            OpCode::U64Copy_S5s3 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(5));
-                words.push(si!(3));
-            }
-            OpCode::U64Copy_S5s4 => {
-                words.push(MINI_COPY_SS);
-                words.push(si!(5));
-                words.push(si!(4));
-            }
+            OpCode::U64Copy_S0s1 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(1)); },
+            OpCode::U64Copy_S0s2 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(2)); },
+            OpCode::U64Copy_S0s3 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(3)); },
+            OpCode::U64Copy_S0s4 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(4)); },
+            OpCode::U64Copy_S0s5 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(5)); },
+            OpCode::U64Copy_S1s0 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(0)); },
+            OpCode::U64Copy_S1s2 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(2)); },
+            OpCode::U64Copy_S1s3 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(3)); },
+            OpCode::U64Copy_S1s4 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(4)); },
+            OpCode::U64Copy_S1s5 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(5)); },
+            OpCode::U64Copy_S2s0 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(0)); },
+            OpCode::U64Copy_S2s1 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(1)); },
+            OpCode::U64Copy_S2s3 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(3)); },
+            OpCode::U64Copy_S2s4 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(4)); },
+            OpCode::U64Copy_S2s5 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(5)); },
+            OpCode::U64Copy_S3s0 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(0)); },
+            OpCode::U64Copy_S3s1 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(1)); },
+            OpCode::U64Copy_S3s2 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(2)); },
+            OpCode::U64Copy_S3s4 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(4)); },
+            OpCode::U64Copy_S3s5 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(5)); },
+            OpCode::U64Copy_S4s0 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(0)); },
+            OpCode::U64Copy_S4s1 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(1)); },
+            OpCode::U64Copy_S4s2 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(2)); },
+            OpCode::U64Copy_S4s3 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(3)); },
+            OpCode::U64Copy_S4s5 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(5)); },
+            OpCode::U64Copy_S5s0 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(0)); },
+            OpCode::U64Copy_S5s1 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(1)); },
+            OpCode::U64Copy_S5s2 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(2)); },
+            OpCode::U64Copy_S5s3 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(3)); },
+            OpCode::U64Copy_S5s4 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(4)); },
             // f64 accumulator spills read the f64 accumulator (`freg64`), not the
             // integer one, so they lower to `MINI_COPY_S_FR` (bit-identical move).
-            OpCode::F64Copy_S0r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(0));
-            }
-            OpCode::F64Copy_S1r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(1));
-            }
-            OpCode::F64Copy_S2r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(2));
-            }
-            OpCode::F64Copy_S3r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(3));
-            }
-            OpCode::F64Copy_S4r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(4));
-            }
-            OpCode::F64Copy_S5r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(5));
-            }
-            OpCode::F64Copy_S6r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(6));
-            }
-            OpCode::F64Copy_S7r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(7));
-            }
-            OpCode::F64Copy_S8r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(8));
-            }
-            OpCode::F64Copy_S9r => {
-                words.push(MINI_COPY_S_FR);
-                words.push(si!(9));
-            }
+            OpCode::F64Copy_S0r => { words.push(MINI_COPY_S_FR); words.push(si!(0)); },
+            OpCode::F64Copy_S1r => { words.push(MINI_COPY_S_FR); words.push(si!(1)); },
+            OpCode::F64Copy_S2r => { words.push(MINI_COPY_S_FR); words.push(si!(2)); },
+            OpCode::F64Copy_S3r => { words.push(MINI_COPY_S_FR); words.push(si!(3)); },
+            OpCode::F64Copy_S4r => { words.push(MINI_COPY_S_FR); words.push(si!(4)); },
+            OpCode::F64Copy_S5r => { words.push(MINI_COPY_S_FR); words.push(si!(5)); },
+            OpCode::F64Copy_S6r => { words.push(MINI_COPY_S_FR); words.push(si!(6)); },
+            OpCode::F64Copy_S7r => { words.push(MINI_COPY_S_FR); words.push(si!(7)); },
+            OpCode::F64Copy_S8r => { words.push(MINI_COPY_S_FR); words.push(si!(8)); },
+            OpCode::F64Copy_S9r => { words.push(MINI_COPY_S_FR); words.push(si!(9)); },
             // Generic accumulator spills with an explicit destination slot (used
             // when the slot index exceeds the dedicated `S{0..9}r` opcodes).
             OpCode::U64Copy_Sr => {
@@ -1480,46 +1334,16 @@ pub(crate) fn prepass(
             }
             // f32 accumulator spills read the f32 accumulator (`freg32`), so they
             // lower to `MINI_COPY_S_F32R` (a 32-bit move; the low 32 hold the f32).
-            OpCode::F32Copy_S0r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(0));
-            }
-            OpCode::F32Copy_S1r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(1));
-            }
-            OpCode::F32Copy_S2r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(2));
-            }
-            OpCode::F32Copy_S3r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(3));
-            }
-            OpCode::F32Copy_S4r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(4));
-            }
-            OpCode::F32Copy_S5r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(5));
-            }
-            OpCode::F32Copy_S6r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(6));
-            }
-            OpCode::F32Copy_S7r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(7));
-            }
-            OpCode::F32Copy_S8r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(8));
-            }
-            OpCode::F32Copy_S9r => {
-                words.push(MINI_COPY_S_F32R);
-                words.push(si!(9));
-            }
+            OpCode::F32Copy_S0r => { words.push(MINI_COPY_S_F32R); words.push(si!(0)); },
+            OpCode::F32Copy_S1r => { words.push(MINI_COPY_S_F32R); words.push(si!(1)); },
+            OpCode::F32Copy_S2r => { words.push(MINI_COPY_S_F32R); words.push(si!(2)); },
+            OpCode::F32Copy_S3r => { words.push(MINI_COPY_S_F32R); words.push(si!(3)); },
+            OpCode::F32Copy_S4r => { words.push(MINI_COPY_S_F32R); words.push(si!(4)); },
+            OpCode::F32Copy_S5r => { words.push(MINI_COPY_S_F32R); words.push(si!(5)); },
+            OpCode::F32Copy_S6r => { words.push(MINI_COPY_S_F32R); words.push(si!(6)); },
+            OpCode::F32Copy_S7r => { words.push(MINI_COPY_S_F32R); words.push(si!(7)); },
+            OpCode::F32Copy_S8r => { words.push(MINI_COPY_S_F32R); words.push(si!(8)); },
+            OpCode::F32Copy_S9r => { words.push(MINI_COPY_S_F32R); words.push(si!(9)); },
             OpCode::F32Copy_Sr => {
                 let op = decode::F32Copy_Sr::decode(&mut cursor).ok()?;
                 let dst = s!(op.result);
@@ -4336,8 +4160,8 @@ pub(crate) fn prepass(
                 // value in ireg. The kernel continues execution after the call.
                 let op = decode::CallInternal::decode(&mut cursor).ok()?;
                 let func_addr = usize::from(op.func) as i64;
-                let params_start = s!(op.params.span().head());
                 let params_len = i64::from(op.params.len());
+                let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[MINI_CALL_RESIDUAL, func_addr, params_start, params_len]);
             }
             OpCode::Trap => {
@@ -4388,8 +4212,8 @@ pub(crate) fn prepass(
                 let table = u32::from(op.table) as i64;
                 let func_type = u32::from(op.func_type) as i64;
                 let index_slot = s!(op.index);
-                let params_start = s!(op.params.span().head());
                 let params_len = i64::from(op.params.len());
+                let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[
                     MINI_CALL_INDIRECT, table, func_type, index_slot,
                     params_start, params_len,
@@ -4720,8 +4544,8 @@ pub(crate) fn prepass(
                 let op = decode::CallIndirect_R::decode(&mut cursor).ok()?;
                 let table = u32::from(op.table) as i64;
                 let func_type = u32::from(op.func_type) as i64;
-                let params_start = s!(op.params.span().head());
                 let params_len = i64::from(op.params.len());
+                let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
                 words.extend_from_slice(&[
                     MINI_CALL_INDIRECT, table, func_type, scratch_base,
@@ -4839,8 +4663,8 @@ pub(crate) fn prepass(
                 // executes either the wasm callee or a host trampoline.
                 let op = decode::CallImported::decode(&mut cursor).ok()?;
                 let func_idx = u32::from(op.func) as i64;
-                let params_start = s!(op.params.span().head());
                 let params_len = i64::from(op.params.len());
+                let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[
                     MINI_CALL_IMPORTED,
                     func_idx,
@@ -5023,31 +4847,67 @@ pub(crate) fn prepass(
         }
     }
 
-    // ── Post-pass: compact scratch indices and shrink num_slots ──
-    // `max_slot_seen` now holds the highest real-slot index any lowered op
-    // references. The kernel's `slots` Vec only needs to cover
-    // `0 ..= max_slot_seen`, not the full `locals + stack`. Scratch slots
-    // are relocated to sit right after the live range.
-    let full_slots = usize::from(len_local_slots) + usize::from(len_stack_slots);
-    let live_slots = if max_slot_seen >= 0 {
-        (max_slot_seen as usize + 1).min(full_slots)
+    // ── Post-pass: dense slot remapping + scratch relocation ──
+    //
+    // Build a dense mapping from unique original slot indices to 0..N-1.
+    // Because `unique_slots` is a BTreeSet, the sorted order guarantees that
+    // contiguous original indices (e.g., params span) map to contiguous dense
+    // indices — the kernel's `state.slots[params_start + i]` staging still
+    // works correctly.
+    //
+    // slot_map: dense_idx → original frame slot index (for seed/writeback).
+    // reverse_map: original → dense_idx (for rewriting SLOT_SENTINEL words).
+    let slot_map: Vec<u16> = unique_slots.iter().map(|&idx| idx as u16).collect();
+    let reverse_map: alloc::collections::BTreeMap<i64, i64> = unique_slots
+        .iter()
+        .enumerate()
+        .map(|(dense, &orig)| (orig, dense as i64))
+        .collect();
+    let dense_count = slot_map.len();
+    let real_scratch_base = dense_count as i64;
+
+    // Replace SLOT_SENTINEL and SCRATCH_SENTINEL occurrences in one pass.
+    // Upper bound: max_slot_seen + 1 (the highest sentinel value that can appear
+    // is SLOT_SENTINEL + max_slot_seen). If no slot was seen, the range is empty.
+    let sentinel_range_end = if max_slot_seen >= 0 {
+        SLOT_SENTINEL + max_slot_seen + 1
     } else {
-        if writes_result { 1 } else { 0 }
+        SLOT_SENTINEL
     };
-    let real_scratch_base = live_slots as i64;
-    // Replace every SCRATCH_SENTINEL occurrence with the real compacted base.
     for w in words.iter_mut() {
-        if *w >= SCRATCH_SENTINEL && *w < SCRATCH_SENTINEL + NUM_SCRATCH as i64 {
+        if *w >= SLOT_SENTINEL && *w < sentinel_range_end {
+            // SLOT_SENTINEL + orig_idx → dense_idx
+            let orig = *w - SLOT_SENTINEL;
+            if let Some(&dense) = reverse_map.get(&orig) {
+                *w = dense;
+            }
+        } else if *w >= SCRATCH_SENTINEL && *w < SCRATCH_SENTINEL + NUM_SCRATCH as i64 {
+            // SCRATCH_SENTINEL + offset → dense_count + offset
             *w = real_scratch_base + (*w - SCRATCH_SENTINEL);
         }
     }
+    // Verify no sentinels remain in the final word stream.
+    #[cfg(debug_assertions)]
+    for (i, &w) in words.iter().enumerate() {
+        debug_assert!(
+            !(w >= SLOT_SENTINEL && w < SLOT_SENTINEL + 65536),
+            "SLOT_SENTINEL leaked at word {i}: value {w} (orig={})",
+            w - SLOT_SENTINEL,
+        );
+        debug_assert!(
+            !(w >= SCRATCH_SENTINEL && w < SCRATCH_SENTINEL + NUM_SCRATCH as i64),
+            "SCRATCH_SENTINEL leaked at word {i}: value {w}",
+        );
+    }
     Some(MiniProgram {
         words,
-        num_slots: live_slots,
+        num_slots: dense_count,
+        slot_map,
         loop_header_word,
         writes_result,
         uses_globals,
         has_yield_or_bail,
+        unique_slot_count: unique_slots.len(),
     })
 }
 
