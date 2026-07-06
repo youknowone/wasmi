@@ -2451,7 +2451,21 @@ pub(crate) fn ensure_cached(
     PROGRAMS.with(|p| {
         let mut progs = p.borrow_mut();
         let entry = progs.entry(key).or_insert_with(|| {
-            super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
+            let result = super::prepass::prepass(ops, len_local_slots, len_stack_slots);
+            #[cfg(feature = "std")]
+            if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                match &result {
+                    Some(p) => eprintln!(
+                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, yield_or_bail={}, globals={}, loop_header={:?}",
+                        key, ops.len(), p.words.len(), p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
+                    ),
+                    None => eprintln!(
+                        "[majit-prepass] INELIGIBLE key={:#x} ops={}",
+                        key, ops.len(),
+                    ),
+                }
+            }
+            result.map(|program| {
                 CachedFunc {
                     program,
                     policy: TierPolicy::Probe {
@@ -2682,8 +2696,9 @@ fn new_driver(
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
             eprintln!(
-                "[majit-kernel] COMPILE #{} (ops {} → {})",
+                "[majit-kernel] COMPILE #{} green={:?} (ops {} → {})",
                 KERNEL_COMPILES.load(Ordering::Relaxed),
+                _green_key,
                 _ops_before,
                 _ops_after,
             );
