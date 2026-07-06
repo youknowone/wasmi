@@ -2617,26 +2617,10 @@ pub(crate) fn ensure_cached(
             #[cfg(feature = "std")]
             if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                 match &result {
-                    Some(p) => {
-                        // Find YIELD_STOCK word positions for diagnostics.
-                        let yield_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
-                            .filter(|(_, w)| **w == super::prepass::MINI_YIELD_STOCK)
-                            .map(|(i, _)| i).collect();
-                        let bail_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
-                            .filter(|(_, w)| **w == super::prepass::MINI_RETURN_BAIL)
-                            .map(|(i, _)| i).collect();
-                        let trap_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
-                            .filter(|(_, w)| **w == super::prepass::MINI_TRAP)
-                            .map(|(i, _)| i).collect();
-                        let truncate_active = p.loop_live_count < p.num_slots;
-                        let trunc_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
-                            .filter(|(_, w)| **w == super::prepass::MINI_SLOTS_TRUNCATE)
-                            .map(|(i, _)| i).collect();
-                        eprintln!(
-                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}, loop_live={}, truncate={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?} trunc={:?}",
-                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.loop_live_count, truncate_active, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos, trunc_pos,
-                        );
-                    }
+                    Some(p) => eprintln!(
+                        "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, yield_or_bail={}, globals={}, loop_header={:?}",
+                        key, ops.len(), p.words.len(), p.has_yield_or_bail, p.uses_globals, p.loop_header_word,
+                    ),
                     None => eprintln!(
                         "[majit-prepass] INELIGIBLE key={:#x} ops={}",
                         key, ops.len(),
@@ -2916,8 +2900,9 @@ fn new_driver(
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
             eprintln!(
-                "[majit-kernel] COMPILE #{} (ops {} → {})",
+                "[majit-kernel] COMPILE #{} green={:?} (ops {} → {})",
                 KERNEL_COMPILES.load(Ordering::Relaxed),
+                _green_key,
                 _ops_before,
                 _ops_after,
             );
