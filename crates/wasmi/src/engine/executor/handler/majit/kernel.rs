@@ -976,16 +976,14 @@ struct WasmKernelState {
     /// The wasm frame's cell slots (locals + stack), seeded from the caller's
     /// frame. Virtualizable so a CloseLoop guard deopt reads the live values.
     slots: Vec<i64>,
-    /// wasmi's type-separated accumulator registers, held as a three-element
-    /// virtualizable array: `accum[0]` is the integer accumulator (`Reg<i64>`,
-    /// `ireg`), `accum[1]` the f64 accumulator (`Reg<f64>`, `freg64`, raw bits),
-    /// and `accum[2]` the f32 accumulator (`Reg<f32>`, `freg32`, raw bits in the
-    /// low 32). Virtualizable rather than scalar reds so a per-op handler jitcode
-    /// can mutate them through the vable reference; the macro has no
-    /// virtualizable scalar field. Keeping the cells apart lets an integer in
-    /// `ireg` stay live across float ops (and each float bank across the other)
-    /// as it does in wasmi's separate register files.
-    accum: Vec<i64>,
+    /// Integer accumulator (`Reg<i64>`, `ireg`). Scalar state field so it
+    /// compiles to a native register in the JIT trace, avoiding the
+    /// virtualizable array overhead that split_dispatch sub-JitCodes incur.
+    accum0: i64,
+    /// f64 accumulator (`Reg<f64>`, `freg64`, held as raw i64 bits).
+    accum1: i64,
+    /// f32 accumulator (`Reg<f32>`, `freg32`, raw bits in the low 32).
+    accum2: i64,
 }
 
 /// Stores a slot snapshot for [`MINI_YIELD_STOCK`]. Isolated from the kernel
@@ -1044,7 +1042,9 @@ fn yield_set_slots(slots: Vec<i64>) {
     greens = [pc, program],
     state_fields = {
         slots: [int; virt],
-        accum: [int; virt],
+        accum0: int,
+        accum1: int,
+        accum2: int,
     },
     // Route pure forward-advancing arms (copy / ALU / compare / select) through
     // per-arm sub-JitCodes that RETURN the advanced pc, so the dispatch JitCode
@@ -1062,9 +1062,9 @@ fn wasm_mainloop(
     let mut stacksize: i32 = 0;
     let mut state = WasmKernelState {
         slots: init_slots.to_vec(),
-        // Three accumulator cells: `accum[0]` = integer (`ireg`), `accum[1]` =
-        // f64 (`freg64`), `accum[2]` = f32 (`freg32`). See the module opcode docs.
-        accum: alloc::vec![0i64, 0i64, 0i64],
+        accum0: 0i64,
+        accum1: 0i64,
+        accum2: 0i64,
     };
 
     loop {
@@ -1080,13 +1080,13 @@ fn wasm_mainloop(
                 // shift form uses only i64 add/shift, which the tracer compiles.
                 let v = ((state.slots[lhs] + imm) << 32) >> 32;
                 state.slots[dst] = v;
-                state.accum[0] = v;
+                state.accum0 = v;
                 pc += 4;
             }
             MINI_BR_I32_NE_RI => {
                 let tgt = program[pc + 1] as usize;
                 let imm = program[pc + 2];
-                if (state.accum[0] as i32) != (imm as i32) {
+                if (state.accum0 as i32) != (imm as i32) {
                     if tgt < pc {
                         can_enter_jit!(driver, tgt, &mut state, program, || {});
                     }
@@ -1096,15 +1096,15 @@ fn wasm_mainloop(
                 pc += 3;
             }
             MINI_RETURN_R => {
-                return state.accum[0];
+                return state.accum0;
             }
             MINI_RETURN_F_R => {
                 // Return the f64 accumulator bits as the result slot value.
-                return state.accum[1];
+                return state.accum1;
             }
             MINI_RETURN_F32_R => {
                 // Return the f32 accumulator bits (low 32) as the result.
-                return state.accum[2] & 0xFFFF_FFFF;
+                return state.accum2 & 0xFFFF_FFFF;
             }
             MINI_RETURN_VOID => {
                 return 0;
@@ -1122,30 +1122,30 @@ fn wasm_mainloop(
             }
             MINI_COPY_SR => {
                 let dst = program[pc + 1] as usize;
-                state.slots[dst] = state.accum[0];
+                state.slots[dst] = state.accum0;
                 pc += 2;
             }
             MINI_COPY_RS => {
                 let src = program[pc + 1] as usize;
-                state.accum[0] = state.slots[src];
+                state.accum0 = state.slots[src];
                 pc += 2;
             }
             MINI_COPY_RI => {
                 let imm = program[pc + 1];
-                state.accum[0] = imm;
+                state.accum0 = imm;
                 pc += 2;
             }
             MINI_COPY_S_FR => {
                 let dst = program[pc + 1] as usize;
                 // Spill the f64 accumulator (`freg64`) — a bit-identical 64-bit move.
-                state.slots[dst] = state.accum[1];
+                state.slots[dst] = state.accum1;
                 pc += 2;
             }
             MINI_I64_ADD_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i64 add: plain `+` traces (release wraps mod 2^64 like wasm).
-                state.accum[0] = state.slots[lhs] + state.slots[rhs];
+                state.accum0 = state.slots[lhs] + state.slots[rhs];
                 pc += 3;
             }
             MINI_I64_ADD_SS_WB => {
@@ -1154,43 +1154,43 @@ fn wasm_mainloop(
                 let rhs = program[pc + 3] as usize;
                 let v = state.slots[lhs] + state.slots[rhs];
                 state.slots[dst] = v;
-                state.accum[0] = v;
+                state.accum0 = v;
                 pc += 4;
             }
             MINI_I64_MUL_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i64 mul: plain `*` traces (release wraps mod 2^64 like wasm).
-                state.accum[0] = state.slots[lhs] * state.slots[rhs];
+                state.accum0 = state.slots[lhs] * state.slots[rhs];
                 pc += 3;
             }
             MINI_I64_OR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = state.slots[lhs] | state.slots[rhs];
+                state.accum0 = state.slots[lhs] | state.slots[rhs];
                 pc += 3;
             }
             MINI_I64_SUB_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i64 sub: plain `-` traces (release wraps mod 2^64); non-commutative.
-                state.accum[0] = state.slots[lhs] - state.slots[rhs];
+                state.accum0 = state.slots[lhs] - state.slots[rhs];
                 pc += 3;
             }
             MINI_I32_MUL_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i32 mul: sign-extend the low 32 bits (`as i32` aborts the trace).
-                state.accum[0] = ((state.slots[lhs] * state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] * state.slots[rhs]) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_ADD_RS_WB => {
                 let dst = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i32 add of the accumulator and a slot, written back to both.
-                let v = ((state.accum[0] + state.slots[rhs]) << 32) >> 32;
+                let v = ((state.accum0 + state.slots[rhs]) << 32) >> 32;
                 state.slots[dst] = v;
-                state.accum[0] = v;
+                state.accum0 = v;
                 pc += 3;
             }
             MINI_I32_ADD_SS_WB => {
@@ -1201,33 +1201,33 @@ fn wasm_mainloop(
                 // sign-extends the low 32 bits; a narrowing cast aborts the trace.
                 let v = ((state.slots[lhs] + state.slots[rhs]) << 32) >> 32;
                 state.slots[dst] = v;
-                state.accum[0] = v;
+                state.accum0 = v;
                 pc += 4;
             }
             MINI_I32_XOR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // Sign-extend the low 32 bits so the result is a canonical i32.
-                state.accum[0] = ((state.slots[lhs] ^ state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] ^ state.slots[rhs]) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_AND_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = ((state.slots[lhs] & state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] & state.slots[rhs]) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_OR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = ((state.slots[lhs] | state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] | state.slots[rhs]) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_SUB_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i32 sub (non-commutative), sign-extended low 32 bits.
-                state.accum[0] = ((state.slots[lhs] - state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] - state.slots[rhs]) << 32) >> 32;
                 pc += 3;
             }
             MINI_BR_U32_LE_SS => {
@@ -1330,7 +1330,7 @@ fn wasm_mainloop(
                 let tgt = program[pc + 1] as usize;
                 let imm = program[pc + 2];
                 // Signed i64 `imm < ireg`: the accumulator is the right operand.
-                if imm < state.accum[0] {
+                if imm < state.accum0 {
                     if tgt < pc {
                         can_enter_jit!(driver, tgt, &mut state, program, || {});
                     }
@@ -1342,45 +1342,45 @@ fn wasm_mainloop(
             MINI_I64_XOR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = state.slots[lhs] ^ state.slots[rhs];
+                state.accum0 = state.slots[lhs] ^ state.slots[rhs];
                 pc += 3;
             }
             MINI_I64_AND_RI_WR => {
                 let imm = program[pc + 1];
-                state.accum[0] = state.accum[0] & imm;
+                state.accum0 = state.accum0 & imm;
                 pc += 2;
             }
             MINI_I64_OR_RI_WR => {
                 let imm = program[pc + 1];
-                state.accum[0] = state.accum[0] | imm;
+                state.accum0 = state.accum0 | imm;
                 pc += 2;
             }
             MINI_I64_AND_SI_WR => {
                 let lhs = program[pc + 1] as usize;
                 let imm = program[pc + 2];
-                state.accum[0] = state.slots[lhs] & imm;
+                state.accum0 = state.slots[lhs] & imm;
                 pc += 3;
             }
             MINI_I64_ADD_RS_WB => {
                 let dst = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                let v = state.accum[0] + state.slots[rhs];
+                let v = state.accum0 + state.slots[rhs];
                 state.slots[dst] = v;
-                state.accum[0] = v;
+                state.accum0 = v;
                 pc += 3;
             }
             MINI_I64_SHL_SI => {
                 let src = program[pc + 1] as usize;
                 let shift = program[pc + 2];
                 // Left shift zero-fills from the right; `<<` traces directly.
-                state.accum[0] = state.slots[src] << shift;
+                state.accum0 = state.slots[src] << shift;
                 pc += 3;
             }
             MINI_I32_SHL_SI => {
                 let src = program[pc + 1] as usize;
                 let shift = program[pc + 2];
                 // i32 left shift; re-canonicalize the low 32 bits.
-                state.accum[0] = ((state.slots[src] << shift) << 32) >> 32;
+                state.accum0 = ((state.slots[src] << shift) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_ROTL_SI => {
@@ -1390,7 +1390,7 @@ fn wasm_mainloop(
                 // bits so `>>` zero-fills the wrapped bits; `<< 32 >> 32` discards
                 // the bits `<< k` carried past bit 31 and re-canonicalizes.
                 let x = state.slots[src] & 0xFFFF_FFFF;
-                state.accum[0] = (((x << k) | (x >> (32 - k))) << 32) >> 32;
+                state.accum0 = (((x << k) | (x >> (32 - k))) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_ROTR_SI => {
@@ -1398,83 +1398,83 @@ fn wasm_mainloop(
                 let k = program[pc + 2];
                 // i32 rotate-right by k in 1..=31, dual to the rotate-left arm.
                 let x = state.slots[src] & 0xFFFF_FFFF;
-                state.accum[0] = (((x >> k) | (x << (32 - k))) << 32) >> 32;
+                state.accum0 = (((x >> k) | (x << (32 - k))) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_BITCOUNT_S => {
                 let sel = program[pc + 1];
                 let src = program[pc + 2] as usize;
                 // i32 bit count (sel: 0=clz, 1=ctz, 2=popcnt) of the low 32 bits.
-                state.accum[0] = i32_bitcount(sel, state.slots[src]);
+                state.accum0 = i32_bitcount(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_I64_BITCOUNT_S => {
                 let sel = program[pc + 1];
                 let src = program[pc + 2] as usize;
                 // i64 bit count (sel: 0=clz, 1=ctz, 2=popcnt).
-                state.accum[0] = i64_bitcount(sel, state.slots[src]);
+                state.accum0 = i64_bitcount(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_I32_DIV_S => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i32_div_s(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i32_div_s(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I32_DIV_U => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i32_div_u(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i32_div_u(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I32_REM_S => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i32_rem_s(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i32_rem_s(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I32_REM_U => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i32_rem_u(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i32_rem_u(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I64_DIV_S => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i64_div_s(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i64_div_s(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I64_DIV_U => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i64_div_u(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i64_div_u(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I64_REM_S => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i64_rem_s(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i64_rem_s(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_I64_REM_U => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] = i64_rem_u(state.slots[lhs], state.slots[rhs]);
+                state.accum0 = i64_rem_u(state.slots[lhs], state.slots[rhs]);
                 pc += 3;
             }
             MINI_U32_SHR_RI => {
                 let shift = program[pc + 1];
                 // i32 logical right shift of the accumulator: mask to the low 32
                 // bits (zero-fill), shift, then sign-extend to a canonical i32.
-                state.accum[0] = (((state.accum[0] & 0xFFFF_FFFF) >> shift) << 32) >> 32;
+                state.accum0 = (((state.accum0 & 0xFFFF_FFFF) >> shift) << 32) >> 32;
                 pc += 2;
             }
             MINI_I32_LT_SI_R => {
                 let lhs = program[pc + 1] as usize;
                 let imm = program[pc + 2];
                 // Compare RESULT (not a branch): a 0/1 value into the accumulator.
-                state.accum[0] = if ((state.slots[lhs] << 32) >> 32) < imm {
+                state.accum0 = if ((state.slots[lhs] << 32) >> 32) < imm {
                     1
                 } else {
                     0
@@ -1485,9 +1485,9 @@ fn wasm_mainloop(
                 let rhs = program[pc + 1] as usize;
                 // Signed i32 compare RESULT with the left operand in the
                 // accumulator: a 0/1 value (both operands sign-extended).
-                let l = (state.accum[0] << 32) >> 32;
+                let l = (state.accum0 << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_I32_LT_SR_R => {
@@ -1495,8 +1495,8 @@ fn wasm_mainloop(
                 // Signed i32 compare RESULT with the right operand in the
                 // accumulator: a 0/1 value (both operands sign-extended).
                 let l = (state.slots[lhs] << 32) >> 32;
-                let r = (state.accum[0] << 32) >> 32;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                let r = (state.accum0 << 32) >> 32;
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_SELECT => {
@@ -1506,38 +1506,38 @@ fn wasm_mainloop(
                 // the trace, so normalize the condition (low 32 bits non-zero) to
                 // `c ∈ {0, 1}` via the compare-result form, then `f + (t - f) * c`
                 // — exact in wrapping i64.
-                let c = if (state.accum[0] & 0xFFFF_FFFF) != 0 {
+                let c = if (state.accum0 & 0xFFFF_FFFF) != 0 {
                     1
                 } else {
                     0
                 };
                 let t = state.slots[true_slot];
                 let f = state.slots[false_slot];
-                state.accum[0] = f + (t - f) * c;
+                state.accum0 = f + (t - f) * c;
                 pc += 3;
             }
             MINI_I32_EQ_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // i32 equality RESULT (0/1) with the left operand in the
                 // accumulator; both operands sign-extended from their low 32 bits.
-                let l = (state.accum[0] << 32) >> 32;
+                let l = (state.accum0 << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l == r { 1 } else { 0 };
+                state.accum0 = if l == r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_I32_NE_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // i32 inequality RESULT (0/1) with the left operand in the
                 // accumulator; both operands sign-extended from their low 32 bits.
-                let l = (state.accum[0] << 32) >> 32;
+                let l = (state.accum0 << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l != r { 1 } else { 0 };
+                state.accum0 = if l != r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_I64_EQ_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // Full i64 equality RESULT (0/1), left operand in the accumulator.
-                state.accum[0] = if state.accum[0] == state.slots[rhs] {
+                state.accum0 = if state.accum0 == state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1547,7 +1547,7 @@ fn wasm_mainloop(
             MINI_I64_NE_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // Full i64 inequality RESULT (0/1), left operand in the accumulator.
-                state.accum[0] = if state.accum[0] != state.slots[rhs] {
+                state.accum0 = if state.accum0 != state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1557,7 +1557,7 @@ fn wasm_mainloop(
             MINI_I64_LT_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // Signed i64 less-than RESULT (0/1), left operand in the accumulator.
-                state.accum[0] = if state.accum[0] < state.slots[rhs] {
+                state.accum0 = if state.accum0 < state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1568,26 +1568,26 @@ fn wasm_mainloop(
                 let rhs = program[pc + 1] as usize;
                 // Signed i32 `<=` RESULT (0/1), left operand in the accumulator;
                 // both operands sign-extended from their low 32 bits.
-                let l = (state.accum[0] << 32) >> 32;
+                let l = (state.accum0 << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l <= r { 1 } else { 0 };
+                state.accum0 = if l <= r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_U32_LT_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // Unsigned i32 `<` RESULT (0/1): mask both operands to their low 32
                 // bits (non-negative i64) so the signed `<` realizes unsigned order.
-                let l = state.accum[0] & 0xFFFF_FFFF;
+                let l = state.accum0 & 0xFFFF_FFFF;
                 let r = state.slots[rhs] & 0xFFFF_FFFF;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_U32_LE_RS_R => {
                 let rhs = program[pc + 1] as usize;
                 // Unsigned i32 `<=` RESULT (0/1): masked low 32 bits of both.
-                let l = state.accum[0] & 0xFFFF_FFFF;
+                let l = state.accum0 & 0xFFFF_FFFF;
                 let r = state.slots[rhs] & 0xFFFF_FFFF;
-                state.accum[0] = if l <= r { 1 } else { 0 };
+                state.accum0 = if l <= r { 1 } else { 0 };
                 pc += 2;
             }
             MINI_I32_EQ_SS_R => {
@@ -1596,7 +1596,7 @@ fn wasm_mainloop(
                 // Signed i32 equality RESULT: sign-extend both low 32-bit slots.
                 let l = (state.slots[lhs] << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l == r { 1 } else { 0 };
+                state.accum0 = if l == r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I32_NE_SS_R => {
@@ -1605,7 +1605,7 @@ fn wasm_mainloop(
                 // Signed i32 inequality RESULT: sign-extend both low 32-bit slots.
                 let l = (state.slots[lhs] << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l != r { 1 } else { 0 };
+                state.accum0 = if l != r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I32_LT_SS_R => {
@@ -1614,7 +1614,7 @@ fn wasm_mainloop(
                 // Signed i32 compare RESULT: sign-extend both low 32-bit slots.
                 let l = (state.slots[lhs] << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I32_LE_SS_R => {
@@ -1623,7 +1623,7 @@ fn wasm_mainloop(
                 // Signed i32 compare RESULT: sign-extend both low 32-bit slots.
                 let l = (state.slots[lhs] << 32) >> 32;
                 let r = (state.slots[rhs] << 32) >> 32;
-                state.accum[0] = if l <= r { 1 } else { 0 };
+                state.accum0 = if l <= r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_U32_LT_SS_R => {
@@ -1632,7 +1632,7 @@ fn wasm_mainloop(
                 // Unsigned i32 `<` RESULT: masked low 32 bits of both slots.
                 let l = state.slots[lhs] & 0xFFFF_FFFF;
                 let r = state.slots[rhs] & 0xFFFF_FFFF;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_U32_LE_SS_R => {
@@ -1641,14 +1641,14 @@ fn wasm_mainloop(
                 // Unsigned i32 `<=` RESULT: masked low 32 bits of both slots.
                 let l = state.slots[lhs] & 0xFFFF_FFFF;
                 let r = state.slots[rhs] & 0xFFFF_FFFF;
-                state.accum[0] = if l <= r { 1 } else { 0 };
+                state.accum0 = if l <= r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I64_EQ_SS_R => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // Full i64 equality RESULT: compare both slots as-is.
-                state.accum[0] = if state.slots[lhs] == state.slots[rhs] {
+                state.accum0 = if state.slots[lhs] == state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1659,7 +1659,7 @@ fn wasm_mainloop(
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // Full i64 inequality RESULT: compare both slots as-is.
-                state.accum[0] = if state.slots[lhs] != state.slots[rhs] {
+                state.accum0 = if state.slots[lhs] != state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1670,7 +1670,7 @@ fn wasm_mainloop(
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // Signed i64 compare RESULT: `slots[lhs] < slots[rhs]` as 0/1.
-                state.accum[0] = if state.slots[lhs] < state.slots[rhs] {
+                state.accum0 = if state.slots[lhs] < state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1681,7 +1681,7 @@ fn wasm_mainloop(
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // Signed i64 compare RESULT: `slots[lhs] <= slots[rhs]` as 0/1.
-                state.accum[0] = if state.slots[lhs] <= state.slots[rhs] {
+                state.accum0 = if state.slots[lhs] <= state.slots[rhs] {
                     1
                 } else {
                     0
@@ -1695,7 +1695,7 @@ fn wasm_mainloop(
                 let flip = U64_ORDER_FLIP;
                 let l = state.slots[lhs] ^ flip;
                 let r = state.slots[rhs] ^ flip;
-                state.accum[0] = if l < r { 1 } else { 0 };
+                state.accum0 = if l < r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_U64_LE_SS_R => {
@@ -1705,21 +1705,21 @@ fn wasm_mainloop(
                 let flip = U64_ORDER_FLIP;
                 let l = state.slots[lhs] ^ flip;
                 let r = state.slots[rhs] ^ flip;
-                state.accum[0] = if l <= r { 1 } else { 0 };
+                state.accum0 = if l <= r { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I64_LT_IS_R => {
                 let imm = program[pc + 1];
                 let rhs = program[pc + 2] as usize;
                 // Signed i64 compare RESULT: `imm < slots[rhs]` as a 0/1 value.
-                state.accum[0] = if imm < state.slots[rhs] { 1 } else { 0 };
+                state.accum0 = if imm < state.slots[rhs] { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I64_LT_SI_R => {
                 let lhs = program[pc + 1] as usize;
                 let imm = program[pc + 2];
                 // Signed i64 compare RESULT: `slots[lhs] < imm` as a 0/1 value.
-                state.accum[0] = if state.slots[lhs] < imm { 1 } else { 0 };
+                state.accum0 = if state.slots[lhs] < imm { 1 } else { 0 };
                 pc += 3;
             }
             MINI_I64_LOAD_MEM0_OFF => {
@@ -1727,16 +1727,16 @@ fn wasm_mainloop(
                 // The dynamic address is the accumulator (an unsigned 32-bit wasm
                 // address); add the static offset, then load via the residual
                 // (which reads the memory base/len from the thread-local context).
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_i64(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_i64(ea);
                 pc += 2;
             }
             MINI_F64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 // Same 8-byte read as `MINI_I64_LOAD_MEM0_OFF`, but the address is
                 // the integer accumulator and the f64 bits land in `freg64`.
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[1] = mem_load_i64(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum1 = mem_load_i64(ea);
                 pc += 2;
             }
             MINI_F64_ARITH_RS => {
@@ -1747,7 +1747,7 @@ fn wasm_mainloop(
                 // and the operation live inside `f64_arith`. Add is commutative, so an
                 // `acc = slot + acc` form maps here as `acc OP slot`; sub/div take the
                 // accumulator as the left operand (wasm order).
-                state.accum[1] = f64_arith(sel, state.accum[1], state.slots[rhs]);
+                state.accum1 = f64_arith(sel, state.accum1, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F32_LOAD_MEM0_OFF => {
@@ -1755,8 +1755,8 @@ fn wasm_mainloop(
                 // 4-byte read (reuses the bounds-checked i32 load); the f32 bits
                 // land in the f32 accumulator (`freg32`, low 32). The address is
                 // the integer accumulator.
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[2] = mem_load_i32(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum2 = mem_load_i32(ea);
                 pc += 2;
             }
             MINI_F32_STORE_SR => {
@@ -1765,14 +1765,14 @@ fn wasm_mainloop(
                 // 4-byte store of the f32 accumulator (`freg32`); reuses the i32
                 // store, which writes the low 4 bytes of the value.
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_i32(ea, state.accum[2]);
+                mem_store_i32(ea, state.accum2);
                 pc += 3;
             }
             MINI_COPY_S_F32R => {
                 let dst = program[pc + 1] as usize;
                 // Spill the f32 accumulator (`freg32`) — a 32-bit move (the high
                 // bits are unused; stores/ops take the low 32).
-                state.slots[dst] = state.accum[2];
+                state.slots[dst] = state.accum2;
                 pc += 2;
             }
             MINI_F32_ARITH_RS => {
@@ -1783,7 +1783,7 @@ fn wasm_mainloop(
                 // and the operation live inside `f32_arith`. Add is commutative, so an
                 // `acc = slot + acc` form maps here as `acc OP slot`; sub/div take the
                 // accumulator as the left operand (wasm order).
-                state.accum[2] = f32_arith(sel, state.accum[2], state.slots[rhs]);
+                state.accum2 = f32_arith(sel, state.accum2, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F32_MINMAX_RS => {
@@ -1792,7 +1792,7 @@ fn wasm_mainloop(
                 // f32 min/max/copysign of the accumulator (`freg32`) and a slot
                 // (sel: 0=min, 1=max, 2=copysign(acc,slot), 3=copysign(slot,acc)).
                 // The bit-casts and wasm semantics live inside `f32_minmax`.
-                state.accum[2] = f32_minmax(sel, state.accum[2], state.slots[rhs]);
+                state.accum2 = f32_minmax(sel, state.accum2, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F32_CMP_RS_R => {
@@ -1801,7 +1801,7 @@ fn wasm_mainloop(
                 // f32 compare RESULT (0/1, an integer) with the left operand in the
                 // f32 accumulator; the 0/1 result lands in the integer accumulator.
                 // sel: 0=lt, 1=le, 2=eq, 3=ne.
-                state.accum[0] = f32_cmp(sel, state.accum[2], state.slots[rhs]);
+                state.accum0 = f32_cmp(sel, state.accum2, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F32_UNARY_S => {
@@ -1809,50 +1809,50 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // f32 unary from a slot into the f32 accumulator (`freg32`). sel:
                 // 0=abs, 1=neg, 2=sqrt, 3=ceil, 4=floor, 5=trunc, 6=nearest.
-                state.accum[2] = f32_unary(sel, state.slots[src]);
+                state.accum2 = f32_unary(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F32_CVT_S => {
                 let sel = program[pc + 1];
                 let src = program[pc + 2] as usize;
                 // integer (slot) → f32 (`freg32`). sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[2] = f32_convert(sel, state.slots[src]);
+                state.accum2 = f32_convert(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F64_PROMOTE_S => {
                 let src = program[pc + 1] as usize;
                 // f32 (slot) → f64 (`freg64`).
-                state.accum[1] = promote_f32_f64(state.slots[src]);
+                state.accum1 = promote_f32_f64(state.slots[src]);
                 pc += 2;
             }
             MINI_F32_DEMOTE_S => {
                 let src = program[pc + 1] as usize;
                 // f64 (slot) → f32 (`freg32`).
-                state.accum[2] = demote_f64_f32(state.slots[src]);
+                state.accum2 = demote_f64_f32(state.slots[src]);
                 pc += 2;
             }
             MINI_I32_REINTERP_F32 => {
                 // i32.reinterpret_f32 accumulator form: the f32 bit pattern in
                 // `freg32` becomes an i32 in `ireg` (sign-extended, the kernel's i32
                 // canonical form). A pure bit move — no residual.
-                state.accum[0] = (state.accum[2] as i32) as i64;
+                state.accum0 = (state.accum2 as i32) as i64;
                 pc += 1;
             }
             MINI_F32_REINTERP_I32 => {
                 // f32.reinterpret_i32 accumulator form: the i32 bit pattern in `ireg`
                 // becomes an f32 in `freg32` (low 32 bits, zero-extended).
-                state.accum[2] = state.accum[0] & 0xFFFF_FFFF;
+                state.accum2 = state.accum0 & 0xFFFF_FFFF;
                 pc += 1;
             }
             MINI_I64_REINTERP_F64 => {
                 // i64.reinterpret_f64: the f64 bit pattern in `freg64` → `ireg`.
                 // Both are 64-bit, so a plain copy.
-                state.accum[0] = state.accum[1];
+                state.accum0 = state.accum1;
                 pc += 1;
             }
             MINI_F64_REINTERP_I64 => {
                 // f64.reinterpret_i64: the i64 bit pattern in `ireg` → `freg64`.
-                state.accum[1] = state.accum[0];
+                state.accum1 = state.accum0;
                 pc += 1;
             }
             MINI_F32_TRUNC_SAT_S => {
@@ -1860,7 +1860,7 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // saturating f32→int (never traps): read the f32 slot, write `ireg`.
                 // sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[0] = f32_trunc_sat(sel, state.slots[src]);
+                state.accum0 = f32_trunc_sat(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F32_TRUNC_S => {
@@ -1868,25 +1868,25 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // trapping f32→int: read the f32 slot, write `ireg` (or latch a trap).
                 // sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[0] = f32_trunc(sel, state.slots[src]);
+                state.accum0 = f32_trunc(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_GLOBAL_GET_R => {
                 let idx = program[pc + 1];
                 // Read integer global `idx`'s raw bits into the accumulator.
-                state.accum[0] = global_get(idx);
+                state.accum0 = global_get(idx);
                 pc += 2;
             }
             MINI_GLOBAL_GET_F32 => {
                 let idx = program[pc + 1];
                 // Read an f32 global's raw bits (low 32) into the f32 accumulator.
-                state.accum[2] = global_get(idx) & 0xFFFF_FFFF;
+                state.accum2 = global_get(idx) & 0xFFFF_FFFF;
                 pc += 2;
             }
             MINI_GLOBAL_GET_F64 => {
                 let idx = program[pc + 1];
                 // Read an f64 global's raw bits into the f64 accumulator.
-                state.accum[1] = global_get(idx);
+                state.accum1 = global_get(idx);
                 pc += 2;
             }
             MINI_GLOBAL_SET_S => {
@@ -1902,7 +1902,7 @@ fn wasm_mainloop(
                 // f64 compare RESULT (0/1, an integer) with the left operand in the
                 // f64 accumulator; the 0/1 result lands in the integer accumulator.
                 // sel: 0=lt, 1=le, 2=eq, 3=ne.
-                state.accum[0] = f64_cmp(sel, state.accum[1], state.slots[rhs]);
+                state.accum0 = f64_cmp(sel, state.accum1, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F64_UNARY_S => {
@@ -1910,14 +1910,14 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // f64 unary from a slot into the f64 accumulator. sel: 0=abs, 1=neg,
                 // 2=sqrt, 3=ceil, 4=floor, 5=trunc, 6=nearest.
-                state.accum[1] = f64_unary(sel, state.slots[src]);
+                state.accum1 = f64_unary(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F64_MINMAX_RS => {
                 let sel = program[pc + 1];
                 let rhs = program[pc + 2] as usize;
                 // f64 `min`/`max(acc, slot)` (sel: 0=min, 1=max).
-                state.accum[1] = f64_minmax(sel, state.accum[1], state.slots[rhs]);
+                state.accum1 = f64_minmax(sel, state.accum1, state.slots[rhs]);
                 pc += 3;
             }
             MINI_F64_CVT_S => {
@@ -1925,7 +1925,7 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // int→f64 widening: read the integer slot, write the f64 accumulator.
                 // sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[1] = f64_convert(sel, state.slots[src]);
+                state.accum1 = f64_convert(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F64_TRUNC_SAT_S => {
@@ -1933,7 +1933,7 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // saturating f64→int (never traps): read the f64 slot, write `ireg`.
                 // sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[0] = f64_trunc_sat(sel, state.slots[src]);
+                state.accum0 = f64_trunc_sat(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_F64_TRUNC_S => {
@@ -1941,51 +1941,51 @@ fn wasm_mainloop(
                 let src = program[pc + 2] as usize;
                 // trapping f64→int: read the f64 slot, write `ireg` (or latch a trap).
                 // sel: 0=i32_s, 1=u32, 2=i64_s, 3=u64.
-                state.accum[0] = f64_trunc(sel, state.slots[src]);
+                state.accum0 = f64_trunc(sel, state.slots[src]);
                 pc += 3;
             }
             MINI_I32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_i32(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_i32(ea);
                 pc += 2;
             }
             MINI_U8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_u8(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_u8(ea);
                 pc += 2;
             }
             MINI_I8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_i8(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_i8(ea);
                 pc += 2;
             }
             MINI_U16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_u16(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_u16(ea);
                 pc += 2;
             }
             MINI_I16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
-                state.accum[0] = mem_load_i16(ea);
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                state.accum0 = mem_load_i16(ea);
                 pc += 2;
             }
             MINI_I32_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_i32(ea, state.accum[0]);
+                mem_store_i32(ea, state.accum0);
                 pc += 3;
             }
             MINI_I64_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_i64(ea, state.accum[0]);
+                mem_store_i64(ea, state.accum0);
                 pc += 3;
             }
             MINI_F64_STORE_SR => {
@@ -1994,60 +1994,60 @@ fn wasm_mainloop(
                 // Same 8-byte store as `MINI_I64_STORE_SR`, but the value is the
                 // f64 accumulator (`freg64`) rather than the integer one.
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_i64(ea, state.accum[1]);
+                mem_store_i64(ea, state.accum1);
                 pc += 3;
             }
             MINI_I32_STORE8_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_u8(ea, state.accum[0]);
+                mem_store_u8(ea, state.accum0);
                 pc += 3;
             }
             MINI_I32_STORE16_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                mem_store_u16(ea, state.accum[0]);
+                mem_store_u16(ea, state.accum0);
                 pc += 3;
             }
             MINI_I32_STORE_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
                 mem_store_i32(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I64_STORE_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
                 mem_store_i64(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I32_STORE8_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
                 mem_store_u8(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I32_STORE16_RS => {
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
-                let ea = (state.accum[0] & 0xFFFF_FFFF) + offset;
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
                 mem_store_u16(ea, state.slots[val_slot]);
                 pc += 3;
             }
             MINI_I64_SEXT32 => {
                 // i64.extend_i32_s: sign-extend the low 32 bits.
-                state.accum[0] = (state.accum[0] << 32) >> 32;
+                state.accum0 = (state.accum0 << 32) >> 32;
                 pc += 1;
             }
             MINI_I64_SEXT32_S => {
                 // i64.extend_i32_s of a slot: sign-extend its low 32 bits.
                 let src = program[pc + 1] as usize;
-                state.accum[0] = (state.slots[src] << 32) >> 32;
+                state.accum0 = (state.slots[src] << 32) >> 32;
                 pc += 2;
             }
             MINI_U64_SHR_SI => {
@@ -2057,7 +2057,7 @@ fn wasm_mainloop(
                 // Logical shift-right: the arithmetic `>>` sign-extends, so mask
                 // off the high `shift` bits to reproduce the zero-fill. Both `>>`
                 // (constant shift) and `&` trace.
-                state.accum[0] = (state.slots[src] >> shift) & mask;
+                state.accum0 = (state.slots[src] >> shift) & mask;
                 pc += 4;
             }
             MINI_BR_I64_EQ_SI => {
@@ -2076,7 +2076,7 @@ fn wasm_mainloop(
             MINI_BR_I64_NE_RI => {
                 let tgt = program[pc + 1] as usize;
                 let imm = program[pc + 2];
-                if state.accum[0] != imm {
+                if state.accum0 != imm {
                     if tgt < pc {
                         can_enter_jit!(driver, tgt, &mut state, program, || {});
                     }
@@ -2140,7 +2140,7 @@ fn wasm_mainloop(
                 CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_internal_residual(func_addr, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 4;
             }
             MINI_CALL_IMPORTED => {
@@ -2164,7 +2164,7 @@ fn wasm_mainloop(
                 CALL_STAGING.with(|c| c.set((buf, n)));
                 let result = call_imported_residual(func_index, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 4;
             }
             MINI_CALL_INDIRECT => {
@@ -2192,7 +2192,7 @@ fn wasm_mainloop(
                 let result =
                     call_indirect_residual(table, func_type, runtime_index, n as i64);
                 state.slots[params_start] = result;
-                state.accum[0] = result;
+                state.accum0 = result;
                 pc += 6;
             }
             MINI_TRAP => {
@@ -2208,13 +2208,13 @@ fn wasm_mainloop(
             MINI_MEMORY_SIZE => {
                 // Return memory size in pages (mem_len / 65536) into ireg.
                 let (_base, len) = MEM_CTX.with(|c| c.get());
-                state.accum[0] = if len > 0 { len / 65536 } else { 0 };
+                state.accum0 = if len > 0 { len / 65536 } else { 0 };
                 pc += 1;
             }
             MINI_U64_SHR_SS_WR => {
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                state.accum[0] =
+                state.accum0 =
                     ((state.slots[lhs] as u64) >> ((state.slots[rhs] as u64) & 63)) as i64;
                 pc += 3;
             }
@@ -2704,8 +2704,9 @@ fn new_driver(
     });
     let seed = WasmKernelState {
         slots: init_slots.to_vec(),
-        // Three accumulator cells (`ireg`, `freg64`, `freg32`), matching runtime.
-        accum: alloc::vec![0i64, 0i64, 0i64],
+        accum0: 0i64,
+        accum1: 0i64,
+        accum2: 0i64,
     };
     {
         use majit_metainterp::JitState as _;
@@ -2858,7 +2859,9 @@ mod tests {
         driver.set_trace_eagerness(2);
         let seed0 = WasmKernelState {
             slots: seed(8, mp.num_slots),
-            accum: alloc::vec![0i64],
+            accum0: 0i64,
+            accum1: 0i64,
+            accum2: 0i64,
         };
         {
             use majit_metainterp::JitState as _;
