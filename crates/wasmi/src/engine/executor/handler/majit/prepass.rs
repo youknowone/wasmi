@@ -668,6 +668,301 @@ pub(crate) const MINI_RETURN_F32_R: i64 = 135;
 /// Four covers a binary op whose two operands both need materializing.
 pub(crate) const NUM_SCRATCH: usize = 4;
 
+// ── Scratch-dedicated ops ──────────────────────────────────────────────────
+//
+// These ops use the kernel's `state.scratch0` / `state.scratch1` scalar
+// fields directly instead of routing through the `slots` virtualizable
+// array. Keeping scratch out of `slots` reduces the JIT's close-loop
+// inputargs count and fixes the LABEL/JUMP arity mismatch that the POC
+// surfaced on trivial loops.
+
+/// `[MINI_COPY_SCRATCH0_R]` (1 word): `scratch0 = accum0` — save the integer
+/// accumulator to the scratch0 scalar register.
+pub(crate) const MINI_COPY_SCRATCH0_R: i64 = 171;
+/// `[MINI_COPY_SCRATCH0_I, imm]` (2 words): `scratch0 = imm` — load an
+/// immediate constant into scratch0.
+pub(crate) const MINI_COPY_SCRATCH0_I: i64 = 172;
+/// `[MINI_COPY_SCRATCH0_FR]` (1 word): `scratch0 = accum1` — save the f64
+/// accumulator bits to scratch0.
+pub(crate) const MINI_COPY_SCRATCH0_FR: i64 = 173;
+/// `[MINI_COPY_SCRATCH0_F32R]` (1 word): `scratch0 = accum2` — save the f32
+/// accumulator bits to scratch0.
+pub(crate) const MINI_COPY_SCRATCH0_F32R: i64 = 174;
+/// `[MINI_COPY_SCRATCH1_R]` (1 word): `scratch1 = accum0` — save the integer
+/// accumulator to the scratch1 scalar register.
+pub(crate) const MINI_COPY_SCRATCH1_R: i64 = 175;
+/// `[MINI_COPY_SCRATCH1_I, imm]` (2 words): `scratch1 = imm` — load an
+/// immediate constant into scratch1.
+pub(crate) const MINI_COPY_SCRATCH1_I: i64 = 176;
+
+// ── Binary RS ops (accum OP slot → accum) ──────────────────────────────────
+/// `[MINI_I32_AND_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum & slot)`.
+pub(crate) const MINI_I32_AND_RS_WR: i64 = 177;
+/// `[MINI_I32_OR_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum | slot)`.
+pub(crate) const MINI_I32_OR_RS_WR: i64 = 178;
+/// `[MINI_I32_SUB_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum - slot)`.
+pub(crate) const MINI_I32_SUB_RS_WR: i64 = 179;
+/// `[MINI_I32_MUL_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum * slot)`.
+pub(crate) const MINI_I32_MUL_RS_WR: i64 = 180;
+/// `[MINI_I32_XOR_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum ^ slot)`.
+pub(crate) const MINI_I32_XOR_RS_WR: i64 = 181;
+/// `[MINI_I64_SUB_RS_WR, rhs_slot]` (2 words): `accum = accum - slot`.
+pub(crate) const MINI_I64_SUB_RS_WR: i64 = 182;
+/// `[MINI_I64_MUL_RS_WR, rhs_slot]` (2 words): `accum = accum * slot`.
+pub(crate) const MINI_I64_MUL_RS_WR: i64 = 183;
+/// `[MINI_I64_OR_RS_WR, rhs_slot]` (2 words): `accum = accum | slot`.
+pub(crate) const MINI_I64_OR_RS_WR: i64 = 184;
+/// `[MINI_I64_XOR_RS_WR, rhs_slot]` (2 words): `accum = accum ^ slot`.
+pub(crate) const MINI_I64_XOR_RS_WR: i64 = 185;
+
+// ── Binary SR ops (slot OP accum → accum) ──────────────────────────────────
+/// `[MINI_I32_SUB_SR_WR, lhs_slot]` (2 words): `accum = wrap_i32(slot - accum)`.
+pub(crate) const MINI_I32_SUB_SR_WR: i64 = 186;
+/// `[MINI_I64_SUB_SR_WR, lhs_slot]` (2 words): `accum = slot - accum`.
+pub(crate) const MINI_I64_SUB_SR_WR: i64 = 187;
+
+// ── Add without slot writeback (replaces throwaway-scratch WB) ─────────────
+/// `[MINI_I32_ADD_RS_WR, rhs_slot]` (2 words): `accum = wrap_i32(accum + slot)`.
+pub(crate) const MINI_I32_ADD_RS_WR: i64 = 188;
+/// `[MINI_I64_ADD_RS_WR, rhs_slot]` (2 words): `accum = accum + slot`.
+pub(crate) const MINI_I64_ADD_RS_WR: i64 = 189;
+/// `[MINI_I32_ADD_SS_WR, lhs_slot, rhs_slot]` (3 words):
+/// `accum = wrap_i32(slot_l + slot_r)` — no slot writeback.
+pub(crate) const MINI_I32_ADD_SS_WR: i64 = 190;
+
+// ── Div/rem with scratch operands (selector-dispatched) ────────────────────
+/// `[MINI_DIVREM_SCRATCH0_S, sel, rhs_slot]` (3 words):
+/// `accum = divrem(sel, scratch0, slot)`. `sel` encodes which div/rem variant.
+pub(crate) const MINI_DIVREM_SCRATCH0_S: i64 = 191;
+/// `[MINI_DIVREM_S_SCRATCH0, sel, lhs_slot]` (3 words):
+/// `accum = divrem(sel, slot, scratch0)`. `sel` encodes which div/rem variant.
+pub(crate) const MINI_DIVREM_S_SCRATCH0: i64 = 192;
+/// `[MINI_DIVREM_SCRATCH01, sel]` (2 words):
+/// `accum = divrem(sel, scratch0, scratch1)`. `sel` encodes which div/rem variant.
+pub(crate) const MINI_DIVREM_SCRATCH01: i64 = 193;
+
+// ── Bitcount/unary/convert from scratch0 ───────────────────────────────────
+/// `[MINI_I32_BITCOUNT_SCRATCH0, sel]` (2 words): `accum = bitcount(sel, scratch0)`.
+pub(crate) const MINI_I32_BITCOUNT_SCRATCH0: i64 = 194;
+/// `[MINI_I64_BITCOUNT_SCRATCH0, sel]` (2 words): `accum = bitcount(sel, scratch0)`.
+pub(crate) const MINI_I64_BITCOUNT_SCRATCH0: i64 = 195;
+/// `[MINI_F32_UNARY_SCRATCH0, sel]` (2 words): `freg32 = unary(sel, scratch0)`.
+pub(crate) const MINI_F32_UNARY_SCRATCH0: i64 = 196;
+/// `[MINI_F64_UNARY_SCRATCH0, sel]` (2 words): `freg64 = unary(sel, scratch0)`.
+pub(crate) const MINI_F64_UNARY_SCRATCH0: i64 = 197;
+/// `[MINI_F32_CVT_SCRATCH0, sel]` (2 words): `freg32 = convert(sel, scratch0)`.
+pub(crate) const MINI_F32_CVT_SCRATCH0: i64 = 198;
+/// `[MINI_F64_CVT_SCRATCH0, sel]` (2 words): `freg64 = convert(sel, scratch0)`.
+pub(crate) const MINI_F64_CVT_SCRATCH0: i64 = 199;
+/// `[MINI_F64_PROMOTE_SCRATCH0]` (1 word): `freg64 = promote(scratch0)`.
+pub(crate) const MINI_F64_PROMOTE_SCRATCH0: i64 = 200;
+/// `[MINI_F32_DEMOTE_SCRATCH0]` (1 word): `freg32 = demote(scratch0)`.
+pub(crate) const MINI_F32_DEMOTE_SCRATCH0: i64 = 201;
+/// `[MINI_F32_TRUNC_SAT_SCRATCH0, sel]` (2 words): `accum = trunc_sat(sel, scratch0)`.
+pub(crate) const MINI_F32_TRUNC_SAT_SCRATCH0: i64 = 202;
+/// `[MINI_F64_TRUNC_SAT_SCRATCH0, sel]` (2 words): `accum = trunc_sat(sel, scratch0)`.
+pub(crate) const MINI_F64_TRUNC_SAT_SCRATCH0: i64 = 203;
+/// `[MINI_F32_TRUNC_SCRATCH0, sel]` (2 words): `accum = trunc(sel, scratch0)`.
+pub(crate) const MINI_F32_TRUNC_SCRATCH0: i64 = 204;
+/// `[MINI_F64_TRUNC_SCRATCH0, sel]` (2 words): `accum = trunc(sel, scratch0)`.
+pub(crate) const MINI_F64_TRUNC_SCRATCH0: i64 = 205;
+
+// ── Branch ops with accumulator operand ────────────────────────────────────
+/// `[MINI_BR_I64_NE_RS, target, rhs_slot]` (3 words): if `accum != slot` jump.
+pub(crate) const MINI_BR_I64_NE_RS: i64 = 206;
+/// `[MINI_BR_I64_EQ_RS, target, rhs_slot]` (3 words): if `accum == slot` jump.
+pub(crate) const MINI_BR_I64_EQ_RS: i64 = 207;
+/// `[MINI_BR_I64_EQ_RI, target, imm]` (3 words): if `accum == imm` jump.
+pub(crate) const MINI_BR_I64_EQ_RI: i64 = 208;
+/// `[MINI_BR_U32_LE_RS, target, rhs_slot]` (3 words): if `u32(accum) <= u32(slot)` jump.
+pub(crate) const MINI_BR_U32_LE_RS: i64 = 209;
+
+// ── Float store from accum address ─────────────────────────────────────────
+/// `[MINI_F64_STORE_RR, offset]` (2 words): `*(accum0 + offset) = freg64`.
+pub(crate) const MINI_F64_STORE_RR: i64 = 210;
+/// `[MINI_F32_STORE_RR, offset]` (2 words): `*(accum0 + offset) = freg32`.
+pub(crate) const MINI_F32_STORE_RR: i64 = 211;
+
+// ── Global set from accum/imm ──────────────────────────────────────────────
+/// `[MINI_GLOBAL_SET_R, idx]` (2 words): `global[idx] = accum0`.
+pub(crate) const MINI_GLOBAL_SET_R: i64 = 212;
+/// `[MINI_GLOBAL_SET_I, idx, imm]` (3 words): `global[idx] = imm`.
+pub(crate) const MINI_GLOBAL_SET_I: i64 = 213;
+/// `[MINI_GLOBAL_SET_FR, idx]` (2 words): `global[idx] = accum1` (f64 bits).
+pub(crate) const MINI_GLOBAL_SET_FR: i64 = 214;
+/// `[MINI_GLOBAL_SET_F32R, idx]` (2 words): `global[idx] = accum2` (f32 bits).
+pub(crate) const MINI_GLOBAL_SET_F32R: i64 = 215;
+
+// ── Misc scratch-elimination ops ───────────────────────────────────────────
+/// `[MINI_I64_LT_SR_R, lhs_slot]` (2 words): `accum = if slot < accum { 1 } else { 0 }`.
+pub(crate) const MINI_I64_LT_SR_R: i64 = 216;
+/// `[MINI_I32_SHL_RI, shift]` (2 words): `accum = wrap_i32(accum << shift)`.
+pub(crate) const MINI_I32_SHL_RI: i64 = 217;
+/// `[MINI_CALL_INDIRECT_SCRATCH0, table, func_type, params_start, params_len]`
+/// (5 words): indirect call with index from scratch0 instead of a slot.
+pub(crate) const MINI_CALL_INDIRECT_SCRATCH0: i64 = 218;
+/// `[MINI_I64_LT_SCRATCH0_I_R, imm]` (2 words): `accum = if scratch0 < imm { 1 } else { 0 }`.
+pub(crate) const MINI_I64_LT_SCRATCH0_I_R: i64 = 219;
+
+// ── Integer store with scratch / accum ─────────────────────────────────────
+/// `[MINI_I32_STORE8_SCRATCH0_R, offset]` (2 words): 8-bit store, ptr from
+/// scratch0, value from accum.
+pub(crate) const MINI_I32_STORE8_SCRATCH0_R: i64 = 220;
+/// `[MINI_I32_STORE16_SCRATCH0_R, offset]` (2 words): 16-bit store, ptr from
+/// scratch0, value from accum.
+pub(crate) const MINI_I32_STORE16_SCRATCH0_R: i64 = 221;
+/// `[MINI_I64_STORE_SCRATCH0_R, offset]` (2 words): 64-bit store, ptr from
+/// scratch0, value from accum. Used when the store value must be loaded after
+/// the pointer has already been moved to scratch0.
+pub(crate) const MINI_I64_STORE_SCRATCH0_R: i64 = 222;
+/// `[MINI_I32_STORE_SCRATCH0_R, offset]` (2 words): 32-bit store, ptr from
+/// scratch0, value from accum.
+pub(crate) const MINI_I32_STORE_SCRATCH0_R: i64 = 223;
+
+// ── Comparison ops with scratch0 ───────────────────────────────────────────
+/// `[MINI_U32_LT_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if u32(scratch0) < u32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LT_SCRATCH0_S_R: i64 = 224;
+/// `[MINI_U32_LE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if u32(scratch0) <= u32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LE_SCRATCH0_S_R: i64 = 225;
+/// `[MINI_U32_LT_S_SCRATCH0_R, lhs_slot]` (2 words):
+/// `accum = if u32(slot) < u32(scratch0) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LT_S_SCRATCH0_R: i64 = 226;
+/// `[MINI_U32_LE_S_SCRATCH0_R, lhs_slot]` (2 words):
+/// `accum = if u32(slot) <= u32(scratch0) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LE_S_SCRATCH0_R: i64 = 227;
+/// `[MINI_I64_LE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if scratch0 <= slot { 1 } else { 0 }`.
+pub(crate) const MINI_I64_LE_SCRATCH0_S_R: i64 = 228;
+/// `[MINI_U64_LT_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if u64(scratch0) < u64(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_U64_LT_SCRATCH0_S_R: i64 = 229;
+/// `[MINI_U64_LT_S_SCRATCH0_R, lhs_slot]` (2 words):
+/// `accum = if u64(slot) < u64(scratch0) { 1 } else { 0 }`.
+pub(crate) const MINI_U64_LT_S_SCRATCH0_R: i64 = 230;
+/// `[MINI_I32_LT_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if i32(scratch0) < i32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_I32_LT_SCRATCH0_S_R: i64 = 231;
+
+// ── Scratch0-aware compare+branch combos ───────────────────────────────────
+/// `[MINI_BR_U64_LT_SCRATCH0_S, target, rhs_slot]` (3 words):
+/// branch if `u64(scratch0) < u64(slot)`.
+pub(crate) const MINI_BR_U64_LT_SCRATCH0_S: i64 = 232;
+
+// ── Add with scratch operands ──────────────────────────────────────────────
+/// `[MINI_I32_ADD_SCRATCH01_WB, dst_slot]` (2 words):
+/// `slots[dst] = accum = wrap_i32(scratch0 + scratch1)`.
+pub(crate) const MINI_I32_ADD_SCRATCH01_WB: i64 = 233;
+/// `[MINI_I64_ADD_SCRATCH01_WB, dst_slot]` (2 words):
+/// `slots[dst] = accum = scratch0 + scratch1`.
+pub(crate) const MINI_I64_ADD_SCRATCH01_WB: i64 = 234;
+/// `[MINI_I32_ADD_SCRATCH0_S_WB, dst_slot, rhs_slot]` (3 words):
+/// `slots[dst] = accum = wrap_i32(scratch0 + slot)`.
+pub(crate) const MINI_I32_ADD_SCRATCH0_S_WB: i64 = 235;
+/// `[MINI_I64_ADD_SCRATCH0_S_WB, dst_slot, rhs_slot]` (3 words):
+/// `slots[dst] = accum = scratch0 + slot`.
+pub(crate) const MINI_I64_ADD_SCRATCH0_S_WB: i64 = 236;
+
+// ── Select with scratch0 operand ───────────────────────────────────────────
+/// `[MINI_SELECT_SCRATCH0_S, false_slot]` (2 words):
+/// `accum = if accum != 0 { scratch0 } else { slot }`.
+pub(crate) const MINI_SELECT_SCRATCH0_S: i64 = 237;
+/// `[MINI_SELECT_S_SCRATCH0, true_slot]` (2 words):
+/// `accum = if accum != 0 { slot } else { scratch0 }`.
+pub(crate) const MINI_SELECT_S_SCRATCH0: i64 = 238;
+/// `[MINI_SELECT_SCRATCH01]` (1 word):
+/// `accum = if accum != 0 { scratch0 } else { scratch1 }`.
+pub(crate) const MINI_SELECT_SCRATCH01: i64 = 239;
+
+// ── Shift/rotate with scratch0 ─────────────────────────────────────────────
+/// `[MINI_U64_SHR_SCRATCH01_WR]` (1 word):
+/// `accum = (scratch0 as u64 >> (scratch1 as u64 & 63)) as i64`.
+pub(crate) const MINI_U64_SHR_SCRATCH01_WR: i64 = 240;
+
+// ── I32 store from accum to accum address ──────────────────────────────────
+/// `[MINI_I32_STORE_RR, offset]` (2 words): `*(accum0 + offset) = accum0`.
+/// For self-store patterns where pointer and value are both in accum.
+/// Actually used for: ptr in SCRATCH0, value loaded via COPY_RI then stored.
+/// Redefined: `[MINI_I32_STORE_SCRATCH0_I, offset, imm]` (3 words):
+/// `*(scratch0 + offset) = imm`.
+pub(crate) const MINI_I32_STORE_SCRATCH0_I: i64 = 241;
+
+// ── Comparison ops: scratch0 vs scratch1 ───────────────────────────────────
+/// `[MINI_U32_LT_SCRATCH01_R]` (1 word):
+/// `accum = if u32(scratch0) < u32(scratch1) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LT_SCRATCH01_R: i64 = 242;
+/// `[MINI_U32_LE_SCRATCH01_R]` (1 word):
+/// `accum = if u32(scratch0) <= u32(scratch1) { 1 } else { 0 }`.
+pub(crate) const MINI_U32_LE_SCRATCH01_R: i64 = 243;
+/// `[MINI_U64_LT_SCRATCH01_R]` (1 word):
+/// `accum = if u64(scratch0) < u64(scratch1) { 1 } else { 0 }`.
+pub(crate) const MINI_U64_LT_SCRATCH01_R: i64 = 244;
+
+// ── Misc with scratch0 ────────────────────────────────────────────────────
+/// `[MINI_I32_EQ_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if i32(scratch0) == i32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_I32_EQ_SCRATCH0_S_R: i64 = 245;
+/// `[MINI_I32_NE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if i32(scratch0) != i32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_I32_NE_SCRATCH0_S_R: i64 = 246;
+/// `[MINI_I32_LE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if i32(scratch0) <= i32(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_I32_LE_SCRATCH0_S_R: i64 = 247;
+/// `[MINI_I64_EQ_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if scratch0 == slot { 1 } else { 0 }`.
+pub(crate) const MINI_I64_EQ_SCRATCH0_S_R: i64 = 248;
+/// `[MINI_I64_NE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if scratch0 != slot { 1 } else { 0 }`.
+pub(crate) const MINI_I64_NE_SCRATCH0_S_R: i64 = 249;
+/// `[MINI_U64_LE_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// `accum = if u64(scratch0) <= u64(slot) { 1 } else { 0 }`.
+pub(crate) const MINI_U64_LE_SCRATCH0_S_R: i64 = 251;
+/// `[MINI_U32_LE_SCRATCH0_S_R_2, rhs_slot]` (2 words): duplicate alias — NOT
+/// needed, reuse 225. Removed.
+
+// ── F32/F64 arith with scratch0 (for immediate forms) ──────────────────────
+/// `[MINI_F32_ARITH_SCRATCH0_S, sel, rhs_slot]` (3 words):
+/// `freg32 = freg32 OP slots[rhs]` after loading imm into scratch0.
+/// Actually: `freg32 = f32_arith(sel, freg32, scratch0)`.
+pub(crate) const MINI_F32_ARITH_SCRATCH0: i64 = 252;
+/// `[MINI_F64_ARITH_SCRATCH0, sel]` (2 words):
+/// `freg64 = f64_arith(sel, freg64, scratch0)`.
+pub(crate) const MINI_F64_ARITH_SCRATCH0: i64 = 253;
+/// `[MINI_F32_MINMAX_SCRATCH0, sel]` (2 words):
+/// `freg32 = f32_minmax(sel, freg32, scratch0)`.
+pub(crate) const MINI_F32_MINMAX_SCRATCH0: i64 = 254;
+/// `[MINI_F64_MINMAX_SCRATCH0, sel]` (2 words):
+/// `freg64 = f64_minmax(sel, freg64, scratch0)`.
+pub(crate) const MINI_F64_MINMAX_SCRATCH0: i64 = 255;
+
+/// `[MINI_I64_EQ_SCRATCH0_R, rhs_slot]` (2 words):
+/// `accum = if scratch0 == slot { 1 } else { 0 }`. Used by I64Eq_Rri.
+/// NOTE: Same as MINI_I64_EQ_SCRATCH0_S_R (248). Use 248 instead.
+
+/// `[MINI_I32_EQ_SCRATCH0_R, rhs_slot]` (2 words):
+/// `accum = if i32(scratch0) == i32(slot) { 1 } else { 0 }`. Same as 245.
+
+/// `[MINI_I32_STORE_RR_2, offset, val_slot]` — store of val at ireg+offset.
+/// Actually: `[MINI_I32_STORE_SCRATCH0_S, offset, val_slot]` (3 words):
+/// `*(scratch0 + offset) = slots[val_slot]`.
+pub(crate) const MINI_I32_STORE_SCRATCH0_S: i64 = 256;
+/// `[MINI_I64_STORE_SCRATCH0_I, offset, imm]` (3 words):
+/// `*(scratch0 + offset) = imm`.
+pub(crate) const MINI_I64_STORE_SCRATCH0_I: i64 = 257;
+
+/// `[MINI_I64_AND_SCRATCH0_I_WR, imm]` (2 words):
+/// `accum = scratch0 & imm`. Used by U64LoadExtend32.
+pub(crate) const MINI_I64_AND_SCRATCH0_I_WR: i64 = 258;
+
+/// `[MINI_F64_NOTGT_SCRATCH0_S_R, rhs_slot]` (2 words):
+/// For F64NotLe_Rss negate pattern: `accum = !(f64_le(...))` using scratch0.
+/// Actually simpler: this is `accum = (scratch0 == 0) ? 1 : 0` = `i32_eq 0`.
+/// Use `MINI_I32_EQ_SCRATCH0_S_R` with a slot containing 0, or just inline.
+/// Dropping this — the pattern will use COPY_SCRATCH0_I 0 + I32_EQ_RS_R.
+
+// Highest op value used: 258
+
 /// A function lowered to flat `i64` MiniProgram words plus the metadata the
 /// kernel needs to set up its reds and merge point.
 pub(crate) struct MiniProgram {
@@ -866,6 +1161,102 @@ fn mini_op_width(op: i64) -> usize {
         | 157 // MINI_YIELD_STOCK (reads program[pc+1..=pc+2])
         | 159 // MINI_TRAP (reads program[pc+1])
         => 2,
+        // ── Scratch-dedicated ops widths ──
+        // Width 1: no operands
+        171 // MINI_COPY_SCRATCH0_R
+        | 173 // MINI_COPY_SCRATCH0_FR
+        | 174 // MINI_COPY_SCRATCH0_F32R
+        | 175 // MINI_COPY_SCRATCH1_R
+        | 200 // MINI_F64_PROMOTE_SCRATCH0
+        | 201 // MINI_F32_DEMOTE_SCRATCH0
+        | 239 // MINI_SELECT_SCRATCH01
+        | 240 // MINI_U64_SHR_SCRATCH01_WR
+        | 242 // MINI_U32_LT_SCRATCH01_R
+        | 243 // MINI_U32_LE_SCRATCH01_R
+        | 244 // MINI_U64_LT_SCRATCH01_R
+        => 1,
+        // Width 2: one operand
+        172 // MINI_COPY_SCRATCH0_I
+        | 176 // MINI_COPY_SCRATCH1_I
+        | 177 // MINI_I32_AND_RS_WR
+        | 178 // MINI_I32_OR_RS_WR
+        | 179 // MINI_I32_SUB_RS_WR
+        | 180 // MINI_I32_MUL_RS_WR
+        | 181 // MINI_I32_XOR_RS_WR
+        | 182 // MINI_I64_SUB_RS_WR
+        | 183 // MINI_I64_MUL_RS_WR
+        | 184 // MINI_I64_OR_RS_WR
+        | 185 // MINI_I64_XOR_RS_WR
+        | 186 // MINI_I32_SUB_SR_WR
+        | 187 // MINI_I64_SUB_SR_WR
+        | 188 // MINI_I32_ADD_RS_WR
+        | 189 // MINI_I64_ADD_RS_WR
+        | 193 // MINI_DIVREM_SCRATCH01
+        | 194 // MINI_I32_BITCOUNT_SCRATCH0
+        | 195 // MINI_I64_BITCOUNT_SCRATCH0
+        | 196 // MINI_F32_UNARY_SCRATCH0
+        | 197 // MINI_F64_UNARY_SCRATCH0
+        | 198 // MINI_F32_CVT_SCRATCH0
+        | 199 // MINI_F64_CVT_SCRATCH0
+        | 202 // MINI_F32_TRUNC_SAT_SCRATCH0
+        | 203 // MINI_F64_TRUNC_SAT_SCRATCH0
+        | 204 // MINI_F32_TRUNC_SCRATCH0
+        | 205 // MINI_F64_TRUNC_SCRATCH0
+        | 210 // MINI_F64_STORE_RR
+        | 211 // MINI_F32_STORE_RR
+        | 212 // MINI_GLOBAL_SET_R
+        | 214 // MINI_GLOBAL_SET_FR
+        | 215 // MINI_GLOBAL_SET_F32R
+        | 216 // MINI_I64_LT_SR_R
+        | 217 // MINI_I32_SHL_RI
+        | 219 // MINI_I64_LT_SCRATCH0_I_R
+        | 220 // MINI_I32_STORE8_SCRATCH0_R
+        | 221 // MINI_I32_STORE16_SCRATCH0_R
+        | 222 // MINI_I64_STORE_SCRATCH0_R
+        | 223 // MINI_I32_STORE_SCRATCH0_R
+        | 224 // MINI_U32_LT_SCRATCH0_S_R
+        | 225 // MINI_U32_LE_SCRATCH0_S_R
+        | 226 // MINI_U32_LT_S_SCRATCH0_R
+        | 227 // MINI_U32_LE_S_SCRATCH0_R
+        | 228 // MINI_I64_LE_SCRATCH0_S_R
+        | 229 // MINI_U64_LT_SCRATCH0_S_R
+        | 230 // MINI_U64_LT_S_SCRATCH0_R
+        | 231 // MINI_I32_LT_SCRATCH0_S_R
+        | 233 // MINI_I32_ADD_SCRATCH01_WB
+        | 234 // MINI_I64_ADD_SCRATCH01_WB
+        | 237 // MINI_SELECT_SCRATCH0_S
+        | 238 // MINI_SELECT_S_SCRATCH0
+        | 245 // MINI_I32_EQ_SCRATCH0_S_R
+        | 246 // MINI_I32_NE_SCRATCH0_S_R
+        | 247 // MINI_I32_LE_SCRATCH0_S_R
+        | 248 // MINI_I64_EQ_SCRATCH0_S_R
+        | 249 // MINI_I64_NE_SCRATCH0_S_R
+        | 251 // MINI_U64_LE_SCRATCH0_S_R
+        | 252 // MINI_F32_ARITH_SCRATCH0
+        | 253 // MINI_F64_ARITH_SCRATCH0
+        | 254 // MINI_F32_MINMAX_SCRATCH0
+        | 255 // MINI_F64_MINMAX_SCRATCH0
+        | 258 // MINI_I64_AND_SCRATCH0_I_WR
+        => 2,
+        // Width 3: two operands
+        190 // MINI_I32_ADD_SS_WR
+        | 191 // MINI_DIVREM_SCRATCH0_S
+        | 192 // MINI_DIVREM_S_SCRATCH0
+        | 206 // MINI_BR_I64_NE_RS
+        | 207 // MINI_BR_I64_EQ_RS
+        | 208 // MINI_BR_I64_EQ_RI
+        | 209 // MINI_BR_U32_LE_RS
+        | 213 // MINI_GLOBAL_SET_I
+        | 232 // MINI_BR_U64_LT_SCRATCH0_S
+        | 235 // MINI_I32_ADD_SCRATCH0_S_WB
+        | 236 // MINI_I64_ADD_SCRATCH0_S_WB
+        | 241 // MINI_I32_STORE_SCRATCH0_I
+        | 256 // MINI_I32_STORE_SCRATCH0_S
+        | 257 // MINI_I64_STORE_SCRATCH0_I
+        => 3,
+        // Width 5
+        218 // MINI_CALL_INDIRECT_SCRATCH0
+        => 5,
         // Unknown op: conservative default (treat as single word)
         _ => 1,
     }
@@ -4779,7 +5170,7 @@ pub(crate) fn prepass(
             let op = words[wi];
             // During emission, opcodes are small positive integers (0-170).
             // Sentinel-tagged values are large negatives. Skip non-opcode words.
-            let width = if op >= 0 && op <= 170 { mini_op_width(op) } else { 1 };
+            let width = if op >= 0 && op <= 258 { mini_op_width(op) } else { 1 };
             for oi in 1..width {
                 if wi + oi < words.len() {
                     let v = words[wi + oi];
