@@ -55,7 +55,7 @@ use super::prepass::{
     MINI_U16_LOAD_MEM0_OFF, MINI_U32_LE_RS_R, MINI_U32_LE_SS_R, MINI_U32_LT_RS_R, MINI_U32_LT_SS_R,
     MINI_U32_SHR_RI, MINI_U64_LE_SS_R, MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR,
     MINI_CALL_IMPORTED, MINI_CALL_INDIRECT, MINI_I64_OR_RI_WR, MINI_MEM_COPY_WITHIN,
-    MINI_YIELD_STOCK, MiniCode,
+    MINI_SLOTS_TRUNCATE, MINI_YIELD_STOCK, MiniCode,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -2250,6 +2250,11 @@ fn wasm_mainloop(
                 );
                 pc += 4;
             }
+            MINI_SLOTS_TRUNCATE => {
+                let new_len = program[pc + 1] as usize;
+                state.slots.truncate(new_len);
+                pc += 2;
+            }
             MINI_YIELD_STOCK => {
                 // Yield to the stock executor at the recorded byte offset.
                 // The caller flushes the slot snapshot to the real frame and
@@ -2487,8 +2492,8 @@ pub(crate) fn ensure_cached(
                             .filter(|(_, w)| **w == super::prepass::MINI_TRAP)
                             .map(|(i, _)| i).collect();
                         eprintln!(
-                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?}",
-                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos,
+                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}, loop_live={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?}",
+                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.loop_live_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos,
                         );
                     }
                     None => eprintln!(
