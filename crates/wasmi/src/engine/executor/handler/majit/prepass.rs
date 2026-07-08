@@ -1657,21 +1657,17 @@ pub(crate) fn prepass(
             OpCode::I32BitAnd_Rrs => {
                 let op = decode::I32BitAnd_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
-                words.extend_from_slice(&[MINI_I32_AND_SS_WR, scratch_base, rhs]);
+                words.extend_from_slice(&[MINI_I32_AND_RS_WR, rhs]);
             }
             OpCode::I32BitOr_Rrs => {
                 let op = decode::I32BitOr_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
-                words.extend_from_slice(&[MINI_I32_OR_SS_WR, scratch_base, rhs]);
+                words.extend_from_slice(&[MINI_I32_OR_RS_WR, rhs]);
             }
             OpCode::I32Sub_Rrs => {
                 let op = decode::I32Sub_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                // Non-commutative: the accumulator is the left operand.
-                words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
-                words.extend_from_slice(&[MINI_I32_SUB_SS_WR, scratch_base, rhs]);
+                words.extend_from_slice(&[MINI_I32_SUB_RS_WR, rhs]);
             }
             // Remaining value-position `sub` forms (result in the accumulator).
             // Sub is non-commutative, so accumulator (`ireg`, via `MINI_COPY_SR`)
@@ -1687,13 +1683,7 @@ pub(crate) fn prepass(
             OpCode::I32Sub_Rsr => {
                 let op = decode::I32Sub_Rsr::decode(&mut cursor).ok()?;
                 let lhs = s!(op.lhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I32_SUB_SS_WR,
-                    lhs,
-                    scratch_base,
-                ]);
+                words.extend_from_slice(&[MINI_I32_SUB_SR_WR, lhs]);
             }
             OpCode::I32Sub_Ris => {
                 let op = decode::I32Sub_Ris::decode(&mut cursor).ok()?;
@@ -1721,24 +1711,12 @@ pub(crate) fn prepass(
             OpCode::I64Sub_Rrs => {
                 let op = decode::I64Sub_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I64_SUB_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I64_SUB_RS_WR, rhs]);
             }
             OpCode::I64Sub_Rsr => {
                 let op = decode::I64Sub_Rsr::decode(&mut cursor).ok()?;
                 let lhs = s!(op.lhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I64_SUB_SS_WR,
-                    lhs,
-                    scratch_base,
-                ]);
+                words.extend_from_slice(&[MINI_I64_SUB_SR_WR, lhs]);
             }
             OpCode::I64Sub_Ris => {
                 let op = decode::I64Sub_Ris::decode(&mut cursor).ok()?;
@@ -1841,24 +1819,12 @@ pub(crate) fn prepass(
             OpCode::I32Mul_Rrs => {
                 let op = decode::I32Mul_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I32_MUL_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I32_MUL_RS_WR, rhs]);
             }
             OpCode::I32BitXor_Rrs => {
                 let op = decode::I32BitXor_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I32_XOR_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I32_XOR_RS_WR, rhs]);
             }
             OpCode::I32Add_Rs_rs => {
                 let op = decode::I32Add_Rs_rs::decode(&mut cursor).ok()?;
@@ -1991,35 +1957,17 @@ pub(crate) fn prepass(
             OpCode::I64Mul_Rrs => {
                 let op = decode::I64Mul_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I64_MUL_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I64_MUL_RS_WR, rhs]);
             }
             OpCode::I64BitOr_Rrs => {
                 let op = decode::I64BitOr_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I64_OR_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I64_OR_RS_WR, rhs]);
             }
             OpCode::I64BitXor_Rrs => {
                 let op = decode::I64BitXor_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[
-                    MINI_COPY_SR,
-                    scratch_base,
-                    MINI_I64_XOR_SS_WR,
-                    scratch_base,
-                    rhs,
-                ]);
+                words.extend_from_slice(&[MINI_I64_XOR_RS_WR, rhs]);
             }
             OpCode::I64Add_Rs_rs => {
                 let op = decode::I64Add_Rs_rs::decode(&mut cursor).ok()?;
@@ -2773,7 +2721,7 @@ pub(crate) fn prepass(
             OpCode::I32Add_Rrs => {
                 let op = decode::I32Add_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[MINI_I32_ADD_RS_WB, scratch_base, rhs]);
+                words.extend_from_slice(&[MINI_I32_ADD_RS_WR, rhs]);
             }
             // Value-position `x + imm` (result in the accumulator, not a local):
             // materialize the immediate into a scratch slot, then reuse the
@@ -2832,7 +2780,7 @@ pub(crate) fn prepass(
             OpCode::I64Add_Rrs => {
                 let op = decode::I64Add_Rrs::decode(&mut cursor).ok()?;
                 let rhs = s!(op.rhs);
-                words.extend_from_slice(&[MINI_I64_ADD_RS_WB, scratch_base, rhs]);
+                words.extend_from_slice(&[MINI_I64_ADD_RS_WR, rhs]);
             }
             OpCode::U64LoadMem0Offset16_Rr => {
                 let op = decode::U64LoadMem0Offset16_Rr::decode(&mut cursor).ok()?;
@@ -7725,7 +7673,10 @@ mod tests {
                 "must lower op {ss} or {rs}"
             );
         }
-        assert!(mp.words.contains(&MINI_BR_I32_LE_SS), "must lower branch");
+        assert!(
+            mp.words.contains(&MINI_BR_I32_LE_SS),
+            "must lower branch"
+        );
     }
 
     /// A loop summing an i32 array out of linear memory (sign-extending each
