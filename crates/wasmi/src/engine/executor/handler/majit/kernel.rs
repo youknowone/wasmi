@@ -2230,9 +2230,29 @@ fn wasm_mainloop(
                 pc += 4;
             }
             MINI_SLOTS_TRUNCATE => {
-                let new_len = program[pc + 1] as usize;
-                state.slots.truncate(new_len);
-                pc += 2;
+                let new_dense_len = program[pc + 1] as usize;
+                let num_scratch = program[pc + 2] as usize;
+                let total = state.slots.len();
+                let old_scratch_base = total - num_scratch;
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    eprintln!(
+                        "[majit-kernel] SLOTS_TRUNCATE total={} → dense={} + scratch={}",
+                        total, new_dense_len, num_scratch,
+                    );
+                }
+                // Save scratch values before truncation
+                let mut scratch_buf = [0i64; 4];
+                for i in 0..num_scratch.min(4) {
+                    scratch_buf[i] = state.slots[old_scratch_base + i];
+                }
+                // Truncate dense slots to loop-live count
+                state.slots.truncate(new_dense_len);
+                // Re-append scratch at the new base (new_dense_len)
+                for i in 0..num_scratch.min(4) {
+                    state.slots.push(scratch_buf[i]);
+                }
+                pc += 3;
             }
             MINI_YIELD_STOCK => {
                 // Yield to the stock executor at the recorded byte offset.
@@ -2470,9 +2490,13 @@ pub(crate) fn ensure_cached(
                         let trap_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
                             .filter(|(_, w)| **w == super::prepass::MINI_TRAP)
                             .map(|(i, _)| i).collect();
+                        let truncate_active = p.loop_live_count < p.num_slots;
+                        let trunc_pos: alloc::vec::Vec<usize> = p.words.iter().enumerate()
+                            .filter(|(_, w)| **w == super::prepass::MINI_SLOTS_TRUNCATE)
+                            .map(|(i, _)| i).collect();
                         eprintln!(
-                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}, loop_live={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?}",
-                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.loop_live_count, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos,
+                            "[majit-prepass] ELIGIBLE key={:#x} ops={} → {} words, num_slots={} (locals={} stack={}, unique={}, loop_live={}, truncate={}), yield_or_bail={}, globals={}, loop_header={:?}, yield={:?} bail={:?} trap={:?} trunc={:?}",
+                            key, ops.len(), p.words.len(), p.num_slots, len_local_slots, len_stack_slots, p.unique_slot_count, p.loop_live_count, truncate_active, p.has_yield_or_bail, p.uses_globals, p.loop_header_word, yield_pos, bail_pos, trap_pos, trunc_pos,
                         );
                     }
                     None => eprintln!(
@@ -2572,14 +2596,14 @@ pub(crate) fn run_persistent(
     // so the pointer stays valid. Releasing the borrow is required so
     // callee calls (CALL_ASSEMBLER path) can borrow PROGRAMS without a
     // RefCell re-entrancy panic.
-    let (words_data, words_len): (*const i64, usize) = PROGRAMS.with(|p| {
+    let (words_data, words_len, prog_loop_live, prog_num_slots): (*const i64, usize, usize, usize) = PROGRAMS.with(|p| {
         let progs = p.borrow();
         let program = progs
             .get(&key)
             .and_then(|c| c.as_ref())
             .map(|c| &c.program)
             .expect("run_persistent: program must be cached and eligible");
-        (program.words.as_ptr(), program.words.len())
+        (program.words.as_ptr(), program.words.len(), program.loop_live_count, program.num_slots)
     });
     // SAFETY: the HashMap entry is never removed, and the Vec heap allocation
     // is stable (no resize after prepass). The pointer is valid for the
@@ -2593,7 +2617,15 @@ pub(crate) fn run_persistent(
         match d.try_borrow_mut() {
             Ok(mut slot) => {
                 if slot.is_none() {
-                    *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                    let seed_slots;
+                    let driver_init = if prog_loop_live < prog_num_slots {
+                        let n_scratch = super::prepass::NUM_SCRATCH;
+                        seed_slots = alloc::vec![0i64; prog_loop_live + n_scratch];
+                        &seed_slots[..]
+                    } else {
+                        init_slots
+                    };
+                    *slot = Some(new_driver(THRESHOLD, words, driver_init));
                 }
                 let driver = slot.as_mut().unwrap();
                 Some(wasm_mainloop(driver, words, init_slots))
@@ -2614,20 +2646,38 @@ pub(crate) fn run_persistent(
         // functions that have a loop (loop_header). Non-looping functions
         // gain nothing from JIT and can cause miscompiles when run on a
         // shared driver that was created for a different function shape.
-        let has_loop = PROGRAMS.with(|p| {
+        let loop_info = PROGRAMS.with(|p| {
             p.borrow()
                 .get(&key)
                 .and_then(|c| c.as_ref())
-                .is_some_and(|c| c.program.loop_header_word.is_some())
+                .and_then(|c| {
+                    c.program.loop_header_word.is_some().then(|| {
+                        (c.program.loop_live_count, c.program.num_slots)
+                    })
+                })
         });
-        if !has_loop {
+        let Some((loop_live_count, num_slots)) = loop_info else {
             return None;
-        }
+        };
         CALLEE_DRIVER.with(|d| {
             match d.try_borrow_mut() {
                 Ok(mut slot) => {
                     if slot.is_none() {
-                        *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                        // Seed the driver with truncated slots when truncation is
+                        // active, so install_canonical_liveness sees the reduced
+                        // virt array size → fewer JIT inputargs.
+                        let seed_slots = if loop_live_count < num_slots {
+                            let n_scratch = super::prepass::NUM_SCRATCH;
+                            let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
+                            // Copy the loop-live prefix from init_slots
+                            for i in 0..loop_live_count.min(init_slots.len()) {
+                                s[i] = init_slots[i];
+                            }
+                            s
+                        } else {
+                            init_slots.to_vec()
+                        };
+                        *slot = Some(new_driver(THRESHOLD, words, &seed_slots));
                     }
                     let driver = slot.as_mut().unwrap();
                     Some(wasm_mainloop(driver, words, init_slots))

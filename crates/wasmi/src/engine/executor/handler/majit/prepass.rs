@@ -298,10 +298,12 @@ pub(crate) const MINI_CALL_IMPORTED: i64 = 164;
 /// type check, then dispatches to Wasm or Host. `index_slot` is the slot
 /// holding the runtime table index. Result to `slots[params_start]`.
 pub(crate) const MINI_CALL_INDIRECT: i64 = 165;
-/// `[MINI_SLOTS_TRUNCATE, new_len]` (2 words): truncate the kernel's `slots`
-/// array to `new_len` elements. Inserted at the loop header position by the
-/// prepass so that only loop-live slots participate in the virtualizable
-/// array, reducing JIT inputargs and register pressure.
+/// `[MINI_SLOTS_TRUNCATE, new_dense_len, num_scratch]` (3 words): truncate the
+/// kernel's `slots` array to `new_dense_len` dense elements, preserving scratch
+/// slots by relocating them from `old_scratch_base` to `new_dense_len`. Inserted
+/// at the loop header position by the prepass so that only loop-live slots
+/// participate in the virtualizable array, reducing JIT inputargs and register
+/// pressure.
 pub(crate) const MINI_SLOTS_TRUNCATE: i64 = 170;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
@@ -760,10 +762,10 @@ fn mini_op_width(op: i64) -> usize {
         | 151 // MINI_COPY_RI
         | 163 // MINI_I64_OR_RI_WR
         | 16 // MINI_BR_ALWAYS (2 words: [op, tgt])
-        | MINI_SLOTS_TRUNCATE // 170, 2 words: [op, new_len]
         => 2,
         // Width 3
-        2  // MINI_BR_I32_NE_RI
+        MINI_SLOTS_TRUNCATE // 170, 3 words: [op, new_dense_len, num_scratch]
+        | 2  // MINI_BR_I32_NE_RI
         | 4  // MINI_COPY_SI
         | 5  // MINI_COPY_SS
         | 7  // MINI_I64_ADD_SS_WR
@@ -4820,6 +4822,9 @@ pub(crate) fn prepass(
         .map(|(dense, &orig)| (orig as i64, dense as i64))
         .collect();
     let dense_count = slot_map.len();
+    let truncation_active = loop_header_word.is_some()
+        && !loop_used_originals.is_empty()
+        && loop_used_originals.len() < dense_count;
     let real_scratch_base = dense_count as i64;
 
     // Replace SLOT_SENTINEL and SCRATCH_SENTINEL occurrences in one pass.
@@ -4874,12 +4879,14 @@ pub(crate) fn prepass(
             dense_count
         };
 
-        // NOTE: MINI_SLOTS_TRUNCATE insertion is deferred until scratch
-        // slots are separated from the slots Vec (they share the same Vec,
-        // so truncating the dense slots also removes scratch). The loop-
-        // first slot ordering is still applied: loop-live slots occupy
-        // dense indices 0..L-1 so a future truncate(L) is well-defined
-        // once scratch is separated into scalar state fields.
+        // NOTE: MINI_SLOTS_TRUNCATE word-stream insertion is NOT done here.
+        // The runtime truncation is achieved via seed-slot truncation in
+        // the kernel: new_driver() receives a seed with loop_live_count +
+        // NUM_SCRATCH slots, so install_canonical_liveness sees the reduced
+        // virt array size → fewer JIT inputargs. The preloop and loop body
+        // both reference scratch at dense_count + offset (unchanged), and
+        // the MINI_SLOTS_TRUNCATE op remains in the kernel dispatch for
+        // future use when runtime truncation becomes viable.
         let _ = MINI_SLOTS_TRUNCATE; // suppress unused warning
 
         llc
