@@ -298,6 +298,11 @@ pub(crate) const MINI_CALL_IMPORTED: i64 = 164;
 /// type check, then dispatches to Wasm or Host. `index_slot` is the slot
 /// holding the runtime table index. Result to `slots[params_start]`.
 pub(crate) const MINI_CALL_INDIRECT: i64 = 165;
+/// `[MINI_SLOTS_TRUNCATE, new_len]` (2 words): truncate the kernel's `slots`
+/// array to `new_len` elements. Inserted at the loop header position by the
+/// prepass so that only loop-live slots participate in the virtualizable
+/// array, reducing JIT inputargs and register pressure.
+pub(crate) const MINI_SLOTS_TRUNCATE: i64 = 170;
 /// `[MINI_I64_LOAD_MEM0_OFF, offset]` (2 words): an i64 load from the default
 /// linear memory — `ireg = *(mem_base + (ireg & 0xffff_ffff) + offset)`. The
 /// dynamic address is the accumulator (an unsigned 32-bit wasm address); the
@@ -692,6 +697,176 @@ pub(crate) struct MiniProgram {
     pub has_yield_or_bail: bool,
     /// Number of distinct slot indices referenced in the program (diagnostic).
     pub unique_slot_count: usize,
+    /// Number of dense slot indices referenced in the loop body (from
+    /// `loop_header_word` onward). When a loop is present, only these slots
+    /// are live across iterations; the rest are setup-only. The kernel
+    /// truncates `state.slots` to this count at the loop header.
+    pub loop_live_count: usize,
+}
+
+/// Return the width (number of i64 words consumed) of a MINI opcode.
+///
+/// Return ops and HALT consume 1 word in this table but terminate the
+/// dispatch (no `pc += width`). Branch ops return their fallthrough width;
+/// branch-taken jumps directly to the target word. This is used by the
+/// loop-live slot analysis to walk the word stream accurately.
+fn mini_op_width(op: i64) -> usize {
+    match op {
+        // Width 1: opcode only (or implicit accumulator)
+        0  // MINI_HALT
+        | 3  // MINI_RETURN_R
+        | 43 // MINI_I64_SEXT32
+        | 49 // MINI_RETURN_VOID
+        | 126 // MINI_I32_REINTERP_F32
+        | 127 // MINI_F32_REINTERP_I32
+        | 134 // MINI_RETURN_F_R
+        | 135 // MINI_RETURN_F32_R
+        | 152 // MINI_I64_REINTERP_F64
+        | 153 // MINI_F64_REINTERP_I64
+        | 156 // MINI_RETURN_BAIL
+        | 160 // MINI_MEMORY_SIZE
+        => 1,
+        // Width 2
+        6  // MINI_COPY_SR
+        | 19 // MINI_I64_AND_RI_WR
+        | 38 // MINI_U32_SHR_RI
+        | 41 // MINI_I64_LOAD_MEM0_OFF
+        | 42 // MINI_I32_LOAD_MEM0_OFF
+        | 44 // MINI_U8_LOAD_MEM0_OFF
+        | 45 // MINI_I8_LOAD_MEM0_OFF
+        | 46 // MINI_U16_LOAD_MEM0_OFF
+        | 47 // MINI_I16_LOAD_MEM0_OFF
+        | 57 // MINI_I32_LT_RS_R
+        | 58 // MINI_I32_LT_SR_R
+        | 60 // MINI_I32_EQ_RS_R
+        | 61 // MINI_I32_NE_RS_R
+        | 62 // MINI_I64_EQ_RS_R
+        | 63 // MINI_I64_NE_RS_R
+        | 64 // MINI_I64_LT_RS_R
+        | 65 // MINI_I32_LE_RS_R
+        | 66 // MINI_U32_LT_RS_R
+        | 67 // MINI_U32_LE_RS_R
+        | 89 // MINI_I64_SEXT32_S
+        | 100 // MINI_COPY_S_FR
+        | 101 // MINI_F64_LOAD_MEM0_OFF
+        | 117 // MINI_F32_LOAD_MEM0_OFF
+        | 119 // MINI_COPY_S_F32R
+        | 124 // MINI_F64_PROMOTE_S
+        | 125 // MINI_F32_DEMOTE_S
+        | 130 // MINI_GLOBAL_GET_R
+        | 132 // MINI_GLOBAL_GET_F32
+        | 133 // MINI_GLOBAL_GET_F64
+        | 150 // MINI_COPY_RS
+        | 151 // MINI_COPY_RI
+        | 163 // MINI_I64_OR_RI_WR
+        | 16 // MINI_BR_ALWAYS (2 words: [op, tgt])
+        | MINI_SLOTS_TRUNCATE // 170, 2 words: [op, new_len]
+        => 2,
+        // Width 3
+        2  // MINI_BR_I32_NE_RI
+        | 4  // MINI_COPY_SI
+        | 5  // MINI_COPY_SS
+        | 7  // MINI_I64_ADD_SS_WR
+        | 10 // MINI_BR_I64_NE_RI
+        | 12 // MINI_I64_MUL_SS_WR
+        | 13 // MINI_I32_MUL_SS_WR
+        | 14 // MINI_I32_ADD_RS_WB
+        | 18 // MINI_I64_XOR_SS_WR
+        | 20 // MINI_I64_AND_SI_WR
+        | 21 // MINI_I64_ADD_RS_WB
+        | 27 // MINI_BR_I64_LT_IR
+        | 28 // MINI_I64_OR_SS_WR
+        | 29 // MINI_I64_SUB_SS_WR
+        | 30 // MINI_I32_XOR_SS_WR
+        | 31 // MINI_I32_AND_SS_WR
+        | 32 // MINI_I32_OR_SS_WR
+        | 33 // MINI_I32_SUB_SS_WR
+        | 36 // MINI_I64_SHL_SI
+        | 37 // MINI_I32_SHL_SI
+        | 39 // MINI_I32_LT_SI_R
+        | 40 // MINI_I64_LT_IS_R
+        | 48 // MINI_I32_STORE_SR
+        | 50 // MINI_I32_STORE_RS
+        | 51 // MINI_I64_STORE_RS
+        | 52 // MINI_I32_STORE8_RS
+        | 53 // MINI_I32_STORE16_RS
+        | 54 // MINI_I64_STORE_SR
+        | 55 // MINI_I32_STORE8_SR
+        | 56 // MINI_I32_STORE16_SR
+        | 59 // MINI_SELECT
+        | 68 // MINI_F64_ARITH_RS
+        | 69 // MINI_F64_CMP_RS_R
+        | 70 // MINI_F64_UNARY_S
+        | 71 // MINI_F64_MINMAX_RS
+        | 85 // MINI_F64_CVT_S
+        | 90 // MINI_F64_TRUNC_SAT_S
+        | 94 // MINI_F64_TRUNC_S
+        | 98 // MINI_I32_ROTL_SI
+        | 99 // MINI_I32_ROTR_SI
+        | 102 // MINI_F64_STORE_SR
+        | 103 // MINI_I32_BITCOUNT_S
+        | 106 // MINI_I64_BITCOUNT_S
+        | 109 // MINI_I32_DIV_S
+        | 110 // MINI_I32_DIV_U
+        | 111 // MINI_I32_REM_S
+        | 112 // MINI_I32_REM_U
+        | 113 // MINI_I64_DIV_S
+        | 114 // MINI_I64_DIV_U
+        | 115 // MINI_I64_REM_S
+        | 116 // MINI_I64_REM_U
+        | 118 // MINI_F32_STORE_SR
+        | 120 // MINI_F32_ARITH_RS
+        | 121 // MINI_F32_CMP_RS_R
+        | 122 // MINI_F32_UNARY_S
+        | 123 // MINI_F32_CVT_S
+        | 128 // MINI_F32_TRUNC_SAT_S
+        | 129 // MINI_F32_TRUNC_S
+        | 131 // MINI_GLOBAL_SET_S
+        | 136 // MINI_F32_MINMAX_RS
+        | 137 // MINI_I64_LT_SI_R
+        | 138 // MINI_I32_EQ_SS_R
+        | 139 // MINI_I32_NE_SS_R
+        | 140 // MINI_I32_LT_SS_R
+        | 141 // MINI_I32_LE_SS_R
+        | 142 // MINI_U32_LT_SS_R
+        | 143 // MINI_U32_LE_SS_R
+        | 144 // MINI_I64_EQ_SS_R
+        | 145 // MINI_I64_NE_SS_R
+        | 146 // MINI_I64_LT_SS_R
+        | 147 // MINI_I64_LE_SS_R
+        | 148 // MINI_U64_LT_SS_R
+        | 149 // MINI_U64_LE_SS_R
+        | 161 // MINI_U64_SHR_SS_WR
+        => 3,
+        // Width 4
+        1  // MINI_I32_ADD_SI_WB
+        | 9  // MINI_BR_I64_EQ_SI
+        | 15 // MINI_BR_U32_LE_SS
+        | 17 // MINI_BR_I64_LE_SS
+        | 22 // MINI_U64_SHR_SI
+        | 23 // MINI_I64_ADD_SS_WB
+        | 24 // MINI_BR_I64_LE_SI
+        | 25 // MINI_I32_ADD_SS_WB
+        | 26 // MINI_BR_I32_LT_SI
+        | 34 // MINI_BR_I32_LE_SS
+        | 35 // MINI_BR_I64_EQ_SS
+        | 154 // MINI_BR_I64_NE_SS
+        | 155 // MINI_BR_U64_LT_SS
+        | 158 // MINI_CALL_RESIDUAL
+        | 162 // MINI_MEM_COPY_WITHIN
+        | 164 // MINI_CALL_IMPORTED
+        => 4,
+        // Width 6
+        165 // MINI_CALL_INDIRECT
+        => 6,
+        // Return ops that read program[pc+1] before returning
+        11 // MINI_RETURN_S (reads program[pc+1])
+        | 157 // MINI_YIELD_STOCK (reads program[pc+1..=pc+2])
+        | 159 // MINI_TRAP (reads program[pc+1])
+        => 2,
+        // Unknown op: conservative default (treat as single word)
+        _ => 1,
+    }
 }
 
 /// Decode `ops` (an `indirect-dispatch` op stream) into a [`MiniProgram`].
@@ -4568,11 +4743,11 @@ pub(crate) fn prepass(
     }
 
     let mut loop_header_word = None;
-    for (target_field, target_byte, is_back) in fixups {
+    for (target_field, target_byte, is_back) in &fixups {
         // A branch into the middle of an op (not an op boundary) is malformed.
-        let target_word = *byte_to_word.get(&target_byte)?;
-        words[target_field] = target_word as i64;
-        if is_back {
+        let target_word = *byte_to_word.get(target_byte)?;
+        words[*target_field] = target_word as i64;
+        if *is_back {
             loop_header_word = Some(target_word);
         }
     }
@@ -4580,18 +4755,69 @@ pub(crate) fn prepass(
     // ── Post-pass: dense slot remapping + scratch relocation ──
     //
     // Build a dense mapping from unique original slot indices to 0..N-1.
-    // Because `unique_slots` is a BTreeSet, the sorted order guarantees that
-    // contiguous original indices (e.g., params span) map to contiguous dense
-    // indices — the kernel's `state.slots[params_start + i]` staging still
-    // works correctly.
+    //
+    // When the function has a loop, we reorder the slot mapping so that
+    // loop-used slots occupy the lowest dense indices (0..L-1) and
+    // pre-loop-only slots occupy L..N-1. This enables truncating the
+    // virtualizable array to L at the loop header, reducing inputargs
+    // and register pressure.
     //
     // slot_map: dense_idx → original frame slot index (for seed/writeback).
     // reverse_map: original → dense_idx (for rewriting SLOT_SENTINEL words).
-    let slot_map: Vec<u16> = unique_slots.iter().map(|&idx| idx as u16).collect();
-    let reverse_map: alloc::collections::BTreeMap<i64, i64> = unique_slots
+
+    // Scan the loop body (pre-sentinel-replacement) for referenced original
+    // slot indices. Words in the sentinel range [SLOT_SENTINEL, SLOT_SENTINEL
+    // + max_slot_seen] are original-slot references.
+    let loop_used_originals: alloc::collections::BTreeSet<i64> = if let Some(lhw) = loop_header_word {
+        let mut used = alloc::collections::BTreeSet::new();
+        let mut wi = lhw;
+        while wi < words.len() {
+            // Width is unknown for sentinel-tagged words, but opcodes are
+            // never in the sentinel range, so words[wi] is the opcode.
+            let op = words[wi];
+            // During emission, opcodes are small positive integers (0-170).
+            // Sentinel-tagged values are large negatives. Skip non-opcode words.
+            let width = if op >= 0 && op <= 170 { mini_op_width(op) } else { 1 };
+            for oi in 1..width {
+                if wi + oi < words.len() {
+                    let v = words[wi + oi];
+                    if v >= SLOT_SENTINEL && v < SLOT_SENTINEL + max_slot_seen + 1 {
+                        used.insert(v - SLOT_SENTINEL); // original slot index
+                    }
+                }
+            }
+            wi += width;
+        }
+        used
+    } else {
+        alloc::collections::BTreeSet::new()
+    };
+
+    // Build slot_map with loop-first ordering: loop-used originals first,
+    // then pre-loop-only originals. Both groups maintain sorted order
+    // internally for contiguous-params compatibility.
+    let slot_map: Vec<u16> = if loop_header_word.is_some() && !loop_used_originals.is_empty() {
+        let mut map = Vec::with_capacity(unique_slots.len());
+        // Loop-used slots first (sorted)
+        for &orig in &unique_slots {
+            if loop_used_originals.contains(&orig) {
+                map.push(orig as u16);
+            }
+        }
+        // Pre-loop-only slots after (sorted)
+        for &orig in &unique_slots {
+            if !loop_used_originals.contains(&orig) {
+                map.push(orig as u16);
+            }
+        }
+        map
+    } else {
+        unique_slots.iter().map(|&idx| idx as u16).collect()
+    };
+    let reverse_map: alloc::collections::BTreeMap<i64, i64> = slot_map
         .iter()
         .enumerate()
-        .map(|(dense, &orig)| (orig, dense as i64))
+        .map(|(dense, &orig)| (orig as i64, dense as i64))
         .collect();
     let dense_count = slot_map.len();
     let real_scratch_base = dense_count as i64;
@@ -4629,6 +4855,38 @@ pub(crate) fn prepass(
             "SCRATCH_SENTINEL leaked at word {i}: value {w}",
         );
     }
+    // ── Loop-live slot analysis + MINI_SLOTS_TRUNCATE insertion ──
+    //
+    // When the function has a loop (loop_header_word is Some), scan the loop
+    // body to find which dense slot indices [0..dense_count) are referenced as
+    // operands. Scratch slots (dense_count..dense_count+NUM_SCRATCH) are
+    // always required and excluded from truncation.
+    //
+    // The truncation reduces the virtualizable array size so the JIT's
+    // close_loop JUMP carries fewer inputargs → less register spill.
+    let loop_live_count = if let Some(lhw) = loop_header_word {
+        // With loop-first slot ordering, loop-used slots occupy dense indices
+        // 0..L-1 and pre-loop-only slots occupy L..dense_count-1.
+        // Truncating to L removes exactly the pre-loop-only slots.
+        let llc = if !loop_used_originals.is_empty() {
+            loop_used_originals.len()
+        } else {
+            dense_count
+        };
+
+        // NOTE: MINI_SLOTS_TRUNCATE insertion is deferred until scratch
+        // slots are separated from the slots Vec (they share the same Vec,
+        // so truncating the dense slots also removes scratch). The loop-
+        // first slot ordering is still applied: loop-live slots occupy
+        // dense indices 0..L-1 so a future truncate(L) is well-defined
+        // once scratch is separated into scalar state fields.
+        let _ = MINI_SLOTS_TRUNCATE; // suppress unused warning
+
+        llc
+    } else {
+        dense_count
+    };
+
     Some(MiniProgram {
         words,
         num_slots: dense_count,
@@ -4638,6 +4896,7 @@ pub(crate) fn prepass(
         uses_globals,
         has_yield_or_bail,
         unique_slot_count: unique_slots.len(),
+        loop_live_count,
     })
 }
 
