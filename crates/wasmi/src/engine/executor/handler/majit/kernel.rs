@@ -2384,12 +2384,12 @@ fn wasm_mainloop(
             }
             MINI_I32_SUB_RS_WR => {
                 let rhs = program[pc + 1] as usize;
-                state.accum0 = ((state.accum0.wrapping_sub(state.slots[rhs])) << 32) >> 32;
+                state.accum0 = ((state.accum0 - state.slots[rhs]) << 32) >> 32;
                 pc += 2;
             }
             MINI_I32_MUL_RS_WR => {
                 let rhs = program[pc + 1] as usize;
-                state.accum0 = ((state.accum0.wrapping_mul(state.slots[rhs])) << 32) >> 32;
+                state.accum0 = ((state.accum0 * state.slots[rhs]) << 32) >> 32;
                 pc += 2;
             }
             MINI_I32_XOR_RS_WR => {
@@ -2399,12 +2399,12 @@ fn wasm_mainloop(
             }
             MINI_I64_SUB_RS_WR => {
                 let rhs = program[pc + 1] as usize;
-                state.accum0 = state.accum0.wrapping_sub(state.slots[rhs]);
+                state.accum0 = state.accum0 - state.slots[rhs];
                 pc += 2;
             }
             MINI_I64_MUL_RS_WR => {
                 let rhs = program[pc + 1] as usize;
-                state.accum0 = state.accum0.wrapping_mul(state.slots[rhs]);
+                state.accum0 = state.accum0 * state.slots[rhs];
                 pc += 2;
             }
             MINI_I64_OR_RS_WR => {
@@ -2420,12 +2420,12 @@ fn wasm_mainloop(
             // Binary SR: slot OP accum -> accum
             MINI_I32_SUB_SR_WR => {
                 let lhs = program[pc + 1] as usize;
-                state.accum0 = ((state.slots[lhs].wrapping_sub(state.accum0)) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs] - state.accum0) << 32) >> 32;
                 pc += 2;
             }
             MINI_I64_SUB_SR_WR => {
                 let lhs = program[pc + 1] as usize;
-                state.accum0 = state.slots[lhs].wrapping_sub(state.accum0);
+                state.accum0 = state.slots[lhs] - state.accum0;
                 pc += 2;
             }
             // Add without slot writeback
@@ -2436,7 +2436,7 @@ fn wasm_mainloop(
             }
             MINI_I64_ADD_RS_WR => {
                 let rhs = program[pc + 1] as usize;
-                state.accum0 = state.accum0.wrapping_add(state.slots[rhs]);
+                state.accum0 = state.accum0 + state.slots[rhs];
                 pc += 2;
             }
             MINI_I32_ADD_SS_WR => {
