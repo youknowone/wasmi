@@ -1161,6 +1161,102 @@ fn mini_op_width(op: i64) -> usize {
         | 157 // MINI_YIELD_STOCK (reads program[pc+1..=pc+2])
         | 159 // MINI_TRAP (reads program[pc+1])
         => 2,
+        // ── Scratch-dedicated ops widths ──
+        // Width 1: no operands
+        171 // MINI_COPY_SCRATCH0_R
+        | 173 // MINI_COPY_SCRATCH0_FR
+        | 174 // MINI_COPY_SCRATCH0_F32R
+        | 175 // MINI_COPY_SCRATCH1_R
+        | 200 // MINI_F64_PROMOTE_SCRATCH0
+        | 201 // MINI_F32_DEMOTE_SCRATCH0
+        | 239 // MINI_SELECT_SCRATCH01
+        | 240 // MINI_U64_SHR_SCRATCH01_WR
+        | 242 // MINI_U32_LT_SCRATCH01_R
+        | 243 // MINI_U32_LE_SCRATCH01_R
+        | 244 // MINI_U64_LT_SCRATCH01_R
+        => 1,
+        // Width 2: one operand
+        172 // MINI_COPY_SCRATCH0_I
+        | 176 // MINI_COPY_SCRATCH1_I
+        | 177 // MINI_I32_AND_RS_WR
+        | 178 // MINI_I32_OR_RS_WR
+        | 179 // MINI_I32_SUB_RS_WR
+        | 180 // MINI_I32_MUL_RS_WR
+        | 181 // MINI_I32_XOR_RS_WR
+        | 182 // MINI_I64_SUB_RS_WR
+        | 183 // MINI_I64_MUL_RS_WR
+        | 184 // MINI_I64_OR_RS_WR
+        | 185 // MINI_I64_XOR_RS_WR
+        | 186 // MINI_I32_SUB_SR_WR
+        | 187 // MINI_I64_SUB_SR_WR
+        | 188 // MINI_I32_ADD_RS_WR
+        | 189 // MINI_I64_ADD_RS_WR
+        | 193 // MINI_DIVREM_SCRATCH01
+        | 194 // MINI_I32_BITCOUNT_SCRATCH0
+        | 195 // MINI_I64_BITCOUNT_SCRATCH0
+        | 196 // MINI_F32_UNARY_SCRATCH0
+        | 197 // MINI_F64_UNARY_SCRATCH0
+        | 198 // MINI_F32_CVT_SCRATCH0
+        | 199 // MINI_F64_CVT_SCRATCH0
+        | 202 // MINI_F32_TRUNC_SAT_SCRATCH0
+        | 203 // MINI_F64_TRUNC_SAT_SCRATCH0
+        | 204 // MINI_F32_TRUNC_SCRATCH0
+        | 205 // MINI_F64_TRUNC_SCRATCH0
+        | 210 // MINI_F64_STORE_RR
+        | 211 // MINI_F32_STORE_RR
+        | 212 // MINI_GLOBAL_SET_R
+        | 214 // MINI_GLOBAL_SET_FR
+        | 215 // MINI_GLOBAL_SET_F32R
+        | 216 // MINI_I64_LT_SR_R
+        | 217 // MINI_I32_SHL_RI
+        | 219 // MINI_I64_LT_SCRATCH0_I_R
+        | 220 // MINI_I32_STORE8_SCRATCH0_R
+        | 221 // MINI_I32_STORE16_SCRATCH0_R
+        | 222 // MINI_I64_STORE_SCRATCH0_R
+        | 223 // MINI_I32_STORE_SCRATCH0_R
+        | 224 // MINI_U32_LT_SCRATCH0_S_R
+        | 225 // MINI_U32_LE_SCRATCH0_S_R
+        | 226 // MINI_U32_LT_S_SCRATCH0_R
+        | 227 // MINI_U32_LE_S_SCRATCH0_R
+        | 228 // MINI_I64_LE_SCRATCH0_S_R
+        | 229 // MINI_U64_LT_SCRATCH0_S_R
+        | 230 // MINI_U64_LT_S_SCRATCH0_R
+        | 231 // MINI_I32_LT_SCRATCH0_S_R
+        | 233 // MINI_I32_ADD_SCRATCH01_WB
+        | 234 // MINI_I64_ADD_SCRATCH01_WB
+        | 237 // MINI_SELECT_SCRATCH0_S
+        | 238 // MINI_SELECT_S_SCRATCH0
+        | 245 // MINI_I32_EQ_SCRATCH0_S_R
+        | 246 // MINI_I32_NE_SCRATCH0_S_R
+        | 247 // MINI_I32_LE_SCRATCH0_S_R
+        | 248 // MINI_I64_EQ_SCRATCH0_S_R
+        | 249 // MINI_I64_NE_SCRATCH0_S_R
+        | 251 // MINI_U64_LE_SCRATCH0_S_R
+        | 252 // MINI_F32_ARITH_SCRATCH0
+        | 253 // MINI_F64_ARITH_SCRATCH0
+        | 254 // MINI_F32_MINMAX_SCRATCH0
+        | 255 // MINI_F64_MINMAX_SCRATCH0
+        | 258 // MINI_I64_AND_SCRATCH0_I_WR
+        => 2,
+        // Width 3: two operands
+        190 // MINI_I32_ADD_SS_WR
+        | 191 // MINI_DIVREM_SCRATCH0_S
+        | 192 // MINI_DIVREM_S_SCRATCH0
+        | 206 // MINI_BR_I64_NE_RS
+        | 207 // MINI_BR_I64_EQ_RS
+        | 208 // MINI_BR_I64_EQ_RI
+        | 209 // MINI_BR_U32_LE_RS
+        | 213 // MINI_GLOBAL_SET_I
+        | 232 // MINI_BR_U64_LT_SCRATCH0_S
+        | 235 // MINI_I32_ADD_SCRATCH0_S_WB
+        | 236 // MINI_I64_ADD_SCRATCH0_S_WB
+        | 241 // MINI_I32_STORE_SCRATCH0_I
+        | 256 // MINI_I32_STORE_SCRATCH0_S
+        | 257 // MINI_I64_STORE_SCRATCH0_I
+        => 3,
+        // Width 5
+        218 // MINI_CALL_INDIRECT_SCRATCH0
+        => 5,
         // Unknown op: conservative default (treat as single word)
         _ => 1,
     }
@@ -5049,7 +5145,7 @@ pub(crate) fn prepass(
             let op = words[wi];
             // During emission, opcodes are small positive integers (0-170).
             // Sentinel-tagged values are large negatives. Skip non-opcode words.
-            let width = if op >= 0 && op <= 170 { mini_op_width(op) } else { 1 };
+            let width = if op >= 0 && op <= 258 { mini_op_width(op) } else { 1 };
             for oi in 1..width {
                 if wi + oi < words.len() {
                     let v = words[wi + oi];

@@ -56,6 +56,43 @@ use super::prepass::{
     MINI_U32_SHR_RI, MINI_U64_LE_SS_R, MINI_U64_LT_SS_R, MINI_U64_SHR_SI, MINI_U64_SHR_SS_WR,
     MINI_CALL_IMPORTED, MINI_CALL_INDIRECT, MINI_I64_OR_RI_WR, MINI_MEM_COPY_WITHIN,
     MINI_SLOTS_TRUNCATE, MINI_YIELD_STOCK, MiniCode,
+    // Scratch-dedicated ops
+    MINI_COPY_SCRATCH0_R, MINI_COPY_SCRATCH0_I, MINI_COPY_SCRATCH0_FR, MINI_COPY_SCRATCH0_F32R,
+    MINI_COPY_SCRATCH1_R, MINI_COPY_SCRATCH1_I,
+    MINI_I32_AND_RS_WR, MINI_I32_OR_RS_WR, MINI_I32_SUB_RS_WR, MINI_I32_MUL_RS_WR,
+    MINI_I32_XOR_RS_WR, MINI_I64_SUB_RS_WR, MINI_I64_MUL_RS_WR, MINI_I64_OR_RS_WR,
+    MINI_I64_XOR_RS_WR, MINI_I32_SUB_SR_WR, MINI_I64_SUB_SR_WR,
+    MINI_I32_ADD_RS_WR, MINI_I64_ADD_RS_WR, MINI_I32_ADD_SS_WR,
+    MINI_DIVREM_SCRATCH0_S, MINI_DIVREM_S_SCRATCH0, MINI_DIVREM_SCRATCH01,
+    MINI_I32_BITCOUNT_SCRATCH0, MINI_I64_BITCOUNT_SCRATCH0,
+    MINI_F32_UNARY_SCRATCH0, MINI_F64_UNARY_SCRATCH0,
+    MINI_F32_CVT_SCRATCH0, MINI_F64_CVT_SCRATCH0,
+    MINI_F64_PROMOTE_SCRATCH0, MINI_F32_DEMOTE_SCRATCH0,
+    MINI_F32_TRUNC_SAT_SCRATCH0, MINI_F64_TRUNC_SAT_SCRATCH0,
+    MINI_F32_TRUNC_SCRATCH0, MINI_F64_TRUNC_SCRATCH0,
+    MINI_BR_I64_NE_RS, MINI_BR_I64_EQ_RS, MINI_BR_I64_EQ_RI, MINI_BR_U32_LE_RS,
+    MINI_F64_STORE_RR, MINI_F32_STORE_RR,
+    MINI_GLOBAL_SET_R, MINI_GLOBAL_SET_I, MINI_GLOBAL_SET_FR, MINI_GLOBAL_SET_F32R,
+    MINI_I64_LT_SR_R, MINI_I32_SHL_RI,
+    MINI_CALL_INDIRECT_SCRATCH0, MINI_I64_LT_SCRATCH0_I_R,
+    MINI_I32_STORE8_SCRATCH0_R, MINI_I32_STORE16_SCRATCH0_R,
+    MINI_I64_STORE_SCRATCH0_R, MINI_I32_STORE_SCRATCH0_R,
+    MINI_U32_LT_SCRATCH0_S_R, MINI_U32_LE_SCRATCH0_S_R,
+    MINI_U32_LT_S_SCRATCH0_R, MINI_U32_LE_S_SCRATCH0_R,
+    MINI_I64_LE_SCRATCH0_S_R, MINI_U64_LT_SCRATCH0_S_R, MINI_U64_LT_S_SCRATCH0_R,
+    MINI_I32_LT_SCRATCH0_S_R, MINI_BR_U64_LT_SCRATCH0_S,
+    MINI_I32_ADD_SCRATCH01_WB, MINI_I64_ADD_SCRATCH01_WB,
+    MINI_I32_ADD_SCRATCH0_S_WB, MINI_I64_ADD_SCRATCH0_S_WB,
+    MINI_SELECT_SCRATCH0_S, MINI_SELECT_S_SCRATCH0, MINI_SELECT_SCRATCH01,
+    MINI_U64_SHR_SCRATCH01_WR, MINI_I32_STORE_SCRATCH0_I,
+    MINI_U32_LT_SCRATCH01_R, MINI_U32_LE_SCRATCH01_R, MINI_U64_LT_SCRATCH01_R,
+    MINI_I32_EQ_SCRATCH0_S_R, MINI_I32_NE_SCRATCH0_S_R, MINI_I32_LE_SCRATCH0_S_R,
+    MINI_I64_EQ_SCRATCH0_S_R, MINI_I64_NE_SCRATCH0_S_R,
+    MINI_U64_LE_SCRATCH0_S_R,
+    MINI_F32_ARITH_SCRATCH0, MINI_F64_ARITH_SCRATCH0,
+    MINI_F32_MINMAX_SCRATCH0, MINI_F64_MINMAX_SCRATCH0,
+    MINI_I32_STORE_SCRATCH0_S, MINI_I64_STORE_SCRATCH0_I,
+    MINI_I64_AND_SCRATCH0_I_WR,
 };
 
 /// Counts hot loops majit compiled in the kernel — evidence the JIT tier traced
@@ -152,6 +189,39 @@ std::thread_local! {
     /// flushes it to the real frame before resuming the stock executor.
     static YIELD_SLOTS: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
 
+}
+
+std::thread_local! {
+    /// Scratch register 0: a temporary scalar that lives outside the
+    /// JIT-tracked state so it does not inflate the virtualizable array or
+    /// the scalar inputarg count. Written by `MINI_COPY_SCRATCH0_*` ops,
+    /// read by `MINI_*_SCRATCH0_*` ops. Thread-safe because the kernel
+    /// runs single-threaded per wasm instance.
+    static SCRATCH0: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    /// Scratch register 1: second temporary for two-operand scratch patterns
+    /// (e.g. `dr_ri!`, `dr_ir!` macros).
+    static SCRATCH1: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+}
+
+/// Read scratch register 0.
+#[inline(always)]
+fn scratch0_get() -> i64 {
+    SCRATCH0.with(|c| c.get())
+}
+/// Write scratch register 0.
+#[inline(always)]
+fn scratch0_set(v: i64) {
+    SCRATCH0.with(|c| c.set(v));
+}
+/// Read scratch register 1.
+#[inline(always)]
+fn scratch1_get() -> i64 {
+    SCRATCH1.with(|c| c.get())
+}
+/// Write scratch register 1.
+#[inline(always)]
+fn scratch1_set(v: i64) {
+    SCRATCH1.with(|c| c.set(v));
 }
 
 /// Maximum number of params for a single CallInternal. Wasm functions rarely
@@ -2296,6 +2366,562 @@ fn wasm_mainloop(
                 // Signal the caller (run_jit) to fall back to stock executor.
                 BAIL_TO_STOCK.with(|b| b.set(true));
                 return 0;
+            }
+            // ── Scratch-dedicated ops ──────────────────────────────────────
+            MINI_COPY_SCRATCH0_R => {
+                scratch0_set(state.accum0);
+                pc += 1;
+            }
+            MINI_COPY_SCRATCH0_I => {
+                scratch0_set(program[pc + 1]);
+                pc += 2;
+            }
+            MINI_COPY_SCRATCH0_FR => {
+                scratch0_set(state.accum1);
+                pc += 1;
+            }
+            MINI_COPY_SCRATCH0_F32R => {
+                scratch0_set(state.accum2);
+                pc += 1;
+            }
+            MINI_COPY_SCRATCH1_R => {
+                scratch1_set(state.accum0);
+                pc += 1;
+            }
+            MINI_COPY_SCRATCH1_I => {
+                scratch1_set(program[pc + 1]);
+                pc += 2;
+            }
+            // Binary RS: accum OP slot -> accum
+            MINI_I32_AND_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0 & state.slots[rhs]) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I32_OR_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0 | state.slots[rhs]) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I32_SUB_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0.wrapping_sub(state.slots[rhs])) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I32_MUL_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0.wrapping_mul(state.slots[rhs])) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I32_XOR_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0 ^ state.slots[rhs]) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I64_SUB_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0.wrapping_sub(state.slots[rhs]);
+                pc += 2;
+            }
+            MINI_I64_MUL_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0.wrapping_mul(state.slots[rhs]);
+                pc += 2;
+            }
+            MINI_I64_OR_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0 | state.slots[rhs];
+                pc += 2;
+            }
+            MINI_I64_XOR_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0 ^ state.slots[rhs];
+                pc += 2;
+            }
+            // Binary SR: slot OP accum -> accum
+            MINI_I32_SUB_SR_WR => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = ((state.slots[lhs].wrapping_sub(state.accum0)) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I64_SUB_SR_WR => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = state.slots[lhs].wrapping_sub(state.accum0);
+                pc += 2;
+            }
+            // Add without slot writeback
+            MINI_I32_ADD_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = ((state.accum0 + state.slots[rhs]) << 32) >> 32;
+                pc += 2;
+            }
+            MINI_I64_ADD_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0.wrapping_add(state.slots[rhs]);
+                pc += 2;
+            }
+            MINI_I32_ADD_SS_WR => {
+                let lhs = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                state.accum0 = ((state.slots[lhs] + state.slots[rhs]) << 32) >> 32;
+                pc += 3;
+            }
+            // Div/rem with scratch operands (selector-dispatched)
+            MINI_DIVREM_SCRATCH0_S => {
+                let sel = program[pc + 1];
+                let rhs = program[pc + 2] as usize;
+                state.accum0 = match sel {
+                    0 => i32_div_s(scratch0_get(), state.slots[rhs]),
+                    1 => i32_div_u(scratch0_get(), state.slots[rhs]),
+                    2 => i32_rem_s(scratch0_get(), state.slots[rhs]),
+                    3 => i32_rem_u(scratch0_get(), state.slots[rhs]),
+                    4 => i64_div_s(scratch0_get(), state.slots[rhs]),
+                    5 => i64_div_u(scratch0_get(), state.slots[rhs]),
+                    6 => i64_rem_s(scratch0_get(), state.slots[rhs]),
+                    _ => i64_rem_u(scratch0_get(), state.slots[rhs]),
+                };
+                pc += 3;
+            }
+            MINI_DIVREM_S_SCRATCH0 => {
+                let sel = program[pc + 1];
+                let lhs = program[pc + 2] as usize;
+                state.accum0 = match sel {
+                    0 => i32_div_s(state.slots[lhs], scratch0_get()),
+                    1 => i32_div_u(state.slots[lhs], scratch0_get()),
+                    2 => i32_rem_s(state.slots[lhs], scratch0_get()),
+                    3 => i32_rem_u(state.slots[lhs], scratch0_get()),
+                    4 => i64_div_s(state.slots[lhs], scratch0_get()),
+                    5 => i64_div_u(state.slots[lhs], scratch0_get()),
+                    6 => i64_rem_s(state.slots[lhs], scratch0_get()),
+                    _ => i64_rem_u(state.slots[lhs], scratch0_get()),
+                };
+                pc += 3;
+            }
+            MINI_DIVREM_SCRATCH01 => {
+                let sel = program[pc + 1];
+                state.accum0 = match sel {
+                    0 => i32_div_s(scratch0_get(), scratch1_get()),
+                    1 => i32_div_u(scratch0_get(), scratch1_get()),
+                    2 => i32_rem_s(scratch0_get(), scratch1_get()),
+                    3 => i32_rem_u(scratch0_get(), scratch1_get()),
+                    4 => i64_div_s(scratch0_get(), scratch1_get()),
+                    5 => i64_div_u(scratch0_get(), scratch1_get()),
+                    6 => i64_rem_s(scratch0_get(), scratch1_get()),
+                    _ => i64_rem_u(scratch0_get(), scratch1_get()),
+                };
+                pc += 2;
+            }
+            // Bitcount from scratch0
+            MINI_I32_BITCOUNT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = i32_bitcount(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_I64_BITCOUNT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = i64_bitcount(sel, scratch0_get());
+                pc += 2;
+            }
+            // Float unary from scratch0
+            MINI_F32_UNARY_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum2 = f32_unary(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_UNARY_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum1 = f64_unary(sel, scratch0_get());
+                pc += 2;
+            }
+            // Float convert from scratch0
+            MINI_F32_CVT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum2 = f32_convert(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_CVT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum1 = f64_convert(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_PROMOTE_SCRATCH0 => {
+                state.accum1 = promote_f32_f64(scratch0_get());
+                pc += 1;
+            }
+            MINI_F32_DEMOTE_SCRATCH0 => {
+                state.accum2 = demote_f64_f32(scratch0_get());
+                pc += 1;
+            }
+            MINI_F32_TRUNC_SAT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = f32_trunc_sat(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_TRUNC_SAT_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = f64_trunc_sat(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F32_TRUNC_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = f32_trunc(sel, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_TRUNC_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum0 = f64_trunc(sel, scratch0_get());
+                pc += 2;
+            }
+            // Branch ops with accumulator operand
+            MINI_BR_I64_NE_RS => {
+                let tgt = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                if state.accum0 != state.slots[rhs] {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 3;
+            }
+            MINI_BR_I64_EQ_RS => {
+                let tgt = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                if state.accum0 == state.slots[rhs] {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 3;
+            }
+            MINI_BR_I64_EQ_RI => {
+                let tgt = program[pc + 1] as usize;
+                let imm = program[pc + 2];
+                if state.accum0 == imm {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 3;
+            }
+            MINI_BR_U32_LE_RS => {
+                let tgt = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                if (state.accum0 as u32) <= (state.slots[rhs] as u32) {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 3;
+            }
+            MINI_BR_U64_LT_SCRATCH0_S => {
+                let tgt = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                if (scratch0_get() as u64) < (state.slots[rhs] as u64) {
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                pc += 3;
+            }
+            // Float store from accum address
+            MINI_F64_STORE_RR => {
+                let offset = program[pc + 1];
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                mem_store_i64(ea, state.accum1);
+                pc += 2;
+            }
+            MINI_F32_STORE_RR => {
+                let offset = program[pc + 1];
+                let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
+                mem_store_i32(ea, state.accum2);
+                pc += 2;
+            }
+            // Global set from accum/imm
+            MINI_GLOBAL_SET_R => {
+                let idx = program[pc + 1];
+                global_set(idx, state.accum0);
+                pc += 2;
+            }
+            MINI_GLOBAL_SET_I => {
+                let idx = program[pc + 1];
+                let imm = program[pc + 2];
+                global_set(idx, imm);
+                pc += 3;
+            }
+            MINI_GLOBAL_SET_FR => {
+                let idx = program[pc + 1];
+                global_set(idx, state.accum1);
+                pc += 2;
+            }
+            MINI_GLOBAL_SET_F32R => {
+                let idx = program[pc + 1];
+                global_set(idx, state.accum2);
+                pc += 2;
+            }
+            // Misc scratch-elimination ops
+            MINI_I64_LT_SR_R => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = if state.slots[lhs] < state.accum0 { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I32_SHL_RI => {
+                let shift = program[pc + 1];
+                let v = state.accum0 << (shift & 31);
+                state.accum0 = (v << 32) >> 32;
+                pc += 2;
+            }
+            MINI_CALL_INDIRECT_SCRATCH0 => {
+                let table = program[pc + 1];
+                let func_type = program[pc + 2];
+                let params_start = program[pc + 3] as usize;
+                let params_len = program[pc + 4] as usize;
+                // Stage params from slots into staging buffer
+                let mut buf = [0i64; MAX_CALL_PARAMS];
+                let n = if params_len < MAX_CALL_PARAMS {
+                    params_len
+                } else {
+                    MAX_CALL_PARAMS
+                };
+                let mut i = 0;
+                while i < n {
+                    buf[i] = state.slots[params_start + i];
+                    i += 1;
+                }
+                CALL_STAGING.with(|c| c.set((buf, n)));
+                // The index comes from scratch0 instead of a slot
+                let result =
+                    call_indirect_residual(table, func_type, scratch0_get(), n as i64);
+                state.slots[params_start] = result;
+                state.accum0 = result;
+                pc += 5;
+            }
+            MINI_I64_LT_SCRATCH0_I_R => {
+                let imm = program[pc + 1];
+                state.accum0 = if scratch0_get() < imm { 1 } else { 0 };
+                pc += 2;
+            }
+            // Integer stores with scratch0 as pointer
+            MINI_I32_STORE8_SCRATCH0_R => {
+                let offset = program[pc + 1];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_u8(ea, state.accum0);
+                pc += 2;
+            }
+            MINI_I32_STORE16_SCRATCH0_R => {
+                let offset = program[pc + 1];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_u16(ea, state.accum0);
+                pc += 2;
+            }
+            MINI_I64_STORE_SCRATCH0_R => {
+                let offset = program[pc + 1];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_i64(ea, state.accum0);
+                pc += 2;
+            }
+            MINI_I32_STORE_SCRATCH0_R => {
+                let offset = program[pc + 1];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_i32(ea, state.accum0);
+                pc += 2;
+            }
+            MINI_I32_STORE_SCRATCH0_I => {
+                let offset = program[pc + 1];
+                let imm = program[pc + 2];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_i32(ea, imm);
+                pc += 3;
+            }
+            MINI_I32_STORE_SCRATCH0_S => {
+                let offset = program[pc + 1];
+                let val_slot = program[pc + 2] as usize;
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_i32(ea, state.slots[val_slot]);
+                pc += 3;
+            }
+            MINI_I64_STORE_SCRATCH0_I => {
+                let offset = program[pc + 1];
+                let imm = program[pc + 2];
+                let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
+                mem_store_i64(ea, imm);
+                pc += 3;
+            }
+            // Comparison ops with scratch0
+            MINI_U32_LT_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as u32) < (state.slots[rhs] as u32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U32_LE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as u32) <= (state.slots[rhs] as u32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U32_LT_S_SCRATCH0_R => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = if (state.slots[lhs] as u32) < (scratch0_get() as u32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U32_LE_S_SCRATCH0_R => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = if (state.slots[lhs] as u32) <= (scratch0_get() as u32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I64_LE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if scratch0_get() <= state.slots[rhs] { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U64_LT_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as u64) < (state.slots[rhs] as u64) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U64_LT_S_SCRATCH0_R => {
+                let lhs = program[pc + 1] as usize;
+                state.accum0 = if (state.slots[lhs] as u64) < (scratch0_get() as u64) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I32_LT_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if ((scratch0_get() << 32) >> 32) < ((state.slots[rhs] << 32) >> 32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U32_LT_SCRATCH01_R => {
+                state.accum0 = if (scratch0_get() as u32) < (scratch1_get() as u32) { 1 } else { 0 };
+                pc += 1;
+            }
+            MINI_U32_LE_SCRATCH01_R => {
+                state.accum0 = if (scratch0_get() as u32) <= (scratch1_get() as u32) { 1 } else { 0 };
+                pc += 1;
+            }
+            MINI_U64_LT_SCRATCH01_R => {
+                state.accum0 = if (scratch0_get() as u64) < (scratch1_get() as u64) { 1 } else { 0 };
+                pc += 1;
+            }
+            // i32/i64 eq/ne/le with scratch0
+            MINI_I32_EQ_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as i32) == (state.slots[rhs] as i32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I32_NE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as i32) != (state.slots[rhs] as i32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I32_LE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if ((scratch0_get() << 32) >> 32) <= ((state.slots[rhs] << 32) >> 32) { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I64_EQ_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if scratch0_get() == state.slots[rhs] { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_I64_NE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if scratch0_get() != state.slots[rhs] { 1 } else { 0 };
+                pc += 2;
+            }
+            MINI_U64_LE_SCRATCH0_S_R => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = if (scratch0_get() as u64) <= (state.slots[rhs] as u64) { 1 } else { 0 };
+                pc += 2;
+            }
+            // Float arith/minmax with scratch0
+            MINI_F32_ARITH_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum2 = f32_arith(sel, state.accum2, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_ARITH_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum1 = f64_arith(sel, state.accum1, scratch0_get());
+                pc += 2;
+            }
+            MINI_F32_MINMAX_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum2 = f32_minmax(sel, state.accum2, scratch0_get());
+                pc += 2;
+            }
+            MINI_F64_MINMAX_SCRATCH0 => {
+                let sel = program[pc + 1];
+                state.accum1 = f64_minmax(sel, state.accum1, scratch0_get());
+                pc += 2;
+            }
+            // Add with scratch operands
+            MINI_I32_ADD_SCRATCH01_WB => {
+                let dst = program[pc + 1] as usize;
+                let v = ((scratch0_get() + scratch1_get()) << 32) >> 32;
+                state.slots[dst] = v;
+                state.accum0 = v;
+                pc += 2;
+            }
+            MINI_I64_ADD_SCRATCH01_WB => {
+                let dst = program[pc + 1] as usize;
+                let v = scratch0_get().wrapping_add(scratch1_get());
+                state.slots[dst] = v;
+                state.accum0 = v;
+                pc += 2;
+            }
+            MINI_I32_ADD_SCRATCH0_S_WB => {
+                let dst = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                let v = ((scratch0_get() + state.slots[rhs]) << 32) >> 32;
+                state.slots[dst] = v;
+                state.accum0 = v;
+                pc += 3;
+            }
+            MINI_I64_ADD_SCRATCH0_S_WB => {
+                let dst = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                let v = scratch0_get().wrapping_add(state.slots[rhs]);
+                state.slots[dst] = v;
+                state.accum0 = v;
+                pc += 3;
+            }
+            // Select with scratch
+            MINI_SELECT_SCRATCH0_S => {
+                let false_slot = program[pc + 1] as usize;
+                let c = if (state.accum0 as i32) != 0 { 1i64 } else { 0i64 };
+                let f = state.slots[false_slot];
+                state.accum0 = f + (scratch0_get() - f).wrapping_mul(c);
+                pc += 2;
+            }
+            MINI_SELECT_S_SCRATCH0 => {
+                let true_slot = program[pc + 1] as usize;
+                let c = if (state.accum0 as i32) != 0 { 1i64 } else { 0i64 };
+                let t = state.slots[true_slot];
+                state.accum0 = scratch0_get() + (t - scratch0_get()).wrapping_mul(c);
+                pc += 2;
+            }
+            MINI_SELECT_SCRATCH01 => {
+                let c = if (state.accum0 as i32) != 0 { 1i64 } else { 0i64 };
+                state.accum0 = scratch1_get() + (scratch0_get() - scratch1_get()).wrapping_mul(c);
+                pc += 1;
+            }
+            // Shift with scratch
+            MINI_U64_SHR_SCRATCH01_WR => {
+                state.accum0 = ((scratch0_get() as u64) >> ((scratch1_get() as u64) & 63)) as i64;
+                pc += 1;
+            }
+            // I64 AND scratch0 with immediate
+            MINI_I64_AND_SCRATCH0_I_WR => {
+                let imm = program[pc + 1];
+                state.accum0 = scratch0_get() & imm;
+                pc += 2;
             }
             // MINI_HALT / any other word: ineligible at runtime (should not
             // happen for a statically-eligible MiniProgram).
