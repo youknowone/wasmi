@@ -1678,7 +1678,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler-core"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=984cb5089ebb04ce22c37c467c0fc001af2a2f36#984cb5089ebb04ce22c37c467c0fc001af2a2f36"
+source = "git+https://github.com/RustPython/RustPython.git?rev=a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a#a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a"
 dependencies = [
  "bitflags 2.13.0",
  "bitflagset",
@@ -1708,7 +1708,7 @@ source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1a
 [[package]]
 name = "rustpython-wtf8"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=984cb5089ebb04ce22c37c467c0fc001af2a2f36#984cb5089ebb04ce22c37c467c0fc001af2a2f36"
+source = "git+https://github.com/RustPython/RustPython.git?rev=a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a#a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a"
 dependencies = [
  "ascii",
  "bstr",
