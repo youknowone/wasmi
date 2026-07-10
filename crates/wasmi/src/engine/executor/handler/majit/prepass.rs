@@ -5750,10 +5750,9 @@ pub(crate) fn prepass(
     }
 
     let mut loop_header_word = None;
-    for (target_field, target_byte, is_back) in &fixups {
+    for (_, target_byte, is_back) in &fixups {
         // A branch into the middle of an op (not an op boundary) is malformed.
         let target_word = *byte_to_word.get(target_byte)?;
-        words[*target_field] = target_word as i64;
         if *is_back {
             loop_header_word = Some(target_word);
         }
@@ -5839,9 +5838,18 @@ pub(crate) fn prepass(
     let truncation_active = loop_header_word.is_some()
         && !loop_used_originals.is_empty()
         && loop_used_originals.len() < dense_count;
+    let loop_live_count = if loop_header_word.is_some() {
+        if !loop_used_originals.is_empty() {
+            loop_used_originals.len()
+        } else {
+            dense_count
+        }
+    } else {
+        dense_count
+    };
     let real_scratch_base = dense_count as i64;
+    let loop_scratch_base = loop_live_count as i64;
 
-    // Replace SLOT_SENTINEL and SCRATCH_SENTINEL occurrences in one pass.
     // Upper bound: max_slot_seen + 1 (the highest sentinel value that can appear
     // is SLOT_SENTINEL + max_slot_seen). If no slot was seen, the range is empty.
     let sentinel_range_end = if max_slot_seen >= 0 {
@@ -5849,7 +5857,43 @@ pub(crate) fn prepass(
     } else {
         SLOT_SENTINEL
     };
-    for w in words.iter_mut() {
+
+    #[cfg(debug_assertions)]
+    if truncation_active {
+        if let Some(lhw) = loop_header_word {
+            let mut wi = lhw;
+            while wi < words.len() {
+                let op = words[wi];
+                let width = if op == MINI_BR_TABLE {
+                    2 + words[wi + 1] as usize
+                } else {
+                    mini_op_width(op)
+                };
+                for oi in 1..width {
+                    if wi + oi < words.len() {
+                        let w = words[wi + oi];
+                        if w >= SLOT_SENTINEL && w < sentinel_range_end {
+                            let orig = w - SLOT_SENTINEL;
+                            let dense = *reverse_map
+                                .get(&orig)
+                                .expect("loop slot reference must be in reverse_map");
+                            debug_assert!(
+                                dense < loop_live_count as i64,
+                                "loop body word {} references dense slot {} >= loop_live_count {}",
+                                wi + oi,
+                                dense,
+                                loop_live_count,
+                            );
+                        }
+                    }
+                }
+                wi += width;
+            }
+        }
+    }
+
+    // Replace SLOT_SENTINEL and SCRATCH_SENTINEL occurrences in one pass.
+    for (i, w) in words.iter_mut().enumerate() {
         if *w >= SLOT_SENTINEL && *w < sentinel_range_end {
             // SLOT_SENTINEL + orig_idx → dense_idx
             let orig = *w - SLOT_SENTINEL;
@@ -5857,8 +5901,17 @@ pub(crate) fn prepass(
                 *w = dense;
             }
         } else if *w >= SCRATCH_SENTINEL && *w < SCRATCH_SENTINEL + NUM_SCRATCH as i64 {
-            // SCRATCH_SENTINEL + offset → dense_count + offset
-            *w = real_scratch_base + (*w - SCRATCH_SENTINEL);
+            // SCRATCH_SENTINEL + offset → active scratch base + offset.
+            // Pre-loop code runs before MINI_SLOTS_TRUNCATE and uses the full
+            // dense base. Loop-side code runs after truncation and uses the
+            // loop-live base that the kernel's truncate arm re-appends scratch at.
+            let scratch_base = if truncation_active && loop_header_word.is_some_and(|lhw| i >= lhw)
+            {
+                loop_scratch_base
+            } else {
+                real_scratch_base
+            };
+            *w = scratch_base + (*w - SCRATCH_SENTINEL);
         }
     }
     // Verify no sentinels remain in the final word stream.
@@ -5876,43 +5929,53 @@ pub(crate) fn prepass(
     }
     // ── Loop-live slot analysis + MINI_SLOTS_TRUNCATE insertion ──
     //
-    // When the function has a loop (loop_header_word is Some), scan the loop
-    // body to find which dense slot indices [0..dense_count) are referenced as
-    // operands. Scratch slots (dense_count..dense_count+NUM_SCRATCH) are
-    // always required and excluded from truncation.
-    //
-    // The truncation reduces the virtualizable array size so the JIT's
-    // close_loop JUMP carries fewer inputargs → less register spill.
-    let loop_live_count = if let Some(lhw) = loop_header_word {
-        // With loop-first slot ordering, loop-used slots occupy dense indices
-        // 0..L-1 and pre-loop-only slots occupy L..dense_count-1.
-        // Truncating to L removes exactly the pre-loop-only slots.
-        let llc = if !loop_used_originals.is_empty() {
-            loop_used_originals.len()
-        } else {
-            dense_count
-        };
-
-        // NOTE: MINI_SLOTS_TRUNCATE word-stream insertion is NOT done here.
-        // The runtime truncation is achieved via seed-slot truncation in
-        // the kernel: new_driver() receives a seed with loop_live_count +
-        // NUM_SCRATCH slots, so install_canonical_liveness sees the reduced
-        // virt array size → fewer JIT inputargs. The preloop and loop body
-        // both reference scratch at dense_count + offset (unchanged), and
-        // the MINI_SLOTS_TRUNCATE op remains in the kernel dispatch for
-        // future use when runtime truncation becomes viable.
-        let _ = MINI_SLOTS_TRUNCATE; // suppress unused warning
-
-        llc
+    // With loop-first slot ordering, loop-used slots occupy dense indices
+    // 0..L-1 and pre-loop-only slots occupy L..dense_count-1. When L<N,
+    // insert a one-shot truncate immediately before the loop header. The
+    // fall-through entry executes it, while adjusted back-edges target the
+    // original loop header after the inserted op, so the JIT trace starts
+    // with an already-truncated slots array.
+    let insertion = if truncation_active {
+        loop_header_word.map(|lhw| {
+            words.splice(
+                lhw..lhw,
+                [
+                    MINI_SLOTS_TRUNCATE,
+                    loop_live_count as i64,
+                    NUM_SCRATCH as i64,
+                ],
+            );
+            lhw
+        })
     } else {
-        dense_count
+        None
     };
+    let adjusted_loop_header_word = loop_header_word.map(|lhw| {
+        if insertion.is_some_and(|insert_at| lhw >= insert_at) {
+            lhw + mini_op_width(MINI_SLOTS_TRUNCATE)
+        } else {
+            lhw
+        }
+    });
+    for (target_field, target_byte, is_back) in &fixups {
+        let mut field = *target_field;
+        let mut target_word = *byte_to_word.get(target_byte)?;
+        if let Some(insert_at) = insertion {
+            if field >= insert_at {
+                field += mini_op_width(MINI_SLOTS_TRUNCATE);
+            }
+            if target_word > insert_at || (target_word == insert_at && *is_back) {
+                target_word += mini_op_width(MINI_SLOTS_TRUNCATE);
+            }
+        }
+        words[field] = target_word as i64;
+    }
 
     Some(MiniProgram {
         words,
         num_slots: dense_count,
         slot_map,
-        loop_header_word,
+        loop_header_word: adjusted_loop_header_word,
         writes_result,
         uses_globals,
         has_yield_or_bail,
@@ -8824,6 +8887,57 @@ mod tests {
             mp.loop_header_word,
             Some(0),
             "the back-edge targets the loop header at word 0"
+        );
+    }
+
+    /// A pre-loop-only local forces `num_slots > loop_live_count`. The prepass
+    /// emits a one-shot `MINI_SLOTS_TRUNCATE` immediately before the loop header
+    /// and retargets the loop back-edge to the post-truncate header.
+    #[test]
+    fn loop_header_truncates_preloop_only_slots() {
+        const WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i64) (result i64)
+                    (local $dead i64) (local $acc i64) (local $i i64)
+                    (local.set $dead (i64.const 12345))
+                    (local.set $acc (i64.const 1))
+                    (local.set $i (local.get $n))
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i64.le_s (local.get $i) (i64.const 0)))
+                            (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+                            (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+        let mp = compile_and_prepass(WAT);
+        assert!(
+            mp.loop_live_count < mp.num_slots,
+            "the dead setup local must be outside the loop-live prefix"
+        );
+        let trunc_positions: alloc::vec::Vec<usize> = mp
+            .words
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &w)| (w == MINI_SLOTS_TRUNCATE).then_some(i))
+            .collect();
+        assert_eq!(trunc_positions.len(), 1, "exactly one truncate op");
+        let trunc = trunc_positions[0];
+        let header = mp.loop_header_word.expect("loop header");
+        assert_eq!(
+            header,
+            trunc + mini_op_width(MINI_SLOTS_TRUNCATE),
+            "loop header must point just after the truncate op",
+        );
+        assert_eq!(mp.words[trunc + 1] as usize, mp.loop_live_count);
+        assert_eq!(mp.words[trunc + 2] as usize, NUM_SCRATCH);
+        assert!(
+            !mp.words[header..].contains(&MINI_SLOTS_TRUNCATE),
+            "truncate must stay outside the traced loop body",
+        );
+        assert!(
+            mp.words[header..].contains(&(header as i64)),
+            "the back-edge must target the post-truncate header",
         );
     }
 

@@ -3605,16 +3605,21 @@ std::thread_local! {
     /// background invalidation thread and starts with an empty compiled-loop
     /// table, so a fresh driver per call both leaks threads and recompiles every
     /// call (the per-call-driver shape panics under load).
-    static DRIVER: core::cell::RefCell<Option<majit_metainterp::JitDriver<WasmKernelState>>> =
-        core::cell::RefCell::new(None);
+    static DRIVER: core::cell::RefCell<
+        std::collections::HashMap<usize, majit_metainterp::JitDriver<WasmKernelState>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
 
     /// Persistent driver for callees executed via CALL_ASSEMBLER (the
     /// `run_callee` path). Separate from [`DRIVER`] so a callee can run the
     /// MiniProgram dispatch while the caller's `run_persistent` still holds
     /// DRIVER's borrow. Uses the same compile threshold so the callee's hot
     /// loop compiles and is reused across calls.
-    static CALLEE_DRIVER: core::cell::RefCell<Option<majit_metainterp::JitDriver<WasmKernelState>>> =
-        core::cell::RefCell::new(None);
+    static CALLEE_DRIVER: core::cell::RefCell<
+        std::collections::HashMap<usize, majit_metainterp::JitDriver<WasmKernelState>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+
+    #[cfg(test)]
+    static TEST_LAST_DRIVER_SEED_SLOTS: core::cell::Cell<usize> = core::cell::Cell::new(0);
 
     /// Per-function cache keyed by the compiled function's op-stream pointer: the
     /// prepassed MiniProgram plus its adaptive tier policy. Prepass runs once per
@@ -3933,19 +3938,22 @@ pub(crate) fn run_persistent(
     DRIVER
         .with(|d| {
             match d.try_borrow_mut() {
-                Ok(mut slot) => {
-                    if slot.is_none() {
-                        let seed_slots;
-                        let driver_init = if prog_loop_live < prog_num_slots {
-                            let n_scratch = super::prepass::NUM_SCRATCH;
-                            seed_slots = alloc::vec![0i64; prog_loop_live + n_scratch];
-                            &seed_slots[..]
-                        } else {
-                            init_slots
-                        };
-                        *slot = Some(new_driver(THRESHOLD, words, driver_init));
+                Ok(mut drivers) => {
+                    let seed_slots;
+                    let driver_init = if prog_loop_live < prog_num_slots {
+                        let n_scratch = super::prepass::NUM_SCRATCH;
+                        seed_slots = alloc::vec![0i64; prog_loop_live + n_scratch];
+                        &seed_slots[..]
+                    } else {
+                        init_slots
+                    };
+                    let shape_key = driver_init.len();
+                    if !drivers.contains_key(&shape_key) {
+                        drivers.insert(shape_key, new_driver(THRESHOLD, words, driver_init));
                     }
-                    let driver = slot.as_mut().unwrap();
+                    let driver = drivers
+                        .get_mut(&shape_key)
+                        .expect("driver just inserted for shape");
                     Some(wasm_mainloop(driver, words, init_slots))
                 }
                 Err(_) => {
@@ -3981,25 +3989,28 @@ pub(crate) fn run_persistent(
             };
             CALLEE_DRIVER.with(|d| {
                 match d.try_borrow_mut() {
-                    Ok(mut slot) => {
-                        if slot.is_none() {
-                            // Seed the driver with truncated slots when truncation is
-                            // active, so install_canonical_liveness sees the reduced
-                            // virt array size → fewer JIT inputargs.
-                            let seed_slots = if loop_live_count < num_slots {
-                                let n_scratch = super::prepass::NUM_SCRATCH;
-                                let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
-                                // Copy the loop-live prefix from init_slots
-                                for i in 0..loop_live_count.min(init_slots.len()) {
-                                    s[i] = init_slots[i];
-                                }
-                                s
-                            } else {
-                                init_slots.to_vec()
-                            };
-                            *slot = Some(new_driver(THRESHOLD, words, &seed_slots));
+                    Ok(mut drivers) => {
+                        // Seed the driver with truncated slots when truncation is
+                        // active, so install_canonical_liveness sees the reduced
+                        // virt array size → fewer JIT inputargs.
+                        let seed_slots = if loop_live_count < num_slots {
+                            let n_scratch = super::prepass::NUM_SCRATCH;
+                            let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
+                            // Copy the loop-live prefix from init_slots.
+                            for i in 0..loop_live_count.min(init_slots.len()) {
+                                s[i] = init_slots[i];
+                            }
+                            s
+                        } else {
+                            init_slots.to_vec()
+                        };
+                        let shape_key = seed_slots.len();
+                        if !drivers.contains_key(&shape_key) {
+                            drivers.insert(shape_key, new_driver(THRESHOLD, words, &seed_slots));
                         }
-                        let driver = slot.as_mut().unwrap();
+                        let driver = drivers
+                            .get_mut(&shape_key)
+                            .expect("callee driver just inserted for shape");
                         Some(wasm_mainloop(driver, words, init_slots))
                     }
                     Err(_) => None, // both drivers busy — fall back to stock
@@ -4065,11 +4076,14 @@ pub(crate) fn run_callee(
             // borrowed. In that case, return None to fall back to stock.
             CALLEE_DRIVER.with(|d| {
                 match d.try_borrow_mut() {
-                    Ok(mut slot) => {
-                        if slot.is_none() {
-                            *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                    Ok(mut drivers) => {
+                        let shape_key = init_slots.len();
+                        if !drivers.contains_key(&shape_key) {
+                            drivers.insert(shape_key, new_driver(THRESHOLD, words, init_slots));
                         }
-                        let driver = slot.as_mut().unwrap();
+                        let driver = drivers
+                            .get_mut(&shape_key)
+                            .expect("callee driver just inserted for shape");
                         Some(wasm_mainloop(driver, words, init_slots))
                     }
                     Err(_) => None, // recursive call — fall back to stock
@@ -4093,13 +4107,16 @@ pub(crate) fn run_callee(
 }
 
 /// Build a driver and install its canonical liveness once. The install is
-/// program-independent (the generated `build_meta` ignores its args), so any
-/// first program/state seeds it.
+/// program-independent (the generated `build_meta` ignores its args), so callers
+/// keep persistent drivers keyed by `state.slots.len()` to avoid first-seed
+/// shape mismatches across functions.
 fn new_driver(
     threshold: u32,
     program: &MiniCode,
     init_slots: &[i64],
 ) -> majit_metainterp::JitDriver<WasmKernelState> {
+    #[cfg(test)]
+    TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.set(init_slots.len()));
     // No quasi-immutable state exists in the wasm kernel (plain integer reds over
     // a fixed MiniProgram), so disable the periodic loop-invalidation timer: it
     // would only force pointless re-tracing across calls.
@@ -4177,10 +4194,10 @@ pub(crate) fn run_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Engine, Module,
-        engine::executor::handler::majit::prepass::{MiniProgram, NUM_SCRATCH, prepass},
+    use crate::engine::executor::handler::majit::prepass::{
+        MINI_SLOTS_TRUNCATE, MiniProgram, NUM_SCRATCH, prepass,
     };
+    use crate::{Engine, Module};
 
     /// Serializes tests that run the kernel and read the global
     /// [`KERNEL_COMPILES`] / [`KERNEL_GUARD_FAILS`] evidence counters: a kernel
@@ -4190,6 +4207,12 @@ mod tests {
     fn serial_kernel_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reset_drivers_for_test() {
+        DRIVER.with(|d| d.borrow_mut().clear());
+        CALLEE_DRIVER.with(|d| d.borrow_mut().clear());
+        TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.set(0));
     }
 
     const COUNTER_WAT: &str = r#"
@@ -4349,6 +4372,86 @@ mod tests {
         assert!(
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the hot loop",
+        );
+    }
+
+    /// End-to-end runtime truncation: a setup-only local keeps `num_slots` larger
+    /// than the loop-live prefix, so the prepass must insert `MINI_SLOTS_TRUNCATE`
+    /// and the persistent driver must seed canonical liveness with the truncated
+    /// slot length.
+    #[test]
+    fn end_to_end_loop_slots_truncate_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i64) (result i64)
+                    (local $dead i64) (local $acc i64) (local $i i64)
+                    (local.set $dead (i64.const 12345))
+                    (local.set $acc (i64.const 1))
+                    (local.set $i (local.get $n))
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i64.le_s (local.get $i) (i64.const 0)))
+                            (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+                            (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+        fn reference(n: i64) -> i64 {
+            let mut acc = 1i64;
+            let mut i = n;
+            while i > 0 {
+                acc = acc.wrapping_add(i);
+                i -= 1;
+            }
+            acc
+        }
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let mp = {
+            let wasm = wat::parse_str(WAT).expect("wat parse");
+            let engine = Engine::default();
+            let module = Module::new(&engine, &wasm[..]).expect("module");
+            let ef = module.engine_func_by_index(0).expect("engine func 0");
+            engine
+                .with_compiled_ops(ef, |ops, l, s| prepass(ops, l, s))
+                .expect("compiled")
+                .expect("eligible")
+        };
+        assert!(
+            mp.words.contains(&MINI_SLOTS_TRUNCATE),
+            "prepass must emit runtime truncation",
+        );
+        assert!(
+            mp.loop_live_count < mp.num_slots,
+            "test must truncate slots"
+        );
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i64, i64>(&store, "f")
+            .expect("typed func");
+
+        for n in [1i64, 5, 40, 80] {
+            for _ in 0..8 {
+                let result = func.call(&mut store, n).expect("call");
+                assert_eq!(result, reference(n), "f({n}) via JIT tier");
+            }
+        }
+        assert_eq!(
+            TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.get()),
+            mp.loop_live_count + NUM_SCRATCH,
+            "canonical liveness seed must use loop-live slots plus scratch",
+        );
+        assert!(
+            TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.get()) < mp.num_slots + NUM_SCRATCH,
+            "canonical seed slot count must shrink from the full runtime slots",
         );
     }
 
