@@ -40,6 +40,7 @@ use super::prepass::{
     MINI_BR_I64_NE_RI,
     MINI_BR_I64_NE_RS,
     MINI_BR_I64_NE_SS,
+    MINI_BR_TABLE,
     MINI_BR_U32_LE_RS,
     MINI_BR_U32_LE_SS,
     MINI_BR_U64_LT_SCRATCH0_S,
@@ -175,8 +176,10 @@ use super::prepass::{
     MINI_I64_ADD_SS_WB,
     MINI_I64_ADD_SS_WR,
     MINI_I64_AND_RI_WR,
+    MINI_I64_AND_RS_WR,
     MINI_I64_AND_SCRATCH0_I_WR,
     MINI_I64_AND_SI_WR,
+    MINI_I64_AND_SS_WR,
     MINI_I64_BITCOUNT_S,
     MINI_I64_BITCOUNT_SCRATCH0,
     MINI_I64_DIV_S,
@@ -877,6 +880,48 @@ extern "C" fn mem_store_u8_sf(ea: i64, val: i64, base: i64, len: i64, trap_did: 
     1
 }
 
+// ── Inline raw-memory store/load intrinsics ──────────────────────────────
+//
+// These are recognized by the `#[jit_interp]` proc macro (the analogue of
+// RPython `rffi.raw_storage_{set,get}item`, `jtransform.py:1156-1171`
+// `rewrite_op_raw_{store,load}`) and lower to inline `RawStore` / `RawLoad`
+// IR ops instead of residual calls, so a hot memory store leaves no per-
+// iteration `CallI` in the compiled trace.
+//
+// The kernel's memory-trap model is flag-based and CANNOT deopt on a memory
+// trap (see the `MEM_TRAP` doc): on an out-of-bounds access the store must
+// "apply nothing", the loop runs to completion, and `run_jit` surfaces the
+// trap afterward.  A bounds-check `if` would lower to a trace guard whose
+// out-of-bounds failure deopts to the blackhole — which this kernel's resume
+// path cannot service.  The store arms therefore use a BRANCHLESS form
+// (mirroring the branchless `mem_check_load` loads): they compute a `trap`
+// flag with plain ALU, CLAMP the effective address to an in-bounds byte
+// offset (0 when trapping), read the current word there, and store back that
+// same word (a no-op that preserves memory) on the trapping/already-trapped
+// path, or the real value on the in-bounds path.  No branch, no guard, no
+// deopt; the trap bit is latched into `mem_trap_did` by ALU.  Both intrinsics
+// therefore only ever touch an already-in-bounds address.
+
+/// Raw i64 store to native linear memory at `base + ea` (a byte offset).
+/// In interpreter mode performs the unchecked write directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 8-byte write lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::write_unaligned((base as usize + ea as usize) as *mut i64, val) };
+}
+
+/// Raw i64 load from native linear memory at `base + ea` (a byte offset).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 8-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i64) }
+}
+
 // ── TLS-free memory load residuals ──────────────────────────────────────
 //
 // These complement the store `_sf` variants for loads. The dispatch arm
@@ -1459,12 +1504,15 @@ fn wasm_mainloop(
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let (init_mem_base, init_mem_len) = MEM_CTX.with(|c| c.get());
-    let init_mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2i64 } else { 0i64 })
-        | (if MEM_DID_STORE.with(|d| d.get()) {
-            1i64
-        } else {
-            0i64
-        });
+    let init_mem_trap_did = (if MEM_TRAP.with(|t| t.get()) {
+        2i64
+    } else {
+        0i64
+    }) | (if MEM_DID_STORE.with(|d| d.get()) {
+        1i64
+    } else {
+        0i64
+    });
     let mut state = WasmKernelState {
         slots: init_slots.to_vec(),
         accum0: 0i64,
@@ -1782,6 +1830,12 @@ fn wasm_mainloop(
                 let lhs = program[pc + 1] as usize;
                 let imm = program[pc + 2];
                 state.accum0 = state.slots[lhs] & imm;
+                pc += 3;
+            }
+            MINI_I64_AND_SS_WR => {
+                let lhs = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                state.accum0 = state.slots[lhs] & state.slots[rhs];
                 pc += 3;
             }
             MINI_I64_ADD_RS_WB => {
@@ -2434,26 +2488,24 @@ fn wasm_mainloop(
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum0 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_F64_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum1,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum1 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_I32_STORE8_SR => {
@@ -2499,13 +2551,12 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.slots[val_slot] * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_I32_STORE8_RS => {
@@ -2641,7 +2692,11 @@ fn wasm_mainloop(
                 // Read back: the callee restored our pre-call TLS, and
                 // the call itself may have set MEM_TRAP on error.
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2668,7 +2723,11 @@ fn wasm_mainloop(
                 sync_trap_to_tls(state.mem_trap_did);
                 let result = call_imported_residual(func_index, n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2698,7 +2757,11 @@ fn wasm_mainloop(
                 sync_trap_to_tls(state.mem_trap_did);
                 let result = call_indirect_residual(table, func_type, runtime_index, n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 6;
@@ -2747,7 +2810,11 @@ fn wasm_mainloop(
                     state.mem_len,
                 );
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 pc += 4;
             }
             MINI_SLOTS_TRUNCATE => {
@@ -2890,6 +2957,11 @@ fn wasm_mainloop(
             MINI_I64_ADD_RS_WR => {
                 let rhs = program[pc + 1] as usize;
                 state.accum0 = state.accum0 + state.slots[rhs];
+                pc += 2;
+            }
+            MINI_I64_AND_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0 & state.slots[rhs];
                 pc += 2;
             }
             MINI_I32_ADD_SS_WR => {
@@ -3041,6 +3113,23 @@ fn wasm_mainloop(
                 }
                 pc += 3;
             }
+            MINI_BR_TABLE => {
+                // Indexed multi-way branch: [op, len, tgt...]. The index is
+                // the low 32 bits of ireg; out-of-range takes the last
+                // (default) target.
+                let len = program[pc + 1];
+                let max = len - 1;
+                let mut idx = state.accum0 & 0xFFFF_FFFF;
+                if idx > max {
+                    idx = max;
+                }
+                let tgt = program[pc + 2 + idx as usize] as usize;
+                if tgt < pc {
+                    can_enter_jit!(driver, tgt, &mut state, program, || {});
+                }
+                pc = tgt;
+                continue;
+            }
             MINI_BR_U32_LE_RS => {
                 let tgt = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
@@ -3069,13 +3158,12 @@ fn wasm_mainloop(
             MINI_F64_STORE_RR => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum1,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum1 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 2;
             }
             MINI_F32_STORE_RR => {
@@ -3150,7 +3238,11 @@ fn wasm_mainloop(
                 // The index comes from scratch0 instead of a slot
                 let result = call_indirect_residual(table, func_type, scratch0_get(), n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 5;
@@ -3188,13 +3280,12 @@ fn wasm_mainloop(
             MINI_I64_STORE_SCRATCH0_R => {
                 let offset = program[pc + 1];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum0 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 2;
             }
             MINI_I32_STORE_SCRATCH0_R => {
@@ -3213,13 +3304,8 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let imm = program[pc + 2];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i32_sf(
-                    ea,
-                    imm,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                state.mem_trap_did =
+                    mem_store_i32_sf(ea, imm, state.mem_base, state.mem_len, state.mem_trap_did);
                 pc += 3;
             }
             MINI_I32_STORE_SCRATCH0_S => {
@@ -3239,13 +3325,12 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let imm = program[pc + 2];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    imm,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = imm * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             // Comparison ops with scratch0
@@ -4327,6 +4412,80 @@ mod tests {
         );
     }
 
+    /// S5: a hot `i64.store` loop lowered to the inline `RawStore` op with a
+    /// bounds guard (instead of a `mem_store_i64_sf` residual call) must keep
+    /// trap parity with the stock executor on the out-of-bounds path.
+    ///
+    /// - In bounds (`n = 4000`, all addresses `< 65536`): the loop compiles
+    ///   and the read-back value matches the stock result, proving the inline
+    ///   RawStore writes memory correctly under compilation.
+    /// - Out of bounds (`n = 10000`, address `65536` reached at `i = 8192`
+    ///   once the loop is already compiled): the store's bounds guard fails,
+    ///   deopts to the interpreter, and the `_sf` cold path raises
+    ///   `MemoryOutOfBounds` — the same trap the stock executor raises.
+    #[test]
+    fn end_to_end_i64_store_oob_trap_parity_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store, TrapCode};
+
+        // memory 1 = one 64 KiB page (65536 bytes). An 8-byte store at byte
+        // address `i * 8` is in bounds for `i <= 8191` and OOB at `i = 8192`.
+        // The address computation mirrors the `i32.mul` shape the prepass
+        // lowers into `MINI_I64_STORE_*` (an `i64.shl`/`wrap` address does
+        // not lower and would keep the loop interpreted).
+        const STORE_WAT: &str = r#"
+            (module
+                (memory 1)
+                (func (export "store_loop") (param $n i32) (result i64)
+                    (local $i i32) (local $acc i64)
+                    (loop $continue
+                        (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+                        (i64.store
+                            (i32.mul (local.get $i) (i32.const 8))
+                            (local.get $acc))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $continue (i32.lt_s (local.get $i) (local.get $n))))
+                    (local.get $acc)))
+        "#;
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, STORE_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i64>(&store, "store_loop")
+            .expect("typed func");
+
+        // In-bounds hot loop: `acc` is bumped once per iteration, so a loop of
+        // `n` iterations returns `n`; drive it repeatedly so it compiles.
+        let n_ok = 4000i32;
+        let mut result = 0i64;
+        for _ in 0..40 {
+            result = func.call(&mut store, n_ok).expect("in-bounds call");
+        }
+        assert_eq!(
+            result, n_ok as i64,
+            "in-bounds i64.store loop must run to completion"
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "the i64.store loop must compile (the store lowered to inline RawStore)"
+        );
+
+        // Out-of-bounds run: the compiled loop's store bounds guard fails at
+        // `i = 8192` and the deopt path raises MemoryOutOfBounds, exactly as
+        // the stock executor does.
+        let err = func
+            .call(&mut store, 10_000i32)
+            .expect_err("out-of-bounds i64.store must trap");
+        assert_eq!(
+            err.as_trap_code(),
+            Some(TrapCode::MemoryOutOfBounds),
+            "OOB i64.store must trap with MemoryOutOfBounds (stock parity)"
+        );
+    }
+
     /// A real i32 loop — `sum(i*i for i in 0..n)` — runs end-to-end on the JIT
     /// tier, exercising i32 multiply, the accumulator-plus-slot i32 add, the
     /// unsigned loop-exit compare, and an unconditional back-edge, and matches the
@@ -4693,6 +4852,192 @@ mod tests {
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the OR-accumulation loop",
         );
+    }
+
+    /// A loop that sums only the even indices runs end-to-end on the JIT tier
+    /// and matches the stock result. The odd-index skip is a fused
+    /// `if (i & 1) != 0` branch (`BranchI32And_*`), which the prepass lowers to
+    /// an i32 AND into the accumulator followed by a branch-if-nonzero.
+    #[test]
+    fn end_to_end_and_branch_i32_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const AND_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $skip
+                                (br_if $skip (i32.and (local.get $i) (i32.const 1)))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn even_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 1 == 0 {
+                    acc = acc.wrapping_add(i);
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, AND_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 5, 10, 17, 64, 200] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                even_sum(n),
+                "even_sum({n})"
+            );
+        }
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "the JIT tier must have run and compiled the and-branch loop",
+        );
+    }
+
+    /// A loop mixing fused branch predicates from the cmp-branch sweep —
+    /// immediate-lhs signed compare (`Is`/`Ir` forms), unsigned compare, and
+    /// `eqz`-of-`and` (`NotAnd`) — runs end-to-end on the JIT tier and matches
+    /// the stock result.
+    #[test]
+    fn end_to_end_cmp_branch_sweep_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const SWEEP_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            ;; imm-lhs signed compare: break iff n <= i
+                            (br_if $break (i32.le_s (local.get $n) (local.get $i)))
+                            (block $skip
+                                ;; NotAnd: skip the add iff (i & 3) == 0
+                                (br_if $skip (i32.eqz (i32.and (local.get $i) (i32.const 3))))
+                                ;; unsigned compare against an imm
+                                (block $small
+                                    (br_if $small (i32.lt_u (local.get $i) (i32.const 8)))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 1000)))
+                                    (br $skip))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn sweep_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 3 != 0 {
+                    if (i as u32) < 8 {
+                        acc += i;
+                    } else {
+                        acc += 1000;
+                    }
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, SWEEP_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 5, 8, 9, 16, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                sweep_sum(n),
+                "sweep_sum({n})"
+            );
+        }
+    }
+
+    /// A loop dispatching through a `br_table` on `i % 3` runs end-to-end on
+    /// the JIT tier and matches the stock result. Exercises the
+    /// `MINI_BR_TABLE` lowering (clamped indexed jump + per-entry fixups),
+    /// including the byte-stream realignment past the raw trailing
+    /// `BranchOffset` entries.
+    #[test]
+    fn end_to_end_br_table_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const BR_TABLE_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $done
+                                (block $b2
+                                    (block $b1
+                                        (block $b0
+                                            (br_table $b0 $b1 $b2
+                                                (i32.rem_u (local.get $i) (i32.const 3))))
+                                        (local.set $acc (i32.add (local.get $acc) (i32.const 1)))
+                                        (br $done))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 10)))
+                                    (br $done))
+                                (local.set $acc (i32.add (local.get $acc) (i32.const 100))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn table_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                acc += match i % 3 {
+                    0 => 1,
+                    1 => 10,
+                    _ => 100,
+                };
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, BR_TABLE_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 7, 30, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                table_sum(n),
+                "table_sum({n})"
+            );
+        }
     }
 
     /// An accumulation loop summing `a - i` (two-variable i64 subtraction) runs
