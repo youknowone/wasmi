@@ -63,7 +63,7 @@ use super::prepass::{
     MINI_I32_XOR_RS_WR, MINI_I64_SUB_RS_WR, MINI_I64_MUL_RS_WR, MINI_I64_OR_RS_WR,
     MINI_I64_XOR_RS_WR, MINI_I32_SUB_SR_WR, MINI_I64_SUB_SR_WR,
     MINI_I32_ADD_RS_WR, MINI_I64_ADD_RS_WR, MINI_I32_ADD_SS_WR,
-    MINI_I64_AND_SS_WR, MINI_I64_AND_RS_WR,
+    MINI_I64_AND_SS_WR, MINI_I64_AND_RS_WR, MINI_BR_TABLE,
     MINI_DIVREM_SCRATCH0_S, MINI_DIVREM_S_SCRATCH0, MINI_DIVREM_SCRATCH01,
     MINI_I32_BITCOUNT_SCRATCH0, MINI_I64_BITCOUNT_SCRATCH0,
     MINI_F32_UNARY_SCRATCH0, MINI_F64_UNARY_SCRATCH0,
@@ -2805,6 +2805,23 @@ fn wasm_mainloop(
                 }
                 pc += 3;
             }
+            MINI_BR_TABLE => {
+                // Indexed multi-way branch: [op, len, tgt...]. The index is
+                // the low 32 bits of ireg; out-of-range takes the last
+                // (default) target.
+                let len = program[pc + 1];
+                let max = len - 1;
+                let mut idx = state.accum0 & 0xFFFF_FFFF;
+                if idx > max {
+                    idx = max;
+                }
+                let tgt = program[pc + 2 + idx as usize] as usize;
+                if tgt < pc {
+                    can_enter_jit!(driver, tgt, &mut state, program, || {});
+                }
+                pc = tgt;
+                continue;
+            }
             MINI_BR_U32_LE_RS => {
                 let tgt = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
@@ -4359,6 +4376,134 @@ mod tests {
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the and-branch loop",
         );
+    }
+
+    /// A loop mixing fused branch predicates from the cmp-branch sweep —
+    /// immediate-lhs signed compare (`Is`/`Ir` forms), unsigned compare, and
+    /// `eqz`-of-`and` (`NotAnd`) — runs end-to-end on the JIT tier and matches
+    /// the stock result.
+    #[test]
+    fn end_to_end_cmp_branch_sweep_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const SWEEP_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            ;; imm-lhs signed compare: break iff n <= i
+                            (br_if $break (i32.le_s (local.get $n) (local.get $i)))
+                            (block $skip
+                                ;; NotAnd: skip the add iff (i & 3) == 0
+                                (br_if $skip (i32.eqz (i32.and (local.get $i) (i32.const 3))))
+                                ;; unsigned compare against an imm
+                                (block $small
+                                    (br_if $small (i32.lt_u (local.get $i) (i32.const 8)))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 1000)))
+                                    (br $skip))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn sweep_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 3 != 0 {
+                    if (i as u32) < 8 {
+                        acc += i;
+                    } else {
+                        acc += 1000;
+                    }
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, SWEEP_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 5, 8, 9, 16, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                sweep_sum(n),
+                "sweep_sum({n})"
+            );
+        }
+    }
+
+    /// A loop dispatching through a `br_table` on `i % 3` runs end-to-end on
+    /// the JIT tier and matches the stock result. Exercises the
+    /// `MINI_BR_TABLE` lowering (clamped indexed jump + per-entry fixups),
+    /// including the byte-stream realignment past the raw trailing
+    /// `BranchOffset` entries.
+    #[test]
+    fn end_to_end_br_table_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const BR_TABLE_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $done
+                                (block $b2
+                                    (block $b1
+                                        (block $b0
+                                            (br_table $b0 $b1 $b2
+                                                (i32.rem_u (local.get $i) (i32.const 3))))
+                                        (local.set $acc (i32.add (local.get $acc) (i32.const 1)))
+                                        (br $done))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 10)))
+                                    (br $done))
+                                (local.set $acc (i32.add (local.get $acc) (i32.const 100))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn table_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                acc += match i % 3 {
+                    0 => 1,
+                    1 => 10,
+                    _ => 100,
+                };
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, BR_TABLE_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 7, 30, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                table_sum(n),
+                "table_sum({n})"
+            );
+        }
     }
 
     /// An accumulation loop summing `a - i` (two-variable i64 subtraction) runs

@@ -965,13 +965,21 @@ pub(crate) const MINI_I64_AND_SS_WR: i64 = 259;
 /// fused `BranchI64And_Rs`.
 pub(crate) const MINI_I64_AND_RS_WR: i64 = 260;
 
+/// `[MINI_BR_TABLE, len, tgt_0, .., tgt_{len-1}]` (2 + len words, the only
+/// variable-width op): indexed multi-way branch. Jumps to
+/// `tgt[min(u32(ireg), len-1)]` (an out-of-range index takes the last, i.e.
+/// default, target). Lowers wasmi `BranchTable_R` / `BranchTable_S` (the
+/// no-copy forms; the `BranchTableSpan_*` copy forms stay ineligible).
+pub(crate) const MINI_BR_TABLE: i64 = 261;
+
 /// `[MINI_F64_NOTGT_SCRATCH0_S_R, rhs_slot]` (2 words):
 /// For F64NotLe_Rss negate pattern: `accum = !(f64_le(...))` using scratch0.
 /// Actually simpler: this is `accum = (scratch0 == 0) ? 1 : 0` = `i32_eq 0`.
 /// Use `MINI_I32_EQ_SCRATCH0_S_R` with a slot containing 0, or just inline.
 /// Dropping this — the pattern will use COPY_SCRATCH0_I 0 + I32_EQ_RS_R.
 
-// Highest op value used: 260
+// Highest op value used: 261 (MINI_BR_TABLE; keep the loop-live walk's
+// opcode-range guard in sync when adding ops)
 
 /// A function lowered to flat `i64` MiniProgram words plus the metadata the
 /// kernel needs to set up its reds and merge point.
@@ -1428,6 +1436,188 @@ pub(crate) fn prepass(
         let pos = total - cursor.len();
         byte_to_word.insert(pos, words.len());
         let code = OpCode::decode(&mut cursor).ok()?;
+        /// Extend a cmp-branch immediate operand to the canonical i64 slot value.
+        /// i32 sign-extends; u32 zero-extends (the u32 kernel compares mask the low
+        /// 32 bits, so either extension is equivalent); u64 is an i64 bit-cast (the
+        /// u64 kernel compares realize unsigned order by flipping the sign bit).
+        macro_rules! xt {
+            (i32 $v:expr) => {
+                i64::from($v)
+            };
+            (u32 $v:expr) => {
+                i64::from($v)
+            };
+            (i64 $v:expr) => {
+                $v
+            };
+            (u64 $v:expr) => {
+                $v as i64
+            };
+        }
+
+        /// Lower a fused compare-branch op (branch taken iff `lhs CMP rhs`):
+        /// materialize reg/imm operands into scratch slots via the `dr_*` helpers
+        /// (preserving the non-commutative `lhs, rhs` order), compute the 0/1
+        /// predicate into ireg with the slot-slot comparison kernel op `$m`, then
+        /// branch-if-nonzero (`MINI_BR_I32_NE_RI, target, 0`).
+        macro_rules! br_cmp {
+            (@finish $offset:expr, $target_byte:expr) => {{
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I32_NE_RI, 0, 0]);
+                fixups.push((target_field, $target_byte, $offset < 0));
+            }};
+            (ss $ty:ident, $m:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let r = s!(op.rhs);
+                dr_ss!($m, l, r);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (rs $ty:ident, $m:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let r = s!(op.rhs);
+                dr_rs!($m, r);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (sr $ty:ident, $m:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                dr_sr!($m, l);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (si $ty:ident, $m:expr, $ext:ident) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let imm = xt!($ext op.rhs);
+                dr_si!($m, l, imm);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (ri $ty:ident, $m:expr, $ext:ident) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = xt!($ext op.rhs);
+                dr_ri!($m, imm);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (is $ty:ident, $m:expr, $ext:ident) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = xt!($ext op.lhs);
+                let r = s!(op.rhs);
+                dr_is!($m, imm, r);
+                br_cmp!(@finish offset, target_byte);
+            }};
+            (ir $ty:ident, $m:expr, $ext:ident) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = xt!($ext op.lhs);
+                dr_ir!($m, imm);
+                br_cmp!(@finish offset, target_byte);
+            }};
+        }
+
+        /// Lower a fused branch whose dedicated `MINI_BR_*` op takes two slot
+        /// operands (`[br, target, lhs_slot, rhs_slot]`).
+        macro_rules! br_dir_ss {
+            ($ty:ident, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let r = s!(op.rhs);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[$br, 0, l, r]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }};
+        }
+
+        /// Lower a fused branch whose dedicated `MINI_BR_*` op compares the
+        /// accumulator against a slot (`[br, target, rhs_slot]`).
+        macro_rules! br_dir_rs {
+            ($ty:ident, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let r = s!(op.rhs);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[$br, 0, r]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }};
+        }
+
+        /// Lower a fused bitwise-test branch (`And`/`Or` taken iff
+        /// `(lhs OP rhs) != 0`, `NotAnd`/`NotOr` taken iff `== 0`): compute the
+        /// bitwise result into ireg with `$m`, then branch via `$br`
+        /// (`MINI_BR_I64_NE_RI` or `MINI_BR_I64_EQ_RI`) against 0. For the i32
+        /// forms the full-width i64 result is zero iff the low-32 i32 result is
+        /// zero (canonical slots are sign-extended: a nonzero high half forces
+        /// both bit31s set for AND — hence a nonzero low half — and a nonzero
+        /// low half for OR follows from either operand being nonzero), so the
+        /// i64 AND/OR compute ops are reused with sign-extended immediates.
+        macro_rules! br_bit {
+            (@finish $br:expr, $offset:expr, $target_byte:expr) => {{
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[$br, 0, 0]);
+                fixups.push((target_field, $target_byte, $offset < 0));
+            }};
+            (ss $ty:ident, $m:expr, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let r = s!(op.rhs);
+                words.extend_from_slice(&[$m, l, r]);
+                br_bit!(@finish $br, offset, target_byte);
+            }};
+            (rs $ty:ident, $m:expr, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let r = s!(op.rhs);
+                words.extend_from_slice(&[$m, r]);
+                br_bit!(@finish $br, offset, target_byte);
+            }};
+            // Slot-imm via a 3-word `[m, lhs_slot, imm]` compute op (AND).
+            (si3 $ty:ident, $m:expr, $ext:ident, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let imm = xt!($ext op.rhs);
+                words.extend_from_slice(&[$m, l, imm]);
+                br_bit!(@finish $br, offset, target_byte);
+            }};
+            // Slot-imm via load-to-ireg + `[m, imm]` accumulator compute op (OR).
+            (si_copy $ty:ident, $m:expr, $ext:ident, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let l = s!(op.lhs);
+                let imm = xt!($ext op.rhs);
+                words.extend_from_slice(&[MINI_COPY_RS, l, $m, imm]);
+                br_bit!(@finish $br, offset, target_byte);
+            }};
+            (ri $ty:ident, $m:expr, $ext:ident, $br:expr) => {{
+                let op = decode::$ty::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = xt!($ext op.rhs);
+                words.extend_from_slice(&[$m, imm]);
+                br_bit!(@finish $br, offset, target_byte);
+            }};
+        }
+
         match code {
             OpCode::I32Add_Rs_si => {
                 let op = decode::I32Add_Rs_si::decode(&mut cursor).ok()?;
@@ -1588,6 +1778,98 @@ pub(crate) fn prepass(
                 words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
+            // ── Fused compare-branch sweep ──────────────────────────────────
+            // The remaining integer cmp-branch matrix, lowered mechanically:
+            // Lt/Le via `br_cmp!` (0/1 predicate into ireg + branch-nonzero),
+            // Eq/NotEq via the dedicated `MINI_BR_*` ops where the shape
+            // matches (canonical sign-extended i32 slots make the i64 equality
+            // branches exact for i32 too), Or/NotAnd/NotOr via `br_bit!`.
+            //
+            // i32 signed Lt/Le
+            OpCode::BranchI32Lt_Rs => br_cmp!(rs BranchI32Lt_Rs, MINI_I32_LT_SS_R),
+            OpCode::BranchI32Lt_Sr => br_cmp!(sr BranchI32Lt_Sr, MINI_I32_LT_SS_R),
+            OpCode::BranchI32Lt_Ss => br_cmp!(ss BranchI32Lt_Ss, MINI_I32_LT_SS_R),
+            OpCode::BranchI32Lt_Ir => br_cmp!(ir BranchI32Lt_Ir, MINI_I32_LT_SS_R, i32),
+            OpCode::BranchI32Lt_Is => br_cmp!(is BranchI32Lt_Is, MINI_I32_LT_SS_R, i32),
+            OpCode::BranchI32Le_Rs => br_cmp!(rs BranchI32Le_Rs, MINI_I32_LE_SS_R),
+            OpCode::BranchI32Le_Ri => br_cmp!(ri BranchI32Le_Ri, MINI_I32_LE_SS_R, i32),
+            OpCode::BranchI32Le_Sr => br_cmp!(sr BranchI32Le_Sr, MINI_I32_LE_SS_R),
+            OpCode::BranchI32Le_Si => br_cmp!(si BranchI32Le_Si, MINI_I32_LE_SS_R, i32),
+            OpCode::BranchI32Le_Ir => br_cmp!(ir BranchI32Le_Ir, MINI_I32_LE_SS_R, i32),
+            OpCode::BranchI32Le_Is => br_cmp!(is BranchI32Le_Is, MINI_I32_LE_SS_R, i32),
+            // i64 signed Lt/Le
+            OpCode::BranchI64Lt_Ri => br_cmp!(ri BranchI64Lt_Ri, MINI_I64_LT_SS_R, i64),
+            OpCode::BranchI64Lt_Si => br_cmp!(si BranchI64Lt_Si, MINI_I64_LT_SS_R, i64),
+            OpCode::BranchI64Lt_Sr => br_cmp!(sr BranchI64Lt_Sr, MINI_I64_LT_SS_R),
+            OpCode::BranchI64Lt_Ss => br_cmp!(ss BranchI64Lt_Ss, MINI_I64_LT_SS_R),
+            OpCode::BranchI64Lt_Is => br_cmp!(is BranchI64Lt_Is, MINI_I64_LT_SS_R, i64),
+            OpCode::BranchI64Le_Ri => br_cmp!(ri BranchI64Le_Ri, MINI_I64_LE_SS_R, i64),
+            OpCode::BranchI64Le_Sr => br_cmp!(sr BranchI64Le_Sr, MINI_I64_LE_SS_R),
+            OpCode::BranchI64Le_Ir => br_cmp!(ir BranchI64Le_Ir, MINI_I64_LE_SS_R, i64),
+            OpCode::BranchI64Le_Is => br_cmp!(is BranchI64Le_Is, MINI_I64_LE_SS_R, i64),
+            // u32 unsigned Lt/Le
+            OpCode::BranchU32Lt_Ri => br_cmp!(ri BranchU32Lt_Ri, MINI_U32_LT_SS_R, u32),
+            OpCode::BranchU32Lt_Is => br_cmp!(is BranchU32Lt_Is, MINI_U32_LT_SS_R, u32),
+            OpCode::BranchU32Le_Ri => br_cmp!(ri BranchU32Le_Ri, MINI_U32_LE_SS_R, u32),
+            OpCode::BranchU32Le_Si => br_cmp!(si BranchU32Le_Si, MINI_U32_LE_SS_R, u32),
+            OpCode::BranchU32Le_Is => br_cmp!(is BranchU32Le_Is, MINI_U32_LE_SS_R, u32),
+            // u64 unsigned Lt/Le
+            OpCode::BranchU64Lt_Ri => br_cmp!(ri BranchU64Lt_Ri, MINI_U64_LT_SS_R, u64),
+            OpCode::BranchU64Lt_Rs => br_cmp!(rs BranchU64Lt_Rs, MINI_U64_LT_SS_R),
+            OpCode::BranchU64Lt_Sr => br_cmp!(sr BranchU64Lt_Sr, MINI_U64_LT_SS_R),
+            OpCode::BranchU64Lt_Ss => br_dir_ss!(BranchU64Lt_Ss, MINI_BR_U64_LT_SS),
+            OpCode::BranchU64Le_Ir => br_cmp!(ir BranchU64Le_Ir, MINI_U64_LE_SS_R, u64),
+            OpCode::BranchU64Le_Is => br_cmp!(is BranchU64Le_Is, MINI_U64_LE_SS_R, u64),
+            OpCode::BranchU64Le_Ri => br_cmp!(ri BranchU64Le_Ri, MINI_U64_LE_SS_R, u64),
+            OpCode::BranchU64Le_Rs => br_cmp!(rs BranchU64Le_Rs, MINI_U64_LE_SS_R),
+            OpCode::BranchU64Le_Si => br_cmp!(si BranchU64Le_Si, MINI_U64_LE_SS_R, u64),
+            OpCode::BranchU64Le_Sr => br_cmp!(sr BranchU64Le_Sr, MINI_U64_LE_SS_R),
+            OpCode::BranchU64Le_Ss => br_cmp!(ss BranchU64Le_Ss, MINI_U64_LE_SS_R),
+            // Eq/NotEq via dedicated branch ops
+            OpCode::BranchI32Eq_Ss => br_dir_ss!(BranchI32Eq_Ss, MINI_BR_I64_EQ_SS),
+            OpCode::BranchI32NotEq_Ss => br_dir_ss!(BranchI32NotEq_Ss, MINI_BR_I64_NE_SS),
+            OpCode::BranchI64Eq_Rs => br_dir_rs!(BranchI64Eq_Rs, MINI_BR_I64_EQ_RS),
+            OpCode::BranchI64NotEq_Rs => br_dir_rs!(BranchI64NotEq_Rs, MINI_BR_I64_NE_RS),
+            OpCode::BranchI64NotEq_Ss => br_dir_ss!(BranchI64NotEq_Ss, MINI_BR_I64_NE_SS),
+            // Branch if slot != immediate (i64): load the slot into ireg and
+            // use the accumulator-sourced not-equal branch.
+            OpCode::BranchI64NotEq_Si => {
+                let op = decode::BranchI64NotEq_Si::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = s!(op.lhs);
+                words.push(MINI_COPY_RS);
+                words.push(lhs);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, op.rhs]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Or / NotOr (branch iff `(lhs | rhs) != 0` / `== 0`)
+            OpCode::BranchI32Or_Ss => br_bit!(ss BranchI32Or_Ss, MINI_I32_OR_SS_WR, MINI_BR_I64_NE_RI),
+            OpCode::BranchI32Or_Rs => br_bit!(rs BranchI32Or_Rs, MINI_I32_OR_RS_WR, MINI_BR_I64_NE_RI),
+            OpCode::BranchI32Or_Si => br_bit!(si_copy BranchI32Or_Si, MINI_I64_OR_RI_WR, i32, MINI_BR_I64_NE_RI),
+            OpCode::BranchI32Or_Ri => br_bit!(ri BranchI32Or_Ri, MINI_I64_OR_RI_WR, i32, MINI_BR_I64_NE_RI),
+            OpCode::BranchI64Or_Ss => br_bit!(ss BranchI64Or_Ss, MINI_I64_OR_SS_WR, MINI_BR_I64_NE_RI),
+            OpCode::BranchI64Or_Rs => br_bit!(rs BranchI64Or_Rs, MINI_I64_OR_RS_WR, MINI_BR_I64_NE_RI),
+            OpCode::BranchI64Or_Si => br_bit!(si_copy BranchI64Or_Si, MINI_I64_OR_RI_WR, i64, MINI_BR_I64_NE_RI),
+            OpCode::BranchI64Or_Ri => br_bit!(ri BranchI64Or_Ri, MINI_I64_OR_RI_WR, i64, MINI_BR_I64_NE_RI),
+            OpCode::BranchI32NotOr_Ss => br_bit!(ss BranchI32NotOr_Ss, MINI_I32_OR_SS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotOr_Rs => br_bit!(rs BranchI32NotOr_Rs, MINI_I32_OR_RS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotOr_Si => br_bit!(si_copy BranchI32NotOr_Si, MINI_I64_OR_RI_WR, i32, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotOr_Ri => br_bit!(ri BranchI32NotOr_Ri, MINI_I64_OR_RI_WR, i32, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotOr_Ss => br_bit!(ss BranchI64NotOr_Ss, MINI_I64_OR_SS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotOr_Rs => br_bit!(rs BranchI64NotOr_Rs, MINI_I64_OR_RS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotOr_Si => br_bit!(si_copy BranchI64NotOr_Si, MINI_I64_OR_RI_WR, i64, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotOr_Ri => br_bit!(ri BranchI64NotOr_Ri, MINI_I64_OR_RI_WR, i64, MINI_BR_I64_EQ_RI),
+            // NotAnd (branch iff `(lhs & rhs) == 0`)
+            OpCode::BranchI32NotAnd_Ss => br_bit!(ss BranchI32NotAnd_Ss, MINI_I32_AND_SS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotAnd_Rs => br_bit!(rs BranchI32NotAnd_Rs, MINI_I32_AND_RS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotAnd_Si => br_bit!(si3 BranchI32NotAnd_Si, MINI_I64_AND_SI_WR, i32, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI32NotAnd_Ri => br_bit!(ri BranchI32NotAnd_Ri, MINI_I64_AND_RI_WR, i32, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotAnd_Ss => br_bit!(ss BranchI64NotAnd_Ss, MINI_I64_AND_SS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotAnd_Rs => br_bit!(rs BranchI64NotAnd_Rs, MINI_I64_AND_RS_WR, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotAnd_Si => br_bit!(si3 BranchI64NotAnd_Si, MINI_I64_AND_SI_WR, i64, MINI_BR_I64_EQ_RI),
+            OpCode::BranchI64NotAnd_Ri => br_bit!(ri BranchI64NotAnd_Ri, MINI_I64_AND_RI_WR, i64, MINI_BR_I64_EQ_RI),
             OpCode::Return => {
                 // Every `return` is a bare operand-less op: the translator has
                 // already copied the result (if any) into slot 0 (`Slot::from(0)`,
@@ -4505,6 +4787,13 @@ pub(crate) fn prepass(
             OpCode::U32LoadExtend8_Rr => {
                 // ptr+offset both dynamic (Reg operands). Yield to stock.
                 let _op = decode::U32LoadExtend8_Rr::decode(&mut cursor).ok()?;
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    std::eprintln!(
+                        "[majit-prepass] yield at op U32LoadExtend8_Rr (byte ~{pos}, word {})",
+                        words.len()
+                    );
+                }
                 words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
                 has_yield_or_bail = true;
             }
@@ -4716,10 +5005,48 @@ pub(crate) fn prepass(
                 ]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
+            // Indexed multi-way branch: `len_targets` raw 4-byte `BranchOffset`
+            // entries trail the op in the byte stream; execution jumps to
+            // `entry_pos + offset` of the entry selected by
+            // `min(u32(index), len-1)`. Consume the entries here (they are not
+            // ops — leaving them in the stream would desync the decode) and
+            // emit `[MINI_BR_TABLE, len, tgt...]` with one fixup per entry.
             OpCode::BranchTable_R => {
-                let _op = decode::BranchTable_R::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                let op = decode::BranchTable_R::decode(&mut cursor).ok()?;
+                let len = op.len_targets as usize;
+                if len == 0 {
+                    return None;
+                }
+                let table_base = words.len();
+                words.extend_from_slice(&[MINI_BR_TABLE, len as i64]);
+                words.resize(table_base + 2 + len, 0);
+                for i in 0..len {
+                    let entry_pos = total - cursor.len();
+                    let off = crate::ir::BranchOffset::decode(&mut cursor).ok()?;
+                    let offset = i32::from(off) as isize;
+                    let target_byte = entry_pos.checked_add_signed(offset)?;
+                    fixups.push((table_base + 2 + i, target_byte, offset < 0));
+                }
+            }
+            // Same, with the index in a slot: load it into ireg first.
+            OpCode::BranchTable_S => {
+                let op = decode::BranchTable_S::decode(&mut cursor).ok()?;
+                let len = op.len_targets as usize;
+                if len == 0 {
+                    return None;
+                }
+                let index = s!(op.index);
+                words.extend_from_slice(&[MINI_COPY_RS, index]);
+                let table_base = words.len();
+                words.extend_from_slice(&[MINI_BR_TABLE, len as i64]);
+                words.resize(table_base + 2 + len, 0);
+                for i in 0..len {
+                    let entry_pos = total - cursor.len();
+                    let off = crate::ir::BranchOffset::decode(&mut cursor).ok()?;
+                    let offset = i32::from(off) as isize;
+                    let target_byte = entry_pos.checked_add_signed(offset)?;
+                    fixups.push((table_base + 2 + i, target_byte, offset < 0));
+                }
             }
             OpCode::BranchI32Lt_Ri => {
                 // if ireg <s imm (i32 signed) goto target. Materialize imm
@@ -5049,11 +5376,15 @@ pub(crate) fn prepass(
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::I64Shr_Rsi => {
-                // Arithmetic i64 right shift. No MINI_I64_SHR op exists yet;
-                // yield to stock.
-                let _op = decode::I64Shr_Rsi::decode(&mut cursor).ok()?;
-                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, scratch_base]);
-                has_yield_or_bail = true;
+                // Arithmetic i64 right shift by a constant. `MINI_U64_SHR_SI`
+                // computes `(slots[src] >> shift) & mask` with the arithmetic
+                // (sign-extending) `>>`; an all-ones mask keeps every bit, so
+                // it realizes the arithmetic shift directly.
+                let op = decode::I64Shr_Rsi::decode(&mut cursor).ok()?;
+                let lhs = s!(op.lhs);
+                // wasm shift amount is taken mod 64.
+                let shift = i64::from(u32::from(u8::from(op.rhs)) & 63);
+                words.extend_from_slice(&[MINI_U64_SHR_SI, lhs, shift, -1i64]);
             }
             OpCode::BranchU32Le_Sr => {
                 // if slot[lhs] <=u ireg goto target. Spill ireg to scratch,
@@ -5194,7 +5525,15 @@ pub(crate) fn prepass(
             let op = words[wi];
             // During emission, opcodes are small positive integers (0-170).
             // Sentinel-tagged values are large negatives. Skip non-opcode words.
-            let width = if op >= 0 && op <= 258 { mini_op_width(op) } else { 1 };
+            let width = if op == MINI_BR_TABLE {
+                // The only variable-width op: [op, len, tgt...] = 2 + len words
+                // (its operands are branch-target word indices, never slots).
+                2 + words[wi + 1] as usize
+            } else if op >= 0 && op <= MINI_I64_AND_RS_WR {
+                mini_op_width(op)
+            } else {
+                1
+            };
             for oi in 1..width {
                 if wi + oi < words.len() {
                     let v = words[wi + oi];
@@ -5618,6 +5957,66 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::BranchI64And_Ri => dec!(BranchI64And_Ri),
             OpCode::BranchI64And_Ss => dec!(BranchI64And_Ss),
             OpCode::BranchI64And_Si => dec!(BranchI64And_Si),
+            OpCode::BranchI32Le_Ir => dec!(BranchI32Le_Ir),
+            OpCode::BranchI32Le_Is => dec!(BranchI32Le_Is),
+            OpCode::BranchI32Le_Ri => dec!(BranchI32Le_Ri),
+            OpCode::BranchI32Le_Rs => dec!(BranchI32Le_Rs),
+            OpCode::BranchI32Le_Si => dec!(BranchI32Le_Si),
+            OpCode::BranchI32Le_Sr => dec!(BranchI32Le_Sr),
+            OpCode::BranchI32Lt_Ir => dec!(BranchI32Lt_Ir),
+            OpCode::BranchI32Lt_Is => dec!(BranchI32Lt_Is),
+            OpCode::BranchI32Lt_Rs => dec!(BranchI32Lt_Rs),
+            OpCode::BranchI32Lt_Sr => dec!(BranchI32Lt_Sr),
+            OpCode::BranchI32Lt_Ss => dec!(BranchI32Lt_Ss),
+            OpCode::BranchI32NotAnd_Ri => dec!(BranchI32NotAnd_Ri),
+            OpCode::BranchI32NotAnd_Rs => dec!(BranchI32NotAnd_Rs),
+            OpCode::BranchI32NotAnd_Si => dec!(BranchI32NotAnd_Si),
+            OpCode::BranchI32NotAnd_Ss => dec!(BranchI32NotAnd_Ss),
+            OpCode::BranchI32NotOr_Ri => dec!(BranchI32NotOr_Ri),
+            OpCode::BranchI32NotOr_Rs => dec!(BranchI32NotOr_Rs),
+            OpCode::BranchI32NotOr_Si => dec!(BranchI32NotOr_Si),
+            OpCode::BranchI32NotOr_Ss => dec!(BranchI32NotOr_Ss),
+            OpCode::BranchI32Or_Ri => dec!(BranchI32Or_Ri),
+            OpCode::BranchI32Or_Rs => dec!(BranchI32Or_Rs),
+            OpCode::BranchI32Or_Si => dec!(BranchI32Or_Si),
+            OpCode::BranchI32Or_Ss => dec!(BranchI32Or_Ss),
+            OpCode::BranchI64Le_Ir => dec!(BranchI64Le_Ir),
+            OpCode::BranchI64Le_Is => dec!(BranchI64Le_Is),
+            OpCode::BranchI64Le_Ri => dec!(BranchI64Le_Ri),
+            OpCode::BranchI64Le_Sr => dec!(BranchI64Le_Sr),
+            OpCode::BranchI64Lt_Is => dec!(BranchI64Lt_Is),
+            OpCode::BranchI64Lt_Ri => dec!(BranchI64Lt_Ri),
+            OpCode::BranchI64Lt_Si => dec!(BranchI64Lt_Si),
+            OpCode::BranchI64Lt_Sr => dec!(BranchI64Lt_Sr),
+            OpCode::BranchI64Lt_Ss => dec!(BranchI64Lt_Ss),
+            OpCode::BranchI64NotAnd_Ri => dec!(BranchI64NotAnd_Ri),
+            OpCode::BranchI64NotAnd_Rs => dec!(BranchI64NotAnd_Rs),
+            OpCode::BranchI64NotAnd_Si => dec!(BranchI64NotAnd_Si),
+            OpCode::BranchI64NotAnd_Ss => dec!(BranchI64NotAnd_Ss),
+            OpCode::BranchI64NotOr_Ri => dec!(BranchI64NotOr_Ri),
+            OpCode::BranchI64NotOr_Rs => dec!(BranchI64NotOr_Rs),
+            OpCode::BranchI64NotOr_Si => dec!(BranchI64NotOr_Si),
+            OpCode::BranchI64NotOr_Ss => dec!(BranchI64NotOr_Ss),
+            OpCode::BranchI64Or_Ri => dec!(BranchI64Or_Ri),
+            OpCode::BranchI64Or_Rs => dec!(BranchI64Or_Rs),
+            OpCode::BranchI64Or_Si => dec!(BranchI64Or_Si),
+            OpCode::BranchI64Or_Ss => dec!(BranchI64Or_Ss),
+            OpCode::BranchU32Le_Is => dec!(BranchU32Le_Is),
+            OpCode::BranchU32Le_Ri => dec!(BranchU32Le_Ri),
+            OpCode::BranchU32Le_Si => dec!(BranchU32Le_Si),
+            OpCode::BranchU32Lt_Is => dec!(BranchU32Lt_Is),
+            OpCode::BranchU32Lt_Ri => dec!(BranchU32Lt_Ri),
+            OpCode::BranchU64Le_Ir => dec!(BranchU64Le_Ir),
+            OpCode::BranchU64Le_Is => dec!(BranchU64Le_Is),
+            OpCode::BranchU64Le_Ri => dec!(BranchU64Le_Ri),
+            OpCode::BranchU64Le_Rs => dec!(BranchU64Le_Rs),
+            OpCode::BranchU64Le_Si => dec!(BranchU64Le_Si),
+            OpCode::BranchU64Le_Sr => dec!(BranchU64Le_Sr),
+            OpCode::BranchU64Le_Ss => dec!(BranchU64Le_Ss),
+            OpCode::BranchU64Lt_Ri => dec!(BranchU64Lt_Ri),
+            OpCode::BranchU64Lt_Rs => dec!(BranchU64Lt_Rs),
+            OpCode::BranchU64Lt_Sr => dec!(BranchU64Lt_Sr),
+            OpCode::BranchU64Lt_Ss => dec!(BranchU64Lt_Ss),
             OpCode::I64ReinterpretF64_Rr => dec!(I64ReinterpretF64_Rr),
             OpCode::F64ReinterpretI64_Rr => dec!(F64ReinterpretI64_Rr),
             OpCode::U32Load_Ri => dec!(U32Load_Ri),
@@ -5639,7 +6038,22 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::BranchU32Lt_Rs => dec!(BranchU32Lt_Rs),
             OpCode::BranchU64Lt_Ir => dec!(BranchU64Lt_Ir),
             OpCode::BranchU32Lt_Ss => dec!(BranchU32Lt_Ss),
-            OpCode::BranchTable_R => dec!(BranchTable_R),
+            OpCode::BranchTable_R => {
+                // Consume the trailing raw `BranchOffset` entries so the
+                // decode stream stays aligned.
+                let op = crate::ir::decode::BranchTable_R::decode(&mut cursor)
+                    .expect("operand decode");
+                for _ in 0..op.len_targets {
+                    crate::ir::BranchOffset::decode(&mut cursor).expect("br_table entry");
+                }
+            }
+            OpCode::BranchTable_S => {
+                let op = crate::ir::decode::BranchTable_S::decode(&mut cursor)
+                    .expect("operand decode");
+                for _ in 0..op.len_targets {
+                    crate::ir::BranchOffset::decode(&mut cursor).expect("br_table entry");
+                }
+            }
             OpCode::BranchI32Lt_Ri => dec!(BranchI32Lt_Ri),
             OpCode::F64NotLe_Rss => dec!(F64NotLe_Rss),
             OpCode::U32Select_Rsii => dec!(U32Select_Rsii),
