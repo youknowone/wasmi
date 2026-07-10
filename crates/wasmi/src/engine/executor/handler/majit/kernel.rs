@@ -63,6 +63,7 @@ use super::prepass::{
     MINI_I32_XOR_RS_WR, MINI_I64_SUB_RS_WR, MINI_I64_MUL_RS_WR, MINI_I64_OR_RS_WR,
     MINI_I64_XOR_RS_WR, MINI_I32_SUB_SR_WR, MINI_I64_SUB_SR_WR,
     MINI_I32_ADD_RS_WR, MINI_I64_ADD_RS_WR, MINI_I32_ADD_SS_WR,
+    MINI_I64_AND_SS_WR, MINI_I64_AND_RS_WR,
     MINI_DIVREM_SCRATCH0_S, MINI_DIVREM_S_SCRATCH0, MINI_DIVREM_SCRATCH01,
     MINI_I32_BITCOUNT_SCRATCH0, MINI_I64_BITCOUNT_SCRATCH0,
     MINI_F32_UNARY_SCRATCH0, MINI_F64_UNARY_SCRATCH0,
@@ -1599,6 +1600,12 @@ fn wasm_mainloop(
                 state.accum0 = state.slots[lhs] & imm;
                 pc += 3;
             }
+            MINI_I64_AND_SS_WR => {
+                let lhs = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                state.accum0 = state.slots[lhs] & state.slots[rhs];
+                pc += 3;
+            }
             MINI_I64_ADD_RS_WB => {
                 let dst = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
@@ -2642,6 +2649,11 @@ fn wasm_mainloop(
             MINI_I64_ADD_RS_WR => {
                 let rhs = program[pc + 1] as usize;
                 state.accum0 = state.accum0 + state.slots[rhs];
+                pc += 2;
+            }
+            MINI_I64_AND_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0 & state.slots[rhs];
                 pc += 2;
             }
             MINI_I32_ADD_SS_WR => {
@@ -4288,6 +4300,64 @@ mod tests {
         assert!(
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the OR-accumulation loop",
+        );
+    }
+
+    /// A loop that sums only the even indices runs end-to-end on the JIT tier
+    /// and matches the stock result. The odd-index skip is a fused
+    /// `if (i & 1) != 0` branch (`BranchI32And_*`), which the prepass lowers to
+    /// an i32 AND into the accumulator followed by a branch-if-nonzero.
+    #[test]
+    fn end_to_end_and_branch_i32_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const AND_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $skip
+                                (br_if $skip (i32.and (local.get $i) (i32.const 1)))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn even_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 1 == 0 {
+                    acc = acc.wrapping_add(i);
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, AND_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 5, 10, 17, 64, 200] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                even_sum(n),
+                "even_sum({n})"
+            );
+        }
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "the JIT tier must have run and compiled the and-branch loop",
         );
     }
 

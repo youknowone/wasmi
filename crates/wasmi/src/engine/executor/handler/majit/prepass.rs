@@ -955,13 +955,23 @@ pub(crate) const MINI_I64_STORE_SCRATCH0_I: i64 = 257;
 /// `accum = scratch0 & imm`. Used by U64LoadExtend32.
 pub(crate) const MINI_I64_AND_SCRATCH0_I_WR: i64 = 258;
 
+/// `[MINI_I64_AND_SS_WR, lhs_slot, rhs_slot]` (3 words):
+/// `ireg = slots[lhs] & slots[rhs]` (i64). The slot-slot counterpart of
+/// `MINI_I64_AND_RI_WR`; used to lower the fused `BranchI64And_Ss`.
+pub(crate) const MINI_I64_AND_SS_WR: i64 = 259;
+
+/// `[MINI_I64_AND_RS_WR, rhs_slot]` (2 words): `ireg = ireg & slots[rhs]`
+/// (i64). The reg-slot counterpart of `MINI_I64_AND_RI_WR`; used to lower the
+/// fused `BranchI64And_Rs`.
+pub(crate) const MINI_I64_AND_RS_WR: i64 = 260;
+
 /// `[MINI_F64_NOTGT_SCRATCH0_S_R, rhs_slot]` (2 words):
 /// For F64NotLe_Rss negate pattern: `accum = !(f64_le(...))` using scratch0.
 /// Actually simpler: this is `accum = (scratch0 == 0) ? 1 : 0` = `i32_eq 0`.
 /// Use `MINI_I32_EQ_SCRATCH0_S_R` with a slot containing 0, or just inline.
 /// Dropping this — the pattern will use COPY_SCRATCH0_I 0 + I32_EQ_RS_R.
 
-// Highest op value used: 258
+// Highest op value used: 260
 
 /// A function lowered to flat `i64` MiniProgram words plus the metadata the
 /// kernel needs to set up its reds and merge point.
@@ -1076,6 +1086,7 @@ fn mini_op_width(op: i64) -> usize {
         | 29 // MINI_I64_SUB_SS_WR
         | 30 // MINI_I32_XOR_SS_WR
         | 31 // MINI_I32_AND_SS_WR
+        | 259 // MINI_I64_AND_SS_WR
         | 32 // MINI_I32_OR_SS_WR
         | 33 // MINI_I32_SUB_SS_WR
         | 36 // MINI_I64_SHL_SI
@@ -1191,6 +1202,7 @@ fn mini_op_width(op: i64) -> usize {
         | 187 // MINI_I64_SUB_SR_WR
         | 188 // MINI_I32_ADD_RS_WR
         | 189 // MINI_I64_ADD_RS_WR
+        | 260 // MINI_I64_AND_RS_WR
         | 193 // MINI_DIVREM_SCRATCH01
         | 194 // MINI_I32_BITCOUNT_SCRATCH0
         | 195 // MINI_I64_BITCOUNT_SCRATCH0
@@ -1485,6 +1497,95 @@ pub(crate) fn prepass(
                 words.push(scratch_base);
                 let target_field = words.len() + 1;
                 words.extend_from_slice(&[MINI_BR_I64_EQ_SI, 0, scratch_base, imm]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            // Fused `if (lhs & rhs) != 0` branches (wasmi `BranchI32And_*` /
+            // `BranchI64And_*`, taken iff `(lhs & rhs) != 0`). Compute the AND
+            // into ireg, then branch-if-nonzero via `MINI_BR_I64_NE_RI, _, 0`.
+            // For the i32 forms, canonical slots hold sign-extended i32s, so the
+            // full-width i64 AND is nonzero iff the low-32 i32 AND is nonzero
+            // (a nonzero high half implies both bit31s set, hence a nonzero low
+            // half); reg-slot uses the masking `MINI_I32_AND_RS_WR` directly.
+            OpCode::BranchI32And_Ss => {
+                let op = decode::BranchI32And_Ss::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = s!(op.lhs);
+                let rhs = s!(op.rhs);
+                words.extend_from_slice(&[MINI_I32_AND_SS_WR, lhs, rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI32And_Si => {
+                let op = decode::BranchI32And_Si::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = s!(op.lhs);
+                let imm = i64::from(op.rhs);
+                words.extend_from_slice(&[MINI_I64_AND_SI_WR, lhs, imm]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI32And_Ri => {
+                let op = decode::BranchI32And_Ri::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let imm = i64::from(op.rhs);
+                words.extend_from_slice(&[MINI_I64_AND_RI_WR, imm]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI32And_Rs => {
+                let op = decode::BranchI32And_Rs::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let rhs = s!(op.rhs);
+                words.extend_from_slice(&[MINI_I32_AND_RS_WR, rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI64And_Ss => {
+                let op = decode::BranchI64And_Ss::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = s!(op.lhs);
+                let rhs = s!(op.rhs);
+                words.extend_from_slice(&[MINI_I64_AND_SS_WR, lhs, rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI64And_Si => {
+                let op = decode::BranchI64And_Si::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let lhs = s!(op.lhs);
+                words.extend_from_slice(&[MINI_I64_AND_SI_WR, lhs, op.rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI64And_Ri => {
+                let op = decode::BranchI64And_Ri::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                words.extend_from_slice(&[MINI_I64_AND_RI_WR, op.rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
+                fixups.push((target_field, target_byte, offset < 0));
+            }
+            OpCode::BranchI64And_Rs => {
+                let op = decode::BranchI64And_Rs::decode(&mut cursor).ok()?;
+                let offset = i32::from(op.offset) as isize;
+                let target_byte = pos.checked_add_signed(offset)?;
+                let rhs = s!(op.rhs);
+                words.extend_from_slice(&[MINI_I64_AND_RS_WR, rhs]);
+                let target_field = words.len() + 1;
+                words.extend_from_slice(&[MINI_BR_I64_NE_RI, 0, 0]);
                 fixups.push((target_field, target_byte, offset < 0));
             }
             OpCode::Return => {
@@ -5509,6 +5610,14 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::BranchI64NotEq_Ri => dec!(BranchI64NotEq_Ri),
             OpCode::BranchI64NotEq_Ss => dec!(BranchI64NotEq_Ss),
             OpCode::BranchI64NotEq_Si => dec!(BranchI64NotEq_Si),
+            OpCode::BranchI32And_Rs => dec!(BranchI32And_Rs),
+            OpCode::BranchI32And_Ri => dec!(BranchI32And_Ri),
+            OpCode::BranchI32And_Ss => dec!(BranchI32And_Ss),
+            OpCode::BranchI32And_Si => dec!(BranchI32And_Si),
+            OpCode::BranchI64And_Rs => dec!(BranchI64And_Rs),
+            OpCode::BranchI64And_Ri => dec!(BranchI64And_Ri),
+            OpCode::BranchI64And_Ss => dec!(BranchI64And_Ss),
+            OpCode::BranchI64And_Si => dec!(BranchI64And_Si),
             OpCode::I64ReinterpretF64_Rr => dec!(I64ReinterpretF64_Rr),
             OpCode::F64ReinterpretI64_Rr => dec!(F64ReinterpretI64_Rr),
             OpCode::U32Load_Ri => dec!(U32Load_Ri),
