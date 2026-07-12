@@ -4749,6 +4749,30 @@ pub(crate) fn prepass(
                 };
                 words.extend_from_slice(&[MINI_U64_SHR_SI, lhs, shift, mask]);
             }
+            OpCode::U64Shr_Rri => {
+                let op = decode::U64Shr_Rri::decode(&mut cursor).ok()?;
+                // wasm shift amount is taken mod 64.
+                let n = u32::from(u8::from(op.rhs)) & 63;
+                let shift = i64::from(n);
+                // Mask off the `n` high bits the arithmetic `>>` would sign-extend,
+                // reproducing the logical (zero-fill) shift.
+                let mask = if n == 0 {
+                    -1i64
+                } else {
+                    ((1u64 << (64 - n)) - 1) as i64
+                };
+                // `_Rri` shifts the i64 accumulator (`ireg`) by a constant. Copy the
+                // accumulator into a scratch slot, then reuse the slot-input logical
+                // shift; the copy folds away in the compiled trace.
+                words.extend_from_slice(&[
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_U64_SHR_SI,
+                    scratch_base,
+                    shift,
+                    mask,
+                ]);
+            }
             OpCode::I64Add_Rs_si => {
                 let op = decode::I64Add_Rs_si::decode(&mut cursor).ok()?;
                 let dst = s!(Slot::from(op.result));
@@ -6071,6 +6095,7 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::I64BitXor_Rrs => dec!(I64BitXor_Rrs),
             OpCode::BranchI64Le_Ss => dec!(BranchI64Le_Ss),
             OpCode::U64Shr_Rsi => dec!(U64Shr_Rsi),
+            OpCode::U64Shr_Rri => dec!(U64Shr_Rri),
             OpCode::I64Shl_Rsi => dec!(I64Shl_Rsi),
             OpCode::I32Shl_Rsi => dec!(I32Shl_Rsi),
             OpCode::U32Shr_Rri => dec!(U32Shr_Rri),
