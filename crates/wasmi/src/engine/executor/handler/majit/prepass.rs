@@ -1017,6 +1017,11 @@ pub(crate) struct MiniProgram {
     /// are live across iterations; the rest are setup-only. The kernel
     /// truncates `state.slots` to this count at the loop header.
     pub loop_live_count: usize,
+    /// MiniProgram word indices that start an instruction after all branch
+    /// fixups and optional loop-header truncation insertion. Diagnostic-only:
+    /// used by `PYRE_PORTAL_RCA=1` to distinguish a legal post-loop continuation
+    /// pc from a mid-instruction or out-of-bounds CRN re-entry target.
+    pub op_starts: Vec<usize>,
 }
 
 /// Return the width (number of i64 words consumed) of a MINI opcode.
@@ -1280,6 +1285,54 @@ fn mini_op_width(op: i64) -> usize {
         // Unknown op: conservative default (treat as single word)
         _ => 1,
     }
+}
+
+pub(crate) fn mini_op_name(op: i64) -> &'static str {
+    match op {
+        MINI_HALT => "MINI_HALT",
+        MINI_RETURN_R => "MINI_RETURN_R",
+        MINI_RETURN_S => "MINI_RETURN_S",
+        MINI_RETURN_VOID => "MINI_RETURN_VOID",
+        MINI_RETURN_F_R => "MINI_RETURN_F_R",
+        MINI_RETURN_F32_R => "MINI_RETURN_F32_R",
+        MINI_RETURN_BAIL => "MINI_RETURN_BAIL",
+        MINI_YIELD_STOCK => "MINI_YIELD_STOCK",
+        MINI_CALL_RESIDUAL => "MINI_CALL_RESIDUAL",
+        MINI_CALL_IMPORTED => "MINI_CALL_IMPORTED",
+        MINI_CALL_INDIRECT => "MINI_CALL_INDIRECT",
+        MINI_CALL_INDIRECT_SCRATCH0 => "MINI_CALL_INDIRECT_SCRATCH0",
+        MINI_TRAP => "MINI_TRAP",
+        MINI_BR_ALWAYS => "MINI_BR_ALWAYS",
+        MINI_BR_TABLE => "MINI_BR_TABLE",
+        MINI_BR_I32_NE_RI => "MINI_BR_I32_NE_RI",
+        MINI_BR_I64_NE_RI => "MINI_BR_I64_NE_RI",
+        MINI_BR_I64_LT_IR => "MINI_BR_I64_LT_IR",
+        MINI_BR_I64_EQ_SS => "MINI_BR_I64_EQ_SS",
+        MINI_BR_I64_LE_SS => "MINI_BR_I64_LE_SS",
+        MINI_BR_I64_LE_SI => "MINI_BR_I64_LE_SI",
+        MINI_BR_I32_LE_SS => "MINI_BR_I32_LE_SS",
+        MINI_BR_I32_LT_SI => "MINI_BR_I32_LT_SI",
+        MINI_BR_I64_NE_SS => "MINI_BR_I64_NE_SS",
+        MINI_BR_U64_LT_SS => "MINI_BR_U64_LT_SS",
+        MINI_SLOTS_TRUNCATE => "MINI_SLOTS_TRUNCATE",
+        _ => "MINI_<other>",
+    }
+}
+
+fn collect_op_starts(words: &[i64]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut pc = 0;
+    while pc < words.len() {
+        starts.push(pc);
+        let op = words[pc];
+        let width = if op == MINI_BR_TABLE && pc + 1 < words.len() {
+            2 + words[pc + 1].max(0) as usize
+        } else {
+            mini_op_width(op)
+        };
+        pc = pc.saturating_add(width.max(1));
+    }
+    starts
 }
 
 /// Decode `ops` (an `indirect-dispatch` op stream) into a [`MiniProgram`].
@@ -6005,6 +6058,7 @@ pub(crate) fn prepass(
         has_yield_or_bail,
         unique_slot_count: unique_slots.len(),
         loop_live_count,
+        op_starts: Vec::new(),
     })
 }
 
