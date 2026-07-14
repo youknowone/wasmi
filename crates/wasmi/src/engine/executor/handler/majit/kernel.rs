@@ -4066,6 +4066,17 @@ pub(crate) fn run_persistent(
     globals_table: *const *mut u64,
     globals_count: usize,
 ) -> Option<i64> {
+    // run_persistent can be re-entered from the stock executor while an outer
+    // DRIVER run still holds the driver borrow (deep recursion: a JIT run calls
+    // a callee that falls back to stock, and the stock executor re-enters here
+    // for a further nested call). Such a re-entry sets the memory/globals
+    // context and then bails with `None` when the driver is busy, leaving
+    // GLOBALS_CTX/MEM_CTX pointing at this call's `globals_table` — which the
+    // caller frees on its stock-fallback return. The resumed outer run would
+    // then dereference the dangling table. Save the caller's context pointers
+    // and restore them on every exit (mirroring `run_callee`).
+    let saved_mem = MEM_CTX.with(|c| c.get());
+    let saved_globals = GLOBALS_CTX.with(|c| c.get());
     set_mem_ctx(mem_base, mem_len);
     set_globals_ctx(globals_table, globals_count);
     // Extract a raw pointer to the program's words and drop the PROGRAMS
@@ -4097,7 +4108,7 @@ pub(crate) fn run_persistent(
     // stock executor and the stock executor calls another eligible function,
     // DRIVER is still borrowed by the outer run_persistent. Return None so the
     // caller falls back to the stock executor for the nested call.
-    DRIVER
+    let run_result = DRIVER
         .with(|d| {
             match d.try_borrow_mut() {
                 Ok(mut drivers) => {
@@ -4179,7 +4190,13 @@ pub(crate) fn run_persistent(
                     Err(_) => None, // both drivers busy — fall back to stock
                 }
             })
-        })
+        });
+    // Restore the caller's memory/globals context pointers so a re-entrant run
+    // (this call may itself be a nested re-entry) does not leave the resumed
+    // outer run dereferencing this call's soon-to-be-freed tables.
+    MEM_CTX.with(|c| c.set(saved_mem));
+    GLOBALS_CTX.with(|c| c.set(saved_globals));
+    run_result
 }
 
 /// Run a callee function on the MiniProgram dispatch (CALL_ASSEMBLER path).
