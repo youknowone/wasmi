@@ -1293,7 +1293,9 @@ pub(crate) fn prepass(
     macro_rules! s {
         ($v:expr) => {{
             let idx = i64::from(u16::from($v));
-            if idx > max_slot_seen { max_slot_seen = idx; }
+            if idx > max_slot_seen {
+                max_slot_seen = idx;
+            }
             unique_slots.insert(idx);
             SLOT_SENTINEL + idx
         }};
@@ -1303,7 +1305,9 @@ pub(crate) fn prepass(
     macro_rules! si {
         ($idx:expr) => {{
             let idx: i64 = $idx;
-            if idx > max_slot_seen { max_slot_seen = idx; }
+            if idx > max_slot_seen {
+                max_slot_seen = idx;
+            }
             unique_slots.insert(idx);
             SLOT_SENTINEL + idx
         }};
@@ -1318,7 +1322,9 @@ pub(crate) fn prepass(
             let len = $len as i64;
             for off in 0..len {
                 let idx = head_idx + off;
-                if idx > max_slot_seen { max_slot_seen = idx; }
+                if idx > max_slot_seen {
+                    max_slot_seen = idx;
+                }
                 unique_slots.insert(idx);
             }
             SLOT_SENTINEL + head_idx
@@ -1497,7 +1503,9 @@ pub(crate) fn prepass(
                     // its dense index. Also update max_slot_seen since we
                     // bypass the s!() macro here.
                     unique_slots.insert(0);
-                    if max_slot_seen < 0 { max_slot_seen = 0; }
+                    if max_slot_seen < 0 {
+                        max_slot_seen = 0;
+                    }
                     words.extend_from_slice(&[MINI_RETURN_S, SLOT_SENTINEL + 0]);
                 } else {
                     words.push(MINI_RETURN_VOID);
@@ -1516,61 +1524,241 @@ pub(crate) fn prepass(
             }
             // Local-indexed accumulator spills (`U64Copy_S{N}r`): the slot index
             // N is baked into the opcode and the operands occupy zero bytes.
-            OpCode::U64Copy_S0r => { words.push(MINI_COPY_SR); words.push(si!(0)); },
-            OpCode::U64Copy_S1r => { words.push(MINI_COPY_SR); words.push(si!(1)); },
-            OpCode::U64Copy_S2r => { words.push(MINI_COPY_SR); words.push(si!(2)); },
-            OpCode::U64Copy_S3r => { words.push(MINI_COPY_SR); words.push(si!(3)); },
-            OpCode::U64Copy_S4r => { words.push(MINI_COPY_SR); words.push(si!(4)); },
-            OpCode::U64Copy_S5r => { words.push(MINI_COPY_SR); words.push(si!(5)); },
-            OpCode::U64Copy_S6r => { words.push(MINI_COPY_SR); words.push(si!(6)); },
-            OpCode::U64Copy_S7r => { words.push(MINI_COPY_SR); words.push(si!(7)); },
-            OpCode::U64Copy_S8r => { words.push(MINI_COPY_SR); words.push(si!(8)); },
-            OpCode::U64Copy_S9r => { words.push(MINI_COPY_SR); words.push(si!(9)); },
+            OpCode::U64Copy_S0r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S1r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S2r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S3r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S4r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(4));
+            }
+            OpCode::U64Copy_S5r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S6r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(6));
+            }
+            OpCode::U64Copy_S7r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(7));
+            }
+            OpCode::U64Copy_S8r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(8));
+            }
+            OpCode::U64Copy_S9r => {
+                words.push(MINI_COPY_SR);
+                words.push(si!(9));
+            }
             // Local-to-local copies (`U64Copy_S{N}s{M}`): both the destination
             // slot N and source slot M are baked into the opcode, so the operands
             // occupy zero bytes. Bit-identical slot move.
-            OpCode::U64Copy_S0s1 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(1)); },
-            OpCode::U64Copy_S0s2 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(2)); },
-            OpCode::U64Copy_S0s3 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(3)); },
-            OpCode::U64Copy_S0s4 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(4)); },
-            OpCode::U64Copy_S0s5 => { words.push(MINI_COPY_SS); words.push(si!(0)); words.push(si!(5)); },
-            OpCode::U64Copy_S1s0 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(0)); },
-            OpCode::U64Copy_S1s2 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(2)); },
-            OpCode::U64Copy_S1s3 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(3)); },
-            OpCode::U64Copy_S1s4 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(4)); },
-            OpCode::U64Copy_S1s5 => { words.push(MINI_COPY_SS); words.push(si!(1)); words.push(si!(5)); },
-            OpCode::U64Copy_S2s0 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(0)); },
-            OpCode::U64Copy_S2s1 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(1)); },
-            OpCode::U64Copy_S2s3 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(3)); },
-            OpCode::U64Copy_S2s4 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(4)); },
-            OpCode::U64Copy_S2s5 => { words.push(MINI_COPY_SS); words.push(si!(2)); words.push(si!(5)); },
-            OpCode::U64Copy_S3s0 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(0)); },
-            OpCode::U64Copy_S3s1 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(1)); },
-            OpCode::U64Copy_S3s2 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(2)); },
-            OpCode::U64Copy_S3s4 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(4)); },
-            OpCode::U64Copy_S3s5 => { words.push(MINI_COPY_SS); words.push(si!(3)); words.push(si!(5)); },
-            OpCode::U64Copy_S4s0 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(0)); },
-            OpCode::U64Copy_S4s1 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(1)); },
-            OpCode::U64Copy_S4s2 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(2)); },
-            OpCode::U64Copy_S4s3 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(3)); },
-            OpCode::U64Copy_S4s5 => { words.push(MINI_COPY_SS); words.push(si!(4)); words.push(si!(5)); },
-            OpCode::U64Copy_S5s0 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(0)); },
-            OpCode::U64Copy_S5s1 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(1)); },
-            OpCode::U64Copy_S5s2 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(2)); },
-            OpCode::U64Copy_S5s3 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(3)); },
-            OpCode::U64Copy_S5s4 => { words.push(MINI_COPY_SS); words.push(si!(5)); words.push(si!(4)); },
+            OpCode::U64Copy_S0s1 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(0));
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S0s2 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(0));
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S0s3 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(0));
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S0s4 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(0));
+                words.push(si!(4));
+            }
+            OpCode::U64Copy_S0s5 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(0));
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S1s0 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(1));
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S1s2 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(1));
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S1s3 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(1));
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S1s4 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(1));
+                words.push(si!(4));
+            }
+            OpCode::U64Copy_S1s5 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(1));
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S2s0 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(2));
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S2s1 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(2));
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S2s3 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(2));
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S2s4 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(2));
+                words.push(si!(4));
+            }
+            OpCode::U64Copy_S2s5 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(2));
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S3s0 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(3));
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S3s1 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(3));
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S3s2 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(3));
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S3s4 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(3));
+                words.push(si!(4));
+            }
+            OpCode::U64Copy_S3s5 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(3));
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S4s0 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(4));
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S4s1 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(4));
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S4s2 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(4));
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S4s3 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(4));
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S4s5 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(4));
+                words.push(si!(5));
+            }
+            OpCode::U64Copy_S5s0 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(5));
+                words.push(si!(0));
+            }
+            OpCode::U64Copy_S5s1 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(5));
+                words.push(si!(1));
+            }
+            OpCode::U64Copy_S5s2 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(5));
+                words.push(si!(2));
+            }
+            OpCode::U64Copy_S5s3 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(5));
+                words.push(si!(3));
+            }
+            OpCode::U64Copy_S5s4 => {
+                words.push(MINI_COPY_SS);
+                words.push(si!(5));
+                words.push(si!(4));
+            }
             // f64 accumulator spills read the f64 accumulator (`freg64`), not the
             // integer one, so they lower to `MINI_COPY_S_FR` (bit-identical move).
-            OpCode::F64Copy_S0r => { words.push(MINI_COPY_S_FR); words.push(si!(0)); },
-            OpCode::F64Copy_S1r => { words.push(MINI_COPY_S_FR); words.push(si!(1)); },
-            OpCode::F64Copy_S2r => { words.push(MINI_COPY_S_FR); words.push(si!(2)); },
-            OpCode::F64Copy_S3r => { words.push(MINI_COPY_S_FR); words.push(si!(3)); },
-            OpCode::F64Copy_S4r => { words.push(MINI_COPY_S_FR); words.push(si!(4)); },
-            OpCode::F64Copy_S5r => { words.push(MINI_COPY_S_FR); words.push(si!(5)); },
-            OpCode::F64Copy_S6r => { words.push(MINI_COPY_S_FR); words.push(si!(6)); },
-            OpCode::F64Copy_S7r => { words.push(MINI_COPY_S_FR); words.push(si!(7)); },
-            OpCode::F64Copy_S8r => { words.push(MINI_COPY_S_FR); words.push(si!(8)); },
-            OpCode::F64Copy_S9r => { words.push(MINI_COPY_S_FR); words.push(si!(9)); },
+            OpCode::F64Copy_S0r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(0));
+            }
+            OpCode::F64Copy_S1r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(1));
+            }
+            OpCode::F64Copy_S2r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(2));
+            }
+            OpCode::F64Copy_S3r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(3));
+            }
+            OpCode::F64Copy_S4r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(4));
+            }
+            OpCode::F64Copy_S5r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(5));
+            }
+            OpCode::F64Copy_S6r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(6));
+            }
+            OpCode::F64Copy_S7r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(7));
+            }
+            OpCode::F64Copy_S8r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(8));
+            }
+            OpCode::F64Copy_S9r => {
+                words.push(MINI_COPY_S_FR);
+                words.push(si!(9));
+            }
             // Generic accumulator spills with an explicit destination slot (used
             // when the slot index exceeds the dedicated `S{0..9}r` opcodes).
             OpCode::U64Copy_Sr => {
@@ -1607,16 +1795,46 @@ pub(crate) fn prepass(
             }
             // f32 accumulator spills read the f32 accumulator (`freg32`), so they
             // lower to `MINI_COPY_S_F32R` (a 32-bit move; the low 32 hold the f32).
-            OpCode::F32Copy_S0r => { words.push(MINI_COPY_S_F32R); words.push(si!(0)); },
-            OpCode::F32Copy_S1r => { words.push(MINI_COPY_S_F32R); words.push(si!(1)); },
-            OpCode::F32Copy_S2r => { words.push(MINI_COPY_S_F32R); words.push(si!(2)); },
-            OpCode::F32Copy_S3r => { words.push(MINI_COPY_S_F32R); words.push(si!(3)); },
-            OpCode::F32Copy_S4r => { words.push(MINI_COPY_S_F32R); words.push(si!(4)); },
-            OpCode::F32Copy_S5r => { words.push(MINI_COPY_S_F32R); words.push(si!(5)); },
-            OpCode::F32Copy_S6r => { words.push(MINI_COPY_S_F32R); words.push(si!(6)); },
-            OpCode::F32Copy_S7r => { words.push(MINI_COPY_S_F32R); words.push(si!(7)); },
-            OpCode::F32Copy_S8r => { words.push(MINI_COPY_S_F32R); words.push(si!(8)); },
-            OpCode::F32Copy_S9r => { words.push(MINI_COPY_S_F32R); words.push(si!(9)); },
+            OpCode::F32Copy_S0r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(0));
+            }
+            OpCode::F32Copy_S1r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(1));
+            }
+            OpCode::F32Copy_S2r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(2));
+            }
+            OpCode::F32Copy_S3r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(3));
+            }
+            OpCode::F32Copy_S4r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(4));
+            }
+            OpCode::F32Copy_S5r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(5));
+            }
+            OpCode::F32Copy_S6r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(6));
+            }
+            OpCode::F32Copy_S7r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(7));
+            }
+            OpCode::F32Copy_S8r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(8));
+            }
+            OpCode::F32Copy_S9r => {
+                words.push(MINI_COPY_S_F32R);
+                words.push(si!(9));
+            }
             OpCode::F32Copy_Sr => {
                 let op = decode::F32Copy_Sr::decode(&mut cursor).ok()?;
                 let dst = s!(op.result);
@@ -2116,11 +2334,7 @@ pub(crate) fn prepass(
             // an i64 word (the residual re-narrows to the op's width).
             OpCode::I32Div_Rss => {
                 let op = decode::I32Div_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I32_DIV_S,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I32_DIV_S, s!(op.lhs), s!(op.rhs));
             }
             OpCode::I32Div_Rrs => {
                 let op = decode::I32Div_Rrs::decode(&mut cursor).ok()?;
@@ -2132,11 +2346,7 @@ pub(crate) fn prepass(
             }
             OpCode::I32Div_Rsi => {
                 let op = decode::I32Div_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_DIV_S,
-                    s!(op.lhs),
-                    i64::from(op.rhs.get())
-                );
+                dr_si!(MINI_I32_DIV_S, s!(op.lhs), i64::from(op.rhs.get()));
             }
             OpCode::I32Div_Rri => {
                 let op = decode::I32Div_Rri::decode(&mut cursor).ok()?;
@@ -2144,11 +2354,7 @@ pub(crate) fn prepass(
             }
             OpCode::I32Div_Ris => {
                 let op = decode::I32Div_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_DIV_S,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_DIV_S, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::I32Div_Rir => {
                 let op = decode::I32Div_Rir::decode(&mut cursor).ok()?;
@@ -2156,11 +2362,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Div_Rss => {
                 let op = decode::U32Div_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I32_DIV_U,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I32_DIV_U, s!(op.lhs), s!(op.rhs));
             }
             OpCode::U32Div_Rrs => {
                 let op = decode::U32Div_Rrs::decode(&mut cursor).ok()?;
@@ -2172,11 +2374,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Div_Rsi => {
                 let op = decode::U32Div_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_DIV_U,
-                    s!(op.lhs),
-                    i64::from(op.rhs.get())
-                );
+                dr_si!(MINI_I32_DIV_U, s!(op.lhs), i64::from(op.rhs.get()));
             }
             OpCode::U32Div_Rri => {
                 let op = decode::U32Div_Rri::decode(&mut cursor).ok()?;
@@ -2184,11 +2382,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Div_Ris => {
                 let op = decode::U32Div_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_DIV_U,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_DIV_U, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::U32Div_Rir => {
                 let op = decode::U32Div_Rir::decode(&mut cursor).ok()?;
@@ -2196,11 +2390,7 @@ pub(crate) fn prepass(
             }
             OpCode::I32Rem_Rss => {
                 let op = decode::I32Rem_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I32_REM_S,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I32_REM_S, s!(op.lhs), s!(op.rhs));
             }
             OpCode::I32Rem_Rrs => {
                 let op = decode::I32Rem_Rrs::decode(&mut cursor).ok()?;
@@ -2212,11 +2402,7 @@ pub(crate) fn prepass(
             }
             OpCode::I32Rem_Rsi => {
                 let op = decode::I32Rem_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_REM_S,
-                    s!(op.lhs),
-                    i64::from(op.rhs.get())
-                );
+                dr_si!(MINI_I32_REM_S, s!(op.lhs), i64::from(op.rhs.get()));
             }
             OpCode::I32Rem_Rri => {
                 let op = decode::I32Rem_Rri::decode(&mut cursor).ok()?;
@@ -2224,11 +2410,7 @@ pub(crate) fn prepass(
             }
             OpCode::I32Rem_Ris => {
                 let op = decode::I32Rem_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_REM_S,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_REM_S, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::I32Rem_Rir => {
                 let op = decode::I32Rem_Rir::decode(&mut cursor).ok()?;
@@ -2236,11 +2418,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Rem_Rss => {
                 let op = decode::U32Rem_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I32_REM_U,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I32_REM_U, s!(op.lhs), s!(op.rhs));
             }
             OpCode::U32Rem_Rrs => {
                 let op = decode::U32Rem_Rrs::decode(&mut cursor).ok()?;
@@ -2252,11 +2430,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Rem_Rsi => {
                 let op = decode::U32Rem_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_REM_U,
-                    s!(op.lhs),
-                    i64::from(op.rhs.get())
-                );
+                dr_si!(MINI_I32_REM_U, s!(op.lhs), i64::from(op.rhs.get()));
             }
             OpCode::U32Rem_Rri => {
                 let op = decode::U32Rem_Rri::decode(&mut cursor).ok()?;
@@ -2264,11 +2438,7 @@ pub(crate) fn prepass(
             }
             OpCode::U32Rem_Ris => {
                 let op = decode::U32Rem_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_REM_U,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_REM_U, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::U32Rem_Rir => {
                 let op = decode::U32Rem_Rir::decode(&mut cursor).ok()?;
@@ -2276,11 +2446,7 @@ pub(crate) fn prepass(
             }
             OpCode::I64Div_Rss => {
                 let op = decode::I64Div_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I64_DIV_S,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I64_DIV_S, s!(op.lhs), s!(op.rhs));
             }
             OpCode::I64Div_Rrs => {
                 let op = decode::I64Div_Rrs::decode(&mut cursor).ok()?;
@@ -2308,11 +2474,7 @@ pub(crate) fn prepass(
             }
             OpCode::U64Div_Rss => {
                 let op = decode::U64Div_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I64_DIV_U,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I64_DIV_U, s!(op.lhs), s!(op.rhs));
             }
             OpCode::U64Div_Rrs => {
                 let op = decode::U64Div_Rrs::decode(&mut cursor).ok()?;
@@ -2324,11 +2486,7 @@ pub(crate) fn prepass(
             }
             OpCode::U64Div_Rsi => {
                 let op = decode::U64Div_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I64_DIV_U,
-                    s!(op.lhs),
-                    op.rhs.get() as i64
-                );
+                dr_si!(MINI_I64_DIV_U, s!(op.lhs), op.rhs.get() as i64);
             }
             OpCode::U64Div_Rri => {
                 let op = decode::U64Div_Rri::decode(&mut cursor).ok()?;
@@ -2344,11 +2502,7 @@ pub(crate) fn prepass(
             }
             OpCode::I64Rem_Rss => {
                 let op = decode::I64Rem_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I64_REM_S,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I64_REM_S, s!(op.lhs), s!(op.rhs));
             }
             OpCode::I64Rem_Rrs => {
                 let op = decode::I64Rem_Rrs::decode(&mut cursor).ok()?;
@@ -2376,11 +2530,7 @@ pub(crate) fn prepass(
             }
             OpCode::U64Rem_Rss => {
                 let op = decode::U64Rem_Rss::decode(&mut cursor).ok()?;
-                dr_ss!(
-                    MINI_I64_REM_U,
-                    s!(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_ss!(MINI_I64_REM_U, s!(op.lhs), s!(op.rhs));
             }
             OpCode::U64Rem_Rrs => {
                 let op = decode::U64Rem_Rrs::decode(&mut cursor).ok()?;
@@ -2392,11 +2542,7 @@ pub(crate) fn prepass(
             }
             OpCode::U64Rem_Rsi => {
                 let op = decode::U64Rem_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I64_REM_U,
-                    s!(op.lhs),
-                    op.rhs.get() as i64
-                );
+                dr_si!(MINI_I64_REM_U, s!(op.lhs), op.rhs.get() as i64);
             }
             OpCode::U64Rem_Rri => {
                 let op = decode::U64Rem_Rri::decode(&mut cursor).ok()?;
@@ -2440,75 +2586,39 @@ pub(crate) fn prepass(
             }
             OpCode::I32Eq_Rsi => {
                 let op = decode::I32Eq_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_EQ_SS_R,
-                    s!(op.lhs),
-                    i64::from(op.rhs)
-                );
+                dr_si!(MINI_I32_EQ_SS_R, s!(op.lhs), i64::from(op.rhs));
             }
             OpCode::I32NotEq_Rsi => {
                 let op = decode::I32NotEq_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_NE_SS_R,
-                    s!(op.lhs),
-                    i64::from(op.rhs)
-                );
+                dr_si!(MINI_I32_NE_SS_R, s!(op.lhs), i64::from(op.rhs));
             }
             OpCode::I32Le_Rsi => {
                 let op = decode::I32Le_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_I32_LE_SS_R,
-                    s!(op.lhs),
-                    i64::from(op.rhs)
-                );
+                dr_si!(MINI_I32_LE_SS_R, s!(op.lhs), i64::from(op.rhs));
             }
             OpCode::U32Lt_Rsi => {
                 let op = decode::U32Lt_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_U32_LT_SS_R,
-                    s!(op.lhs),
-                    i64::from(op.rhs)
-                );
+                dr_si!(MINI_U32_LT_SS_R, s!(op.lhs), i64::from(op.rhs));
             }
             OpCode::U32Le_Rsi => {
                 let op = decode::U32Le_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_U32_LE_SS_R,
-                    s!(op.lhs),
-                    i64::from(op.rhs)
-                );
+                dr_si!(MINI_U32_LE_SS_R, s!(op.lhs), i64::from(op.rhs));
             }
             OpCode::I32Lt_Ris => {
                 let op = decode::I32Lt_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_LT_SS_R,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_LT_SS_R, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::I32Le_Ris => {
                 let op = decode::I32Le_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_I32_LE_SS_R,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_I32_LE_SS_R, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::U32Lt_Ris => {
                 let op = decode::U32Lt_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_U32_LT_SS_R,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_U32_LT_SS_R, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::U32Le_Ris => {
                 let op = decode::U32Le_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_U32_LE_SS_R,
-                    i64::from(op.lhs),
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_U32_LE_SS_R, i64::from(op.lhs), s!(op.rhs));
             }
             OpCode::I64Eq_Rsi => {
                 let op = decode::I64Eq_Rsi::decode(&mut cursor).ok()?;
@@ -2524,19 +2634,11 @@ pub(crate) fn prepass(
             }
             OpCode::U64Lt_Rsi => {
                 let op = decode::U64Lt_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_U64_LT_SS_R,
-                    s!(op.lhs),
-                    op.rhs as i64
-                );
+                dr_si!(MINI_U64_LT_SS_R, s!(op.lhs), op.rhs as i64);
             }
             OpCode::U64Le_Rsi => {
                 let op = decode::U64Le_Rsi::decode(&mut cursor).ok()?;
-                dr_si!(
-                    MINI_U64_LE_SS_R,
-                    s!(op.lhs),
-                    op.rhs as i64
-                );
+                dr_si!(MINI_U64_LE_SS_R, s!(op.lhs), op.rhs as i64);
             }
             OpCode::I64Le_Ris => {
                 let op = decode::I64Le_Ris::decode(&mut cursor).ok()?;
@@ -2544,19 +2646,11 @@ pub(crate) fn prepass(
             }
             OpCode::U64Lt_Ris => {
                 let op = decode::U64Lt_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_U64_LT_SS_R,
-                    op.lhs as i64,
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_U64_LT_SS_R, op.lhs as i64, s!(op.rhs));
             }
             OpCode::U64Le_Ris => {
                 let op = decode::U64Le_Ris::decode(&mut cursor).ok()?;
-                dr_is!(
-                    MINI_U64_LE_SS_R,
-                    op.lhs as i64,
-                    s!(op.rhs)
-                );
+                dr_is!(MINI_U64_LE_SS_R, op.lhs as i64, s!(op.rhs));
             }
             OpCode::I32Lt_Rrs => {
                 // i32.lt_s with the left operand in the accumulator, right in a slot.
@@ -4436,8 +4530,12 @@ pub(crate) fn prepass(
                 let params_len = i64::from(op.params.len());
                 let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[
-                    MINI_CALL_INDIRECT, table, func_type, index_slot,
-                    params_start, params_len,
+                    MINI_CALL_INDIRECT,
+                    table,
+                    func_type,
+                    index_slot,
+                    params_start,
+                    params_len,
                 ]);
                 has_yield_or_bail = true;
             }
@@ -4769,8 +4867,12 @@ pub(crate) fn prepass(
                 let params_start = s_contig!(op.params.span().head(), op.params.len());
                 words.extend_from_slice(&[MINI_COPY_SR, scratch_base]);
                 words.extend_from_slice(&[
-                    MINI_CALL_INDIRECT, table, func_type, scratch_base,
-                    params_start, params_len,
+                    MINI_CALL_INDIRECT,
+                    table,
+                    func_type,
+                    scratch_base,
+                    params_start,
+                    params_len,
                 ]);
                 has_yield_or_bail = true;
             }
@@ -4886,12 +4988,7 @@ pub(crate) fn prepass(
                 let func_idx = u32::from(op.func) as i64;
                 let params_len = i64::from(op.params.len());
                 let params_start = s_contig!(op.params.span().head(), op.params.len());
-                words.extend_from_slice(&[
-                    MINI_CALL_IMPORTED,
-                    func_idx,
-                    params_start,
-                    params_len,
-                ]);
+                words.extend_from_slice(&[MINI_CALL_IMPORTED, func_idx, params_start, params_len]);
                 has_yield_or_bail = true;
             }
             OpCode::MemoryCopy => {
@@ -5084,7 +5181,8 @@ pub(crate) fn prepass(
     // Scan the loop body (pre-sentinel-replacement) for referenced original
     // slot indices. Words in the sentinel range [SLOT_SENTINEL, SLOT_SENTINEL
     // + max_slot_seen] are original-slot references.
-    let loop_used_originals: alloc::collections::BTreeSet<i64> = if let Some(lhw) = loop_header_word {
+    let loop_used_originals: alloc::collections::BTreeSet<i64> = if let Some(lhw) = loop_header_word
+    {
         let mut used = alloc::collections::BTreeSet::new();
         let mut wi = lhw;
         while wi < words.len() {
@@ -5093,7 +5191,11 @@ pub(crate) fn prepass(
             let op = words[wi];
             // During emission, opcodes are small positive integers (0-170).
             // Sentinel-tagged values are large negatives. Skip non-opcode words.
-            let width = if op >= 0 && op <= 258 { mini_op_width(op) } else { 1 };
+            let width = if op >= 0 && op <= 258 {
+                mini_op_width(op)
+            } else {
+                1
+            };
             for oi in 1..width {
                 if wi + oi < words.len() {
                     let v = words[wi + oi];
@@ -7673,10 +7775,7 @@ mod tests {
                 "must lower op {ss} or {rs}"
             );
         }
-        assert!(
-            mp.words.contains(&MINI_BR_I32_LE_SS),
-            "must lower branch"
-        );
+        assert!(mp.words.contains(&MINI_BR_I32_LE_SS), "must lower branch");
     }
 
     /// A loop summing an i32 array out of linear memory (sign-extending each
