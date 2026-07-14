@@ -1,22 +1,40 @@
 use super::{ControlFrame, ControlFrameKind, FuncTranslator, LocalIdx};
 use crate::{
-    Error, F32, F64, FuncType, Mutability, RefType, TrapCode, ValType,
+    Error,
+    F32,
+    F64,
+    FuncType,
+    Mutability,
+    RefType,
+    TrapCode,
+    ValType,
     core::{FuelCostsProvider, IndexType, RawRef, RawVal, TypedRawRef, TypedRawVal, wasm},
     engine::{
         BlockType,
         translator::{
             comparator::UpdateBranchOffset,
             func::{
-                ControlFrameBase, LocalSetCodegen, Operand, op,
+                ControlFrameBase,
+                LocalSetCodegen,
+                Operand,
+                op,
                 stack::{
-                    AcquiredTarget, Allocation, IfReachability, Location, RegKind, ResolvedOperand,
+                    AcquiredTarget,
+                    Allocation,
+                    IfReachability,
+                    Location,
+                    RegKind,
+                    ResolvedOperand,
                 },
             },
         },
     },
     ir::{self, Op, index},
     module::{
-        self, MemoryIdx, TableIdx, WasmiValueType,
+        self,
+        MemoryIdx,
+        TableIdx,
+        WasmiValueType,
         init_expr::{EmptyEvalContext, Eval},
     },
 };

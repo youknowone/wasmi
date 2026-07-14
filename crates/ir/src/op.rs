@@ -3,8 +3,17 @@ use crate::core::V128;
 #[cfg(feature = "simd")]
 use crate::core::simd::ImmLaneIdx;
 use crate::{
-    Address, BlockFuel, BoundedSlotSpan, BranchOffset, FixedSlotSpan, Local, Offset, Offset16, Reg,
-    Slot, SlotAndReg,
+    Address,
+    BlockFuel,
+    BoundedSlotSpan,
+    BranchOffset,
+    FixedSlotSpan,
+    Local,
+    Offset,
+    Offset16,
+    Reg,
+    Slot,
+    SlotAndReg,
     core::{ShiftAmount, TrapCode, ValType},
     index::{Data, Elem, Func, FuncType, Global, InternalFunc, Memory, Table},
 };

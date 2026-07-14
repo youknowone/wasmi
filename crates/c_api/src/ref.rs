@@ -1,6 +1,13 @@
 use crate::{
-    wasm_extern_t, wasm_foreign_t, wasm_func_t, wasm_global_t, wasm_instance_t, wasm_memory_t,
-    wasm_module_t, wasm_table_t, wasm_trap_t,
+    wasm_extern_t,
+    wasm_foreign_t,
+    wasm_func_t,
+    wasm_global_t,
+    wasm_instance_t,
+    wasm_memory_t,
+    wasm_module_t,
+    wasm_table_t,
+    wasm_trap_t,
 };
 use alloc::boxed::Box;
 use core::{ffi::c_void, ptr, unimplemented};

@@ -1,7 +1,8 @@
 use crate::{
     V128,
     core::{
-        ShiftAmount, simd,
+        ShiftAmount,
+        simd,
         simd::{ImmLaneIdx2, ImmLaneIdx4, ImmLaneIdx8, ImmLaneIdx16},
     },
     engine::executor::handler::{

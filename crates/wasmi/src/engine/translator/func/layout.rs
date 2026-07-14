@@ -1,6 +1,7 @@
 use super::{LocalIdx, Reset};
 use crate::{
-    Error, ValType,
+    Error,
+    ValType,
     engine::{
         TranslationError,
         translator::{func::LocalOperand, utils::required_cells_for_ty},

@@ -1,7 +1,8 @@
 //! Defines the entire Wasm `simd` proposal API.
 
 use crate::{
-    TrapCode, V128,
+    TrapCode,
+    V128,
     memory::{self, ExtendInto},
     simd,
     value::Float,

@@ -1,5 +1,6 @@
 use crate::{
-    FuncType, RawHandle,
+    FuncType,
+    RawHandle,
     collections::arena::{ArenaKey, DedupArena},
     engine::{EngineId, EngineOwned},
 };

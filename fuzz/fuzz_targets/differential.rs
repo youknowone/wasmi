@@ -4,10 +4,17 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use wasmi::ValType;
 use wasmi_fuzz::{
-    FuzzError, FuzzModule, FuzzVal, FuzzValType,
+    FuzzError,
+    FuzzModule,
+    FuzzVal,
+    FuzzValType,
     config::FuzzSmithConfig,
     oracle::{
-        ChosenOracle, DifferentialOracle, DifferentialOracleMeta, ModuleExports, WasmiOracle,
+        ChosenOracle,
+        DifferentialOracle,
+        DifferentialOracleMeta,
+        ModuleExports,
+        WasmiOracle,
     },
 };
 

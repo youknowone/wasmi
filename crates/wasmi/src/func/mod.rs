@@ -12,11 +12,16 @@ pub use self::{
     typed_func::{TypedFunc, WasmParams, WasmResults},
 };
 use super::{
-    AsContext, AsContextMut, Instance, StoreContext,
+    AsContext,
+    AsContextMut,
+    Instance,
+    StoreContext,
     engine::{DedupFuncType, EngineFunc},
 };
 use crate::{
-    Engine, Error, Val,
+    Engine,
+    Error,
+    Val,
     engine::{InOutParams, InOutResults, Inst, ResumableCall, required_cells_for_tys},
     store::Stored,
 };

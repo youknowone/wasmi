@@ -1,6 +1,10 @@
 use super::Func;
 use crate::{
-    AsContext, AsContextMut, Engine, Error, Val,
+    AsContext,
+    AsContextMut,
+    Engine,
+    Error,
+    Val,
     engine::{LiftFromCellsByValue, LoadByVal, Stack},
     func::FuncError,
     ir::SlotSpan,

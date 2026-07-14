@@ -1,9 +1,18 @@
 use crate::{
-    FuzzError, FuzzVal,
+    FuzzError,
+    FuzzVal,
     oracle::{DifferentialOracle, DifferentialOracleMeta},
 };
 use wasmtime::{
-    Config, Engine, Instance, Linker, Module, Store, StoreLimitsBuilder, V128, Val,
+    Config,
+    Engine,
+    Instance,
+    Linker,
+    Module,
+    Store,
+    StoreLimitsBuilder,
+    V128,
+    Val,
     WasmBacktraceDetails,
 };
 

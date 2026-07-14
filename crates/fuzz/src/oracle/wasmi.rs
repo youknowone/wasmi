@@ -1,9 +1,21 @@
 use crate::{
-    FuzzError, FuzzSmithConfig, FuzzVal, FuzzValType,
+    FuzzError,
+    FuzzSmithConfig,
+    FuzzVal,
+    FuzzValType,
     oracle::{DifferentialOracle, DifferentialOracleMeta},
 };
 use wasmi::{
-    Config, Engine, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Val, ValType,
+    Config,
+    Engine,
+    Instance,
+    Linker,
+    Module,
+    Store,
+    StoreLimits,
+    StoreLimitsBuilder,
+    Val,
+    ValType,
 };
 
 use super::ModuleExports;

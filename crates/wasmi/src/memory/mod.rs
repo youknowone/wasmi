@@ -6,8 +6,14 @@ pub use self::{
     ty::{MemoryType, MemoryTypeBuilder},
 };
 use crate::{
-    AsContext, AsContextMut, Error, StoreContext, StoreContextMut, core::CoreMemory,
-    errors::MemoryError, store::Stored,
+    AsContext,
+    AsContextMut,
+    Error,
+    StoreContext,
+    StoreContextMut,
+    core::CoreMemory,
+    errors::MemoryError,
+    store::Stored,
 };
 
 define_handle! {

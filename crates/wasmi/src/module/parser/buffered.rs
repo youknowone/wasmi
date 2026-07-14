@@ -1,5 +1,9 @@
 use super::{
-    CustomSectionsBuilder, ModuleBuilder, ModuleHeader, ModuleHeaderBuilder, ModuleParser,
+    CustomSectionsBuilder,
+    ModuleBuilder,
+    ModuleHeader,
+    ModuleHeaderBuilder,
+    ModuleParser,
 };
 use crate::{Error, Module};
 #[cfg(feature = "validate")]

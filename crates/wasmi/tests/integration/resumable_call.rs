@@ -2,9 +2,26 @@
 
 use core::slice;
 use wasmi::{
-    AsContext, AsContextMut, Caller, Config, Engine, Error, Extern, Func, Linker, Module,
-    ResumableCall, ResumableCallHostTrap, Store, TrapCode, TypedFunc, TypedResumableCall,
-    TypedResumableCallHostTrap, Val, ValType, errors::ErrorKind,
+    AsContext,
+    AsContextMut,
+    Caller,
+    Config,
+    Engine,
+    Error,
+    Extern,
+    Func,
+    Linker,
+    Module,
+    ResumableCall,
+    ResumableCallHostTrap,
+    Store,
+    TrapCode,
+    TypedFunc,
+    TypedResumableCall,
+    TypedResumableCallHostTrap,
+    Val,
+    ValType,
+    errors::ErrorKind,
 };
 
 fn test_setup(remaining: u32) -> (Store<TestData>, Linker<TestData>) {

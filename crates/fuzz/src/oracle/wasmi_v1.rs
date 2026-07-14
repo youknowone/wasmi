@@ -1,10 +1,25 @@
 use crate::{
-    FuzzError, FuzzSmithConfig, FuzzVal,
+    FuzzError,
+    FuzzSmithConfig,
+    FuzzVal,
     oracle::{DifferentialOracle, DifferentialOracleMeta},
 };
 use wasmi_v1::{
-    Config, Engine, Error, ExternRef, Func, Instance, Linker, Module, Ref, Store, StoreLimits,
-    StoreLimitsBuilder, TrapCode, V128, Val,
+    Config,
+    Engine,
+    Error,
+    ExternRef,
+    Func,
+    Instance,
+    Linker,
+    Module,
+    Ref,
+    Store,
+    StoreLimits,
+    StoreLimitsBuilder,
+    TrapCode,
+    V128,
+    Val,
 };
 
 /// Differential fuzzing backend for the register-machine Wasmi v0.48.0.

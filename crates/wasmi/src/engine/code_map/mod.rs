@@ -14,7 +14,9 @@ use self::utils::SmallByteSlice;
 use super::ValidatingFuncTranslator;
 use super::{FuncToValidate, FuncTranslationDriver, FuncTranslator, TranslationError};
 use crate::{
-    Config, Error, TrapCode,
+    Config,
+    Error,
+    TrapCode,
     core::{Fuel, FuelCostsProvider, hint},
     engine::{ResumableOutOfFuelError, utils::unreachable_unchecked},
     errors::FuelError,
@@ -23,7 +25,8 @@ use crate::{
 use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
-    fmt, iter,
+    fmt,
+    iter,
     mem::{ManuallyDrop, MaybeUninit},
     pin::Pin,
     ptr::{self, NonNull},

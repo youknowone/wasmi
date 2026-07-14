@@ -3,7 +3,11 @@
 use assert_matches::assert_matches;
 use core::slice;
 use wasmi::{
-    Engine, Func, FuncType, Store, Val,
+    Engine,
+    Func,
+    FuncType,
+    Store,
+    Val,
     errors::{ErrorKind, FuncError},
 };
 use wasmi_core::{F32, F64, ValType};

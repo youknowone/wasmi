@@ -1,5 +1,7 @@
 use crate::{
-    Engine, FuncType, ValType,
+    Engine,
+    FuncType,
+    ValType,
     engine::DedupFuncType,
     module::{FuncTypeIdx, ModuleHeader, utils::WasmiValueType},
 };

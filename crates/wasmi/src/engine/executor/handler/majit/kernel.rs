@@ -4357,10 +4357,16 @@ pub(crate) fn run_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::executor::handler::majit::prepass::{
-        MINI_SLOTS_TRUNCATE, MiniProgram, NUM_SCRATCH, prepass,
+    use crate::{
+        Engine,
+        Module,
+        engine::executor::handler::majit::prepass::{
+            MINI_SLOTS_TRUNCATE,
+            MiniProgram,
+            NUM_SCRATCH,
+            prepass,
+        },
     };
-    use crate::{Engine, Module};
 
     /// Serializes tests that run the kernel and read the global
     /// [`KERNEL_COMPILES`] / [`KERNEL_GUARD_FAILS`] evidence counters: a kernel

@@ -15,7 +15,12 @@ pub use self::{
     pruned::PrunedStore,
 };
 use crate::{
-    Engine, Error, Handle, Memory, RawHandle, ResourceLimiter,
+    Engine,
+    Error,
+    Handle,
+    Memory,
+    RawHandle,
+    ResourceLimiter,
     collections::arena::{Arena, ArenaError},
     core::{CoreMemory, ResourceLimiterRef},
     engine::{InOutParams, Inst},

@@ -1,5 +1,12 @@
 use crate::{
-    ExternRef, F32, F64, Func, Nullable, Ref, V128, Val,
+    ExternRef,
+    F32,
+    F64,
+    Func,
+    Nullable,
+    Ref,
+    V128,
+    Val,
     core::{RawRef, ShiftAmount},
     handle::Handle,
     store::AsStoreId,
