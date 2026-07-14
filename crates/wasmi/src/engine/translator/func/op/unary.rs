@@ -1,7 +1,6 @@
 use super::IntoResult as _;
 use crate::{
-    TrapCode,
-    ValType,
+    TrapCode, ValType,
     core::{Typed, TypedRawVal, wasm},
     ir::{Op, Slot},
 };

@@ -21,10 +21,7 @@
 // The `#[jit_interp]`-generated code names `Box`/`Vec`/`eprintln!`/`ToString`
 // unqualified; this `#![no_std]` crate must bring them into scope (`majit-jit`
 // always implies `std`).
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::eprintln;
 
@@ -1462,12 +1459,15 @@ fn wasm_mainloop(
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let (init_mem_base, init_mem_len) = MEM_CTX.with(|c| c.get());
-    let init_mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2i64 } else { 0i64 })
-        | (if MEM_DID_STORE.with(|d| d.get()) {
-            1i64
-        } else {
-            0i64
-        });
+    let init_mem_trap_did = (if MEM_TRAP.with(|t| t.get()) {
+        2i64
+    } else {
+        0i64
+    }) | (if MEM_DID_STORE.with(|d| d.get()) {
+        1i64
+    } else {
+        0i64
+    });
     let mut state = WasmKernelState {
         slots: init_slots.to_vec(),
         accum0: 0i64,
@@ -2644,7 +2644,11 @@ fn wasm_mainloop(
                 // Read back: the callee restored our pre-call TLS, and
                 // the call itself may have set MEM_TRAP on error.
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2671,7 +2675,11 @@ fn wasm_mainloop(
                 sync_trap_to_tls(state.mem_trap_did);
                 let result = call_imported_residual(func_index, n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2701,7 +2709,11 @@ fn wasm_mainloop(
                 sync_trap_to_tls(state.mem_trap_did);
                 let result = call_indirect_residual(table, func_type, runtime_index, n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 6;
@@ -2750,7 +2762,11 @@ fn wasm_mainloop(
                     state.mem_len,
                 );
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 pc += 4;
             }
             MINI_SLOTS_TRUNCATE => {
@@ -3153,7 +3169,11 @@ fn wasm_mainloop(
                 // The index comes from scratch0 instead of a slot
                 let result = call_indirect_residual(table, func_type, scratch0_get(), n as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 });
+                    | (if MEM_DID_STORE.with(|d| d.get()) {
+                        1
+                    } else {
+                        0
+                    });
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 5;
@@ -3216,13 +3236,8 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let imm = program[pc + 2];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i32_sf(
-                    ea,
-                    imm,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                state.mem_trap_did =
+                    mem_store_i32_sf(ea, imm, state.mem_base, state.mem_len, state.mem_trap_did);
                 pc += 3;
             }
             MINI_I32_STORE_SCRATCH0_S => {
@@ -3242,13 +3257,8 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let imm = program[pc + 2];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    imm,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                state.mem_trap_did =
+                    mem_store_i64_sf(ea, imm, state.mem_base, state.mem_len, state.mem_trap_did);
                 pc += 3;
             }
             // Comparison ops with scratch0
@@ -4095,8 +4105,10 @@ pub(crate) fn run_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::executor::handler::majit::prepass::{MiniProgram, NUM_SCRATCH, prepass};
-    use crate::{Engine, Module};
+    use crate::{
+        Engine, Module,
+        engine::executor::handler::majit::prepass::{MiniProgram, NUM_SCRATCH, prepass},
+    };
 
     /// Serializes tests that run the kernel and read the global
     /// [`KERNEL_COMPILES`] / [`KERNEL_GUARD_FAILS`] evidence counters: a kernel

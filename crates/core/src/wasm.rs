@@ -1,13 +1,7 @@
 //! Execution helpers for Wasm or Wasmi instructions.
 
 use crate::{
-    Float,
-    Integer,
-    SignExtendFrom,
-    TrapCode,
-    TruncateSaturateInto,
-    TryTruncateInto,
-    memory,
+    Float, Integer, SignExtendFrom, TrapCode, TruncateSaturateInto, TryTruncateInto, memory,
     value::{demote_f64, promote_f32},
 };
 

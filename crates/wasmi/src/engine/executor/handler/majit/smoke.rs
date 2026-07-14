@@ -20,10 +20,7 @@
 // The `#[jit_interp]`-generated code names `Box`/`Vec`/`eprintln!`/`ToString`
 // unqualified, which are in the prelude for the std example crates but not in
 // this `#![no_std]` crate. `majit-jit` always implies `std`.
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::eprintln;
 

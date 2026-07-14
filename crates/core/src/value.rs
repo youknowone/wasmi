@@ -1,6 +1,5 @@
 use crate::{
-    RefType,
-    TrapCode,
+    RefType, TrapCode,
     hint::{likely, unlikely},
 };
 use core::ops::Neg;

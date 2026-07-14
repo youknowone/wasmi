@@ -40,7 +40,13 @@ pub struct WasmFuncCall<'a, T, State> {
     /// decision, and `slot_map` maps dense slot indices to original frame slots.
     /// `None` -> stock executor (ineligible or majit disabled).
     #[cfg(feature = "majit-jit")]
-    majit: Option<(usize, usize, bool, super::majit::kernel::TierAction, alloc::vec::Vec<u16>)>,
+    majit: Option<(
+        usize,
+        usize,
+        bool,
+        super::majit::kernel::TierAction,
+        alloc::vec::Vec<u16>,
+    )>,
 }
 
 impl<'a, T, State> WasmFuncCall<'a, T, State> {
@@ -400,7 +406,13 @@ pub fn init_wasm_func_call<'a, T>(
     #[cfg(feature = "majit-jit")]
     let majit = super::majit::kernel::ensure_cached(ops, len_local_slots, len_stack_slots).map(
         |(num_slots, writes_result, action, slot_map)| {
-            (ops.as_ptr() as usize, num_slots, writes_result, action, slot_map)
+            (
+                ops.as_ptr() as usize,
+                num_slots,
+                writes_result,
+                action,
+                slot_map,
+            )
         },
     );
     // Note: using a length of 0 for `callee_params` simply has the effect that all frame
@@ -692,8 +704,7 @@ fn call_imported_runner_fn(data: *mut (), func_index: u32, params: &[i64]) -> i6
     // all borrows before run_resolved_func (which re-borrows via `data`).
     let (func_handle, instance) = {
         let ctx = unsafe { &*(data as *const CallRunnerCtx) };
-        let func =
-            utils::fetch_func(ctx.instance, crate::ir::index::Func::from(func_index));
+        let func = utils::fetch_func(ctx.instance, crate::ir::index::Func::from(func_index));
         (func, ctx.instance)
     };
     // All borrows dropped — run_resolved_func can safely re-borrow via data.
@@ -772,8 +783,10 @@ fn resolve_indirect(
     };
 
     // Type check.
-    let expected_fnty =
-        utils::fetch_func_type(ctx.instance, crate::ir::index::FuncType::from(func_type_idx));
+    let expected_fnty = utils::fetch_func_type(
+        ctx.instance,
+        crate::ir::index::FuncType::from(func_type_idx),
+    );
     let actual_fnty = utils::resolve_func(store, &func).ty_dedup();
     if expected_fnty.ne(actual_fnty) {
         super::majit::kernel::set_residual_trap(crate::TrapCode::BadSignature);
@@ -801,8 +814,7 @@ fn run_resolved_func(data: *mut (), func: Func, params: &[i64]) -> i64 {
             FuncEntity::Wasm(wasm_func) => {
                 let func_body = wasm_func.func_body();
                 let callee_instance = *wasm_func.instance();
-                let callee_inst: Inst =
-                    resolve_instance(store, &callee_instance).into();
+                let callee_inst: Inst = resolve_instance(store, &callee_instance).into();
                 Resolved::Wasm(func_body, callee_inst)
             }
             FuncEntity::Host(host_func) => Resolved::Host(*host_func),
@@ -833,10 +845,8 @@ fn run_resolved_func(data: *mut (), func: Func, params: &[i64]) -> i64 {
             // the pointer is stable (no resize after allocation).
             let func_entry = unsafe { &*func_entry_ptr };
             let compiled = match func_entry
-                .get_or_compile(
-                    Some(store.inner_mut().fuel_mut()),
-                    ctx.code.features(),
-                ) {
+                .get_or_compile(Some(store.inner_mut().fuel_mut()), ctx.code.features())
+            {
                 Ok(c) => c,
                 Err(_) => {
                     super::majit::kernel::set_residual_trap(
@@ -874,8 +884,15 @@ fn run_resolved_func(data: *mut (), func: Func, params: &[i64]) -> i64 {
             let (ireg, freg32, freg64) = ctx.callee_stack.regs();
             let mut vm = VmState::new(store, &mut ctx.callee_stack, ctx.code);
             match execute_until_done(
-                &mut vm, callee_ip, callee_sp, mem0, mem0_len, callee_inst,
-                ireg, freg32, freg64,
+                &mut vm,
+                callee_ip,
+                callee_sp,
+                mem0,
+                mem0_len,
+                callee_inst,
+                ireg,
+                freg32,
+                freg64,
             ) {
                 Ok(sp) => unsafe { sp.get::<i64>(Slot::from(0)) },
                 Err(_) => {

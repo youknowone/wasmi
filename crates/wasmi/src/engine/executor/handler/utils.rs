@@ -2,22 +2,12 @@ use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState
 #[cfg(feature = "simd")]
 use crate::core::simd::ImmLaneIdx;
 use crate::{
-    Error,
-    Func,
-    Global,
-    Instance,
-    Memory,
-    Nullable,
-    RefType,
-    Table,
-    TrapCode,
-    V128,
+    Error, Func, Global, Instance, Memory, Nullable, RefType, Table, TrapCode, V128,
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, RawVal, ShiftAmount},
     engine::{
         DedupFuncType, EngineFunc, FuncEntry,
         executor::{
-            LoadFromCellsByValue,
-            StoreToCells,
+            LoadFromCellsByValue, StoreToCells,
             handler::{Break, Control, DoneReason, args::Args},
         },
         utils::unreachable_unchecked,
@@ -25,16 +15,7 @@ use crate::{
     func::{FuncEntity, HostFuncEntity},
     instance::InstanceEntity,
     ir::{
-        self,
-        Address,
-        BoundedSlotSpan,
-        Local,
-        Offset,
-        Offset16,
-        Slot,
-        SlotAndReg,
-        SlotSpan,
-        index,
+        self, Address, BoundedSlotSpan, Local, Offset, Offset16, Slot, SlotAndReg, SlotSpan, index,
     },
     memory::{DataSegment, DataSegmentEntity},
     store::{CallHooks, PrunedStore, StoreError, StoreInner},

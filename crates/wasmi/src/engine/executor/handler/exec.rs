@@ -19,8 +19,7 @@ use crate::{
     TrapCode,
     core::{CoreTable, RawRef, ReadAs, WriteAs, wasm},
     engine::{
-        FuncEntry,
-        eval,
+        FuncEntry, eval,
         executor::handler::{
             Control,
             dispatch::Break,
