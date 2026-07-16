@@ -1016,6 +1016,15 @@ extern "C" fn sync_trap_to_tls(trap_did: i64) {
     }
 }
 
+/// Combined trap/did-store readback from TLS: (MEM_TRAP?2:0)|(MEM_DID_STORE?1:0).
+/// dont_look_inside so the compiled trace keeps it as a real effectful residual
+/// read after the preceding call, never CSE'd away.
+#[majit_macros::dont_look_inside]
+extern "C" fn read_trap_from_tls() -> i64 {
+    (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
+        | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 })
+}
+
 /// Residual f64 arithmetic, `sel`-dispatched: 0=add, 1=sub, 2=mul, 3=div. Both
 /// operands and the result are i64 bit-patterns (the slots hold f64 values as
 /// their raw bits). The bit-casts live inside this `#[dont_look_inside]` helper,
@@ -1490,6 +1499,7 @@ fn yield_set_slots(slots: Vec<i64>) {
         global_get => residual_int,
         global_set => residual_void_cannot_raise,
         call_stage_param => residual_void_cannot_raise,
+        read_trap_from_tls => residual_int_cannot_raise,
         call_internal_residual => residual_int,
         call_imported_residual => residual_int,
         call_indirect_residual => residual_int,
@@ -2706,12 +2716,7 @@ fn wasm_mainloop(
                 let result = call_internal_residual(func_addr, params_len as i64);
                 // Read back: the callee restored our pre-call TLS, and
                 // the call itself may have set MEM_TRAP on error.
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2730,12 +2735,7 @@ fn wasm_mainloop(
                 }
                 sync_trap_to_tls(state.mem_trap_did);
                 let result = call_imported_residual(func_index, params_len as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2758,12 +2758,7 @@ fn wasm_mainloop(
                 sync_trap_to_tls(state.mem_trap_did);
                 let result =
                     call_indirect_residual(table, func_type, runtime_index, params_len as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 6;
@@ -2824,12 +2819,7 @@ fn wasm_mainloop(
                     state.mem_base,
                     state.mem_len,
                 );
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 pc += 4;
             }
             MINI_SLOTS_TRUNCATE => {
@@ -3246,12 +3236,7 @@ fn wasm_mainloop(
                 // The index comes from scratch0 instead of a slot
                 let result =
                     call_indirect_residual(table, func_type, scratch0_get(), params_len as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 5;
@@ -11095,6 +11080,180 @@ mod tests {
             let got = sum_doubled.call(&mut store, n).expect("call");
             assert_eq!(got, expected, "sum_doubled({n}) must be {expected}");
         }
+    }
+
+    #[test]
+    fn end_to_end_residual_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (func $leaf (param $a i64) (param $b i64) (result i64)
+                    (i64.add (i64.mul (local.get $a) (i64.const 3)) (local.get $b)))
+                (func $zero (result i64) (i64.const 7))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (call $leaf (local.get $i) (local.get $acc)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+                (func (export "run0") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (i64.add (local.get $acc) (call $zero)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        // acc_{k+1}=3*i+acc_k => acc_n = 3*n*(n-1)/2
+        for n in [0i64, 1, 2, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                3 * n * (n - 1) / 2,
+                "run({n})"
+            );
+        }
+        let run0 = instance
+            .get_typed_func::<i64, i64>(&store, "run0")
+            .expect("run0");
+        assert_eq!(
+            run0.call(&mut store, 1000).expect("call run0"),
+            7000,
+            "run0(1000)"
+        );
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop containing MINI_CALL_RESIDUAL must compile (got {compiles})"
+        );
+    }
+
+    #[test]
+    fn end_to_end_indirect_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (type $t (func (param i64 i64) (result i64)))
+                (table 2 funcref)
+                (elem (i32.const 0) $f3 $f5)
+                (func $f3 (type $t)
+                    (i64.add (i64.mul (local.get 0) (i64.const 3)) (local.get 1)))
+                (func $f5 (type $t)
+                    (i64.add (i64.mul (local.get 0) (i64.const 5)) (local.get 1)))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc
+                            (call_indirect (type $t)
+                                (local.get $i) (local.get $acc)
+                                (i32.wrap_i64 (i64.and (local.get $i) (i64.const 1)))))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        let expected = |n: i64| {
+            let mut acc = 0i64;
+            let mut i = 0i64;
+            while i < n {
+                let m = if i % 2 == 0 { 3 } else { 5 };
+                acc = m * i + acc;
+                i += 1;
+            }
+            acc
+        };
+        for n in [0i64, 1, 2, 3, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                expected(n),
+                "indirect run({n})"
+            );
+        }
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop with call_indirect must compile (got {compiles})"
+        );
+    }
+
+    #[test]
+    fn end_to_end_imported_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Func, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (import "env" "leaf" (func $leaf (param i64 i64) (result i64)))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (call $leaf (local.get $i) (local.get $acc)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let leaf = Func::wrap(&mut store, |a: i64, b: i64| a * 3 + b);
+        let instance = Instance::new(&mut store, &module, &[leaf.into()]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        let expected = |n: i64| {
+            let mut acc = 0i64;
+            let mut i = 0i64;
+            while i < n {
+                acc = i * 3 + acc;
+                i += 1;
+            }
+            acc
+        };
+        for n in [0i64, 1, 2, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                expected(n),
+                "imported run({n})"
+            );
+        }
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop with imported call must compile (got {compiles})"
+        );
     }
 
     fn run_call_assembler_callee_memory_loop_once(n: i64) -> (i64, i64, usize, usize) {
