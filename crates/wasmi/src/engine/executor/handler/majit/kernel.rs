@@ -3644,6 +3644,29 @@ std::thread_local! {
         std::collections::HashMap<usize, majit_metainterp::JitDriver<WasmKernelState>>,
     > = core::cell::RefCell::new(std::collections::HashMap::new());
 
+    /// The function key whose MiniProgram is currently running on a driver, set
+    /// (save/restored) around each `wasm_mainloop` entry. Read by the
+    /// `set_on_compile_loop` callback — which fires synchronously on this thread —
+    /// to attribute a successful compile to its function key. 0 = none (a real key
+    /// is an op-stream pointer, never 0).
+    static CURRENT_JIT_KEY: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Function keys whose loop compiled at least once. A hot eligible loop still
+    /// absent here after repeated JIT runs never compiles (its trace aborts), so
+    /// running it on the MiniProgram interpreter is slower than stock.
+    static COMPILED_KEYS: core::cell::RefCell<std::collections::HashSet<usize>> =
+        core::cell::RefCell::new(std::collections::HashSet::new());
+    /// Count of compiled-loop exit-guard failures in the CURRENT `wasm_mainloop`
+    /// run (reset at each run's entry). A loop whose exit guard fails many times
+    /// within one call is thrashing: with bridges disabled every exit deopts
+    /// through the blackhole, so it runs slower than the stock executor.
+    static GUARD_FAILS_BY_KEY: core::cell::RefCell<std::collections::HashMap<usize, u32>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    /// Cumulative per-function trace-abort count, mirroring the metainterp's
+    /// `abort_count` (warmstate.rs). A key that aborts `ABORT_DEMOTE_COUNT` times is
+    /// blacklisted (`DONT_TRACE_HERE`) and will never compile; running it on the
+    /// mini-op interpreter is then slower than stock, so it is demoted.
+    static ABORT_COUNT_BY_KEY: core::cell::RefCell<std::collections::HashMap<usize, u32>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
     #[cfg(test)]
     static TEST_LAST_DRIVER_SEED_SLOTS: core::cell::Cell<usize> = core::cell::Cell::new(0);
 
@@ -3797,28 +3820,13 @@ fn portal_rca_log_dispatch(program: &MiniCode, pc: usize, site: &'static str) {
     }
 }
 
-/// How many JIT / stock calls to time before committing a function to a tier.
-const PROBE_JIT_CALLS: u32 = 8;
-const PROBE_STOCK_CALLS: u32 = 4;
-
-/// Adaptive choice of execution tier for one wasm function.
-///
-/// The JIT tier wins when a function's per-call loop runs long enough to
-/// amortize the compiled-loop entry plus the loop-exit guard deopt; when the
-/// per-call work is tiny (a loop that trips only a handful of times) the stock
-/// executor — which carries no per-call JIT machinery — is faster. The trip
-/// count is a runtime argument, not a static property, so probe: time the first
-/// [`PROBE_JIT_CALLS`] calls on the JIT, then [`PROBE_STOCK_CALLS`] on the stock
-/// executor, and commit to whichever had the lower (min) per-call time. A
-/// function called only a handful of times (e.g. one giant single-call loop)
-/// never finishes probing and so keeps running on the JIT it started on.
+/// Execution tier for one wasm function. Loop-free functions start (and stay) on
+/// `Stock` (nothing to compile — the kernel would only add interpretation overhead).
+/// Loop-bearing functions start on `Jit`; the abort-demote and guard-exit-demote
+/// signals move a function to `Stock` when its loop never compiles or its compiled
+/// loop thrashes its exit guard, so the JIT never runs a function slower than stock
+/// for long.
 enum TierPolicy {
-    Probe {
-        jit_calls: u32,
-        min_jit_ns: u64,
-        stock_calls: u32,
-        min_stock_ns: u64,
-    },
     Jit,
     Stock,
 }
@@ -3828,43 +3836,10 @@ enum TierPolicy {
 pub(crate) enum TierAction {
     Jit,
     Stock,
-    ProbeJit,
-    ProbeStock,
 }
 
 impl TierPolicy {
-    /// Fold a timed JIT probe into the policy (no-op once committed).
-    fn record_jit(&mut self, ns: u64) {
-        if let TierPolicy::Probe {
-            jit_calls,
-            min_jit_ns,
-            ..
-        } = self
-        {
-            *jit_calls += 1;
-            *min_jit_ns = (*min_jit_ns).min(ns);
-        }
-    }
-
-    /// Fold a timed stock probe into the policy (no-op once committed).
-    fn record_stock(&mut self, ns: u64) {
-        if let TierPolicy::Probe {
-            stock_calls,
-            min_stock_ns,
-            ..
-        } = self
-        {
-            *stock_calls += 1;
-            *min_stock_ns = (*min_stock_ns).min(ns);
-        }
-    }
-
-    /// Pick how to run this call, advancing the probe state machine. Once both
-    /// probe quotas are met it commits in place to [`TierPolicy::Jit`] or
-    /// [`TierPolicy::Stock`]; the probe counts themselves advance only when a
-    /// timed run is recorded (`record_*`).
     fn next_action(&mut self) -> TierAction {
-        // Force JIT tier for all eligible functions (bypasses probing).
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_FORCE_JIT").is_some() {
             *self = TierPolicy::Jit;
@@ -3873,47 +3848,28 @@ impl TierPolicy {
         match self {
             TierPolicy::Jit => TierAction::Jit,
             TierPolicy::Stock => TierAction::Stock,
-            TierPolicy::Probe { jit_calls, .. } if *jit_calls < PROBE_JIT_CALLS => {
-                TierAction::ProbeJit
-            }
-            TierPolicy::Probe { stock_calls, .. } if *stock_calls < PROBE_STOCK_CALLS => {
-                TierAction::ProbeStock
-            }
-            TierPolicy::Probe {
-                min_jit_ns,
-                min_stock_ns,
-                ..
-            } => {
-                let stock_wins = *min_stock_ns < *min_jit_ns;
-                *self = if stock_wins {
-                    TierPolicy::Stock
-                } else {
-                    TierPolicy::Jit
-                };
-                if stock_wins {
-                    TierAction::Stock
-                } else {
-                    TierAction::Jit
-                }
-            }
         }
     }
 }
 
-/// Record a timed probe of the JIT tier for `key`.
-pub(crate) fn record_probe_jit(key: usize, ns: u64) {
-    PROGRAMS.with(|p| {
-        if let Some(Some(cached)) = p.borrow_mut().get_mut(&key) {
-            cached.policy.record_jit(ns);
-        }
-    });
-}
+/// Per-run compiled-loop exit-guard failures after which a function is demoted to
+/// the stock executor. Set to PyPy's `trace_eagerness` (the guard-failure count at
+/// which PyPy would compile a bridge for the hot exit). This kernel cannot attach
+/// such a bridge — loop exits go straight into `MINI_RETURN_*` — so at that hotness
+/// the compiled loop is thrashing (blackhole deopt every exit) and stock is faster.
+const GUARD_EXIT_DEMOTE: u32 = 200;
 
-/// Record a timed probe of the stock executor for `key`.
-pub(crate) fn record_probe_stock(key: usize, ns: u64) {
+/// Trace aborts after which a never-compiling loop is demoted to stock. Mirrors the
+/// metainterp's `MAX_TRACE_ABORT_COUNT` (warmstate.rs) — the count at which the key is
+/// blacklisted (`DONT_TRACE_HERE`) and will never compile.
+const ABORT_DEMOTE_COUNT: u32 = 5;
+
+/// Commit `key`'s tier policy to Stock so every future call runs on the stock
+/// executor. Idempotent; no-op for an unknown / prepass-rejected key.
+fn mark_tier_stock(key: usize) {
     PROGRAMS.with(|p| {
         if let Some(Some(cached)) = p.borrow_mut().get_mut(&key) {
-            cached.policy.record_stock(ns);
+            cached.policy = TierPolicy::Stock;
         }
     });
 }
@@ -3978,15 +3934,16 @@ pub(crate) fn ensure_cached(
                 portal_rca_log_program(key, program, "ensure_cached");
             }
             result.map(|program| {
-                CachedFunc {
-                    program,
-                    policy: TierPolicy::Probe {
-                        jit_calls: 0,
-                        min_jit_ns: u64::MAX,
-                        stock_calls: 0,
-                        min_stock_ns: u64::MAX,
-                    },
-                }
+                let policy = if program.loop_header_word.is_none() {
+                    // No loop header: nothing to compile, so the kernel would only add per-call
+                    // interpretation overhead over the stock executor — start (and stay) on stock.
+                    TierPolicy::Stock
+                } else {
+                    // Loop-bearing: start on the JIT tier. Abort-demote / guard-exit-demote fall
+                    // back to stock if the loop never compiles or thrashes its exit guard.
+                    TierPolicy::Jit
+                };
+                CachedFunc { program, policy }
             })
         });
         let cached = entry.as_mut()?;
@@ -4015,14 +3972,14 @@ pub(crate) fn ensure_callee_cached(
         let entry = progs.entry(key).or_insert_with(|| {
             super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
                 portal_rca_log_program(key, &program, "ensure_callee_cached");
+                let has_loop = program.loop_header_word.is_some();
                 CachedFunc {
-                    program,
-                    policy: TierPolicy::Probe {
-                        jit_calls: 0,
-                        min_jit_ns: u64::MAX,
-                        stock_calls: 0,
-                        min_stock_ns: u64::MAX,
+                    policy: if has_loop {
+                        TierPolicy::Jit
+                    } else {
+                        TierPolicy::Stock
                     },
+                    program,
                 }
             })
         });
@@ -4127,7 +4084,10 @@ pub(crate) fn run_persistent(
                     let driver = drivers
                         .get_mut(&shape_key)
                         .expect("driver just inserted for shape");
-                    Some(wasm_mainloop(driver, words, init_slots))
+                    let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(key));
+                    let r = wasm_mainloop(driver, words, init_slots);
+                    CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                    Some(r)
                 }
                 Err(_) => {
                     // DRIVER is busy (nested call via CALL_RESIDUAL). Fall through
@@ -4184,7 +4144,9 @@ pub(crate) fn run_persistent(
                         let driver = drivers
                             .get_mut(&shape_key)
                             .expect("callee driver just inserted for shape");
+                        let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(key));
                         let result = wasm_mainloop(driver, words, init_slots);
+                        CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
                         Some(result)
                     }
                     Err(_) => None, // both drivers busy — fall back to stock
@@ -4244,6 +4206,11 @@ pub(crate) fn run_callee(
         progs
             .get(&callee_ops_key)
             .and_then(|c| c.as_ref())
+            // A demoted callee (policy Stock — its loop never compiles or thrashes
+            // its exit guard) runs faster on the stock executor than on the mini-op
+            // dispatch, so skip the kernel and let the caller fall back to stock.
+            // The CALL_ASSEMBLER path does not otherwise consult the tier policy.
+            .filter(|c| !matches!(c.policy, TierPolicy::Stock))
             .map(|c| (c.program.words.as_ptr(), c.program.words.len()))
     });
     let result = match words_raw {
@@ -4264,7 +4231,10 @@ pub(crate) fn run_callee(
                         let driver = drivers
                             .get_mut(&shape_key)
                             .expect("callee driver just inserted for shape");
-                        Some(wasm_mainloop(driver, words, init_slots))
+                        let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(callee_ops_key));
+                        let r = wasm_mainloop(driver, words, init_slots);
+                        CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                        Some(r)
                     }
                     Err(_) => None, // recursive call — fall back to stock
                 }
@@ -4312,6 +4282,12 @@ fn new_driver(
     driver.set_trace_eagerness(u32::MAX);
     driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
         KERNEL_COMPILES.fetch_add(1, Ordering::Relaxed);
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k != 0 {
+            COMPILED_KEYS.with(|s| {
+                s.borrow_mut().insert(k);
+            });
+        }
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
             eprintln!(
@@ -4324,16 +4300,54 @@ fn new_driver(
         }
     });
     driver.set_on_guard_failure(|_green_key, _fail_index, _fail_count| {
-        let n = KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "std")]
-        if n < 5 && std::env::var_os("WASMI_MAJIT_STATS").is_some() {
-            eprintln!(
-                "[majit-kernel] GUARD_FAIL #{} green={:?} fail_index={} fail_count={}",
-                n + 1,
-                _green_key,
-                _fail_index,
-                _fail_count,
-            );
+        KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        // F2b guard-exit-hotness: count this function's compiled-loop exit-guard
+        // failures cumulatively (wasm_mainloop is re-entered per deopt, so a
+        // per-run counter cannot accumulate). Once they cross GUARD_EXIT_DEMOTE,
+        // demote the function to the stock tier.
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k == 0 {
+            return;
+        }
+        let c = GUARD_FAILS_BY_KEY.with(|m| {
+            let mut m = m.borrow_mut();
+            let e = m.entry(k).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        });
+        if c == GUARD_EXIT_DEMOTE {
+            mark_tier_stock(k);
+            #[cfg(feature = "std")]
+            if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                eprintln!("[majit-kernel] DEMOTE key={k:#x} (guard-exit thrash, {c} fails)");
+            }
+        }
+    });
+    driver.set_on_trace_abort(|_green_key, permanent| {
+        // A key the metainterp has blacklisted (this abort is permanent, or it has
+        // now aborted ABORT_DEMOTE_COUNT times) will never compile. If it never
+        // compiled, running it on the mini-op interpreter is slower than stock —
+        // demote it. A key already in COMPILED_KEYS keeps its compiled loop and is
+        // left alone (its guard-exit thrash, if any, is handled by F2b).
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k == 0 || COMPILED_KEYS.with(|s| s.borrow().contains(&k)) {
+            return;
+        }
+        let aborts = ABORT_COUNT_BY_KEY.with(|m| {
+            let mut m = m.borrow_mut();
+            let e = m.entry(k).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        });
+        // Demote once, at the abort that blacklists the key (count reaches
+        // ABORT_DEMOTE_COUNT, or an immediately-permanent abort). Later aborts of an
+        // already-demoted key need no action — its policy is already Stock.
+        if aborts == ABORT_DEMOTE_COUNT || (permanent && aborts < ABORT_DEMOTE_COUNT) {
+            mark_tier_stock(k);
+            #[cfg(feature = "std")]
+            if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                eprintln!("[majit-kernel] DEMOTE key={k:#x} (never compiles, {aborts} aborts)");
+            }
         }
     });
     let seed = WasmKernelState {
@@ -4375,14 +4389,10 @@ pub(crate) fn run_kernel(
 mod tests {
     use super::*;
     use crate::{
-        Engine,
-        Module,
         engine::executor::handler::majit::prepass::{
-            MINI_SLOTS_TRUNCATE,
-            MiniProgram,
-            NUM_SCRATCH,
-            prepass,
+            prepass, MiniProgram, MINI_SLOTS_TRUNCATE, NUM_SCRATCH,
         },
+        Engine, Module,
     };
 
     /// Serializes tests that run the kernel and read the global
@@ -11012,55 +11022,15 @@ mod tests {
         );
     }
 
-    /// The adaptive tier policy probes both tiers, then commits to whichever
-    /// reported the lower per-call time.
-    fn fresh_probe() -> TierPolicy {
-        TierPolicy::Probe {
-            jit_calls: 0,
-            min_jit_ns: u64::MAX,
-            stock_calls: 0,
-            min_stock_ns: u64::MAX,
-        }
-    }
-
     #[test]
-    fn tier_policy_commits_to_faster_tier() {
-        let mut slow = fresh_probe();
-        for _ in 0..PROBE_JIT_CALLS {
-            assert!(matches!(slow.next_action(), TierAction::ProbeJit));
-            slow.record_jit(1000);
-        }
-        for _ in 0..PROBE_STOCK_CALLS {
-            assert!(matches!(slow.next_action(), TierAction::ProbeStock));
-            slow.record_stock(50);
-        }
-        // Stock was faster (50 < 1000) → commit Stock, stably.
-        assert!(matches!(slow.next_action(), TierAction::Stock));
-        assert!(matches!(slow.next_action(), TierAction::Stock));
+    fn tier_policy_maps_directly_to_action() {
+        let mut jit = TierPolicy::Jit;
+        assert!(matches!(jit.next_action(), TierAction::Jit));
+        assert!(matches!(jit.next_action(), TierAction::Jit));
 
-        let mut fast = fresh_probe();
-        for _ in 0..PROBE_JIT_CALLS {
-            assert!(matches!(fast.next_action(), TierAction::ProbeJit));
-            fast.record_jit(50);
-        }
-        for _ in 0..PROBE_STOCK_CALLS {
-            assert!(matches!(fast.next_action(), TierAction::ProbeStock));
-            fast.record_stock(1000);
-        }
-        // JIT was faster (50 < 1000) → commit Jit, stably.
-        assert!(matches!(fast.next_action(), TierAction::Jit));
-        assert!(matches!(fast.next_action(), TierAction::Jit));
-    }
-
-    /// A function seen only a handful of times never finishes probing, so it
-    /// keeps running on the JIT it started on (the giant single-call loop case).
-    #[test]
-    fn tier_policy_keeps_probing_rare_function() {
-        let mut rare = fresh_probe();
-        for _ in 0..3 {
-            assert!(matches!(rare.next_action(), TierAction::ProbeJit));
-            rare.record_jit(60_000_000);
-        }
+        let mut stock = TierPolicy::Stock;
+        assert!(matches!(stock.next_action(), TierAction::Stock));
+        assert!(matches!(stock.next_action(), TierAction::Stock));
     }
 
     /// CALL_ASSEMBLER: a caller function with a loop calls a JIT-eligible

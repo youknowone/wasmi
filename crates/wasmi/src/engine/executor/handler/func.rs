@@ -183,10 +183,7 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         )
     }
 
-    /// Run an eligible function, choosing the JIT tier or the stock executor by
-    /// the function's adaptive [`tier`](super::majit::kernel::tier_action)
-    /// policy. While probing, the chosen path is timed so the policy can commit
-    /// to whichever tier is faster for this function's actual per-call work.
+    /// Run an eligible function on its selected tier.
     #[cfg(feature = "majit-jit")]
     fn execute_majit(
         &mut self,
@@ -196,22 +193,10 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
         action: super::majit::kernel::TierAction,
         slot_map: &[u16],
     ) -> Result<Sp, ExecutionOutcome> {
-        use super::majit::kernel::{self, TierAction};
+        use super::majit::kernel::TierAction;
         match action {
             TierAction::Stock => self.execute_stock(),
             TierAction::Jit => self.run_jit(key, num_slots, writes_result, slot_map),
-            TierAction::ProbeJit => {
-                let t = std::time::Instant::now();
-                let r = self.run_jit(key, num_slots, writes_result, slot_map);
-                kernel::record_probe_jit(key, t.elapsed().as_nanos() as u64);
-                r
-            }
-            TierAction::ProbeStock => {
-                let t = std::time::Instant::now();
-                let r = self.execute_stock();
-                kernel::record_probe_stock(key, t.elapsed().as_nanos() as u64);
-                r
-            }
         }
     }
 
