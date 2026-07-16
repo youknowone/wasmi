@@ -397,13 +397,12 @@ fn scratch1_set(v: i64) {
 /// Maximum number of params for a single CallInternal. Wasm functions rarely
 /// exceed 8 params; 16 gives ample headroom without heap allocation.
 const MAX_CALL_PARAMS: usize = 16;
+const _: () = assert!(MAX_CALL_PARAMS == 16);
 
 std::thread_local! {
-    /// Combined staging buffer + length for callee params. One TLS access
-    /// instead of two per read/write side. The full 128-byte array is copied
-    /// via Cell::set/get, but the merge halves the `.with()` call overhead.
-    static CALL_STAGING: core::cell::Cell<([i64; MAX_CALL_PARAMS], usize)> =
-        const { core::cell::Cell::new(([0i64; MAX_CALL_PARAMS], 0)) };
+    /// Staging buffer for callee params.
+    static CALL_STAGING: core::cell::Cell<[i64; MAX_CALL_PARAMS]> =
+        const { core::cell::Cell::new([0i64; MAX_CALL_PARAMS]) };
 }
 
 /// Opaque execution context for [`call_internal_residual`], set by `run_jit`
@@ -456,14 +455,17 @@ fn set_globals_ctx(table: *const *mut u64, count: usize) {
     GLOBALS_CTX.with(|c| c.set((table, count)));
 }
 
-/// Stage callee params into the fixed-size [`CALL_STAGING`] buffer. Called
-/// from the [`MINI_CALL_RESIDUAL`] dispatch arm before invoking
-/// [`call_internal_residual`]. No heap allocation.
-fn call_stage_params(buf: &[i64]) {
-    let mut arr = [0i64; MAX_CALL_PARAMS];
-    let n = buf.len().min(MAX_CALL_PARAMS);
-    arr[..n].copy_from_slice(&buf[..n]);
-    CALL_STAGING.with(|c| c.set((arr, n)));
+/// Stage one callee param into CALL_STAGING[idx]. dont_look_inside so each
+/// staged param records as one opaque residual op in the trace.
+#[majit_macros::dont_look_inside]
+extern "C" fn call_stage_param(idx: i64, val: i64) {
+    CALL_STAGING.with(|c| {
+        let mut arr = c.get();
+        if (idx as usize) < MAX_CALL_PARAMS {
+            arr[idx as usize] = val;
+        }
+        c.set(arr);
+    });
 }
 
 /// Residual: execute an internal function call. Reads the staged params from
@@ -485,7 +487,8 @@ extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
     }
     let f: CallRunnerFn = unsafe { core::mem::transmute::<usize, CallRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(data, func_addr as usize, &staging[..n])
 }
 
@@ -503,7 +506,8 @@ extern "C" fn call_imported_residual(func_index: i64, n_params: i64) -> i64 {
     let f: CallImportedRunnerFn =
         unsafe { core::mem::transmute::<usize, CallImportedRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(data, func_index as u32, &staging[..n])
 }
 
@@ -526,7 +530,8 @@ extern "C" fn call_indirect_residual(
     let f: CallIndirectRunnerFn =
         unsafe { core::mem::transmute::<usize, CallIndirectRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(
         data,
         table as u32,
@@ -1484,6 +1489,7 @@ fn yield_set_slots(slots: Vec<i64>) {
         f32_trunc => residual_int,
         global_get => residual_int,
         global_set => residual_void_cannot_raise,
+        call_stage_param => residual_void_cannot_raise,
         call_internal_residual => residual_int,
         call_imported_residual => residual_int,
         call_indirect_residual => residual_int,
@@ -2689,22 +2695,15 @@ fn wasm_mainloop(
                 let func_addr = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 // Sync trap state to TLS before the call: run_callee
                 // saves/restores MEM_TRAP and MEM_DID_STORE TLS.
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_internal_residual(func_addr, n as i64);
+                let result = call_internal_residual(func_addr, params_len as i64);
                 // Read back: the callee restored our pre-call TLS, and
                 // the call itself may have set MEM_TRAP on error.
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
@@ -2724,20 +2723,13 @@ fn wasm_mainloop(
                 let func_index = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_imported_residual(func_index, n as i64);
+                let result = call_imported_residual(func_index, params_len as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
                     | (if MEM_DID_STORE.with(|d| d.get()) {
                         1
@@ -2758,20 +2750,14 @@ fn wasm_mainloop(
                 let params_start = program[pc + 4] as usize;
                 let params_len = program[pc + 5] as usize;
                 let runtime_index = state.slots[index_slot];
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_indirect_residual(table, func_type, runtime_index, n as i64);
+                let result =
+                    call_indirect_residual(table, func_type, runtime_index, params_len as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
                     | (if MEM_DID_STORE.with(|d| d.get()) {
                         1
@@ -3251,21 +3237,15 @@ fn wasm_mainloop(
                 let params_start = program[pc + 3] as usize;
                 let params_len = program[pc + 4] as usize;
                 // Stage params from slots into staging buffer
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
                 // The index comes from scratch0 instead of a slot
-                let result = call_indirect_residual(table, func_type, scratch0_get(), n as i64);
+                let result =
+                    call_indirect_residual(table, func_type, scratch0_get(), params_len as i64);
                 state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
                     | (if MEM_DID_STORE.with(|d| d.get()) {
                         1
