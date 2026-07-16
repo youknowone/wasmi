@@ -1485,6 +1485,9 @@ fn yield_set_slots(slots: Vec<i64>) {
         global_get => residual_int,
         global_set => residual_void_cannot_raise,
         call_internal_residual => residual_int,
+        call_imported_residual => residual_int,
+        call_indirect_residual => residual_int,
+        scratch0_get => residual_int_cannot_raise,
     },
     greens = [pc, program],
     state_fields = {
