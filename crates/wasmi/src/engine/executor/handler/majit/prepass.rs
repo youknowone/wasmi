@@ -4758,6 +4758,48 @@ pub(crate) fn prepass(
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[MINI_COPY_RS, ptr, MINI_I32_LOAD_MEM0_OFF, offset]);
             }
+            // SlotAndReg-result load variants: same lowering as `_Rs`/`_Rr`
+            // plus a `COPY_SR` writing the loaded value to the result slot.
+            OpCode::U64LoadMem0Offset16_Rs_s => {
+                let op = decode::U64LoadMem0Offset16_Rs_s::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let ptr = s!(op.ptr);
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_RS,
+                    ptr,
+                    MINI_I64_LOAD_MEM0_OFF,
+                    offset,
+                    MINI_COPY_SR,
+                    dst,
+                ]);
+            }
+            OpCode::U64LoadMem0Offset16_Rs_r => {
+                let op = decode::U64LoadMem0Offset16_Rs_r::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_I64_LOAD_MEM0_OFF, offset, MINI_COPY_SR, dst]);
+            }
+            OpCode::U32LoadMem0Offset16_Rs_s => {
+                let op = decode::U32LoadMem0Offset16_Rs_s::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let ptr = s!(op.ptr);
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_RS,
+                    ptr,
+                    MINI_I32_LOAD_MEM0_OFF,
+                    offset,
+                    MINI_COPY_SR,
+                    dst,
+                ]);
+            }
+            OpCode::U32LoadMem0Offset16_Rs_r => {
+                let op = decode::U32LoadMem0Offset16_Rs_r::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[MINI_I32_LOAD_MEM0_OFF, offset, MINI_COPY_SR, dst]);
+            }
             OpCode::I32Add_Rss => {
                 // slot + slot -> reg (no slot result): reuse the slot-and-reg add
                 // and route its slot write to a throwaway scratch slot.
@@ -5177,6 +5219,49 @@ pub(crate) fn prepass(
                     MINI_I64_AND_SI_WR,
                     scratch_base,
                     0x_FFFF_FFFF_i64,
+                ]);
+            }
+            OpCode::U64LoadExtend32Mem0Offset16_Rs_s => {
+                // i64.load32_u with a result slot: same as `_Rs` (i32 load +
+                // zero-extend mask) plus a COPY_SR writing the zero-extended
+                // value to the result slot.
+                let op =
+                    decode::U64LoadExtend32Mem0Offset16_Rs_s::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let ptr = s!(op.ptr);
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_COPY_RS,
+                    ptr,
+                    MINI_I32_LOAD_MEM0_OFF,
+                    offset,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I64_AND_SI_WR,
+                    scratch_base,
+                    0x_FFFF_FFFF_i64,
+                    MINI_COPY_SR,
+                    dst,
+                ]);
+            }
+            OpCode::U64LoadExtend32Mem0Offset16_Rs_r => {
+                // i64.load32_u whose address is already in the accumulator
+                // reg, with a result slot: like `_Rs_s` but without the
+                // initial COPY_RS.
+                let op =
+                    decode::U64LoadExtend32Mem0Offset16_Rs_r::decode(&mut cursor).ok()?;
+                let dst = s!(Slot::from(op.result));
+                let offset = u64::from(op.offset) as i64;
+                words.extend_from_slice(&[
+                    MINI_I32_LOAD_MEM0_OFF,
+                    offset,
+                    MINI_COPY_SR,
+                    scratch_base,
+                    MINI_I64_AND_SI_WR,
+                    scratch_base,
+                    0x_FFFF_FFFF_i64,
+                    MINI_COPY_SR,
+                    dst,
                 ]);
             }
             OpCode::U32Store_Ir => {
