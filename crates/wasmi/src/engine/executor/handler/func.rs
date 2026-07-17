@@ -27,6 +27,26 @@ use core::marker::PhantomData;
 std::thread_local! {
     static CALLEE_STACK_CACHE: core::cell::RefCell<Option<Stack>> =
         core::cell::RefCell::new(None);
+    static ENGINE_ENTRY_DEPTH: core::cell::Cell<u32> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// The majit JIT tier is not re-entrant: its compiled loop (`wasm_mainloop`) is a
+/// per-thread `JitDriver` driving thread-global kernel TLS (MEM/GLOBALS ctx,
+/// call-runner registration, staging/scratch, trap/bail/yield flags). Running a
+/// second kernel context at a nested engine entry (a host-callback re-entry via
+/// `Func::call`) drives that non-re-entrant kernel against shared state and
+/// corrupts it. Cap the engine-entry depth at which majit is allowed: at depth 1
+/// (the outermost call) majit runs; every deeper entry runs the stock executor —
+/// the standard "run the interpreter when the JIT can't proceed here" escape.
+/// Overridable via `WASMI_MAJIT_MAX_DEPTH` for diagnosis only; do not raise it to
+/// "recover perf" (depth > 1 miscompiles/crashes on this non-re-entrant tier).
+#[cfg(feature = "majit-jit")]
+fn majit_max_entry_depth() -> u32 {
+    match std::env::var("WASMI_MAJIT_MAX_DEPTH") {
+        Ok(value) => value.parse().unwrap_or(1),
+        Err(_) => 1,
+    }
 }
 
 pub struct WasmFuncCall<'a, T, State> {
@@ -125,6 +145,20 @@ impl<'a, T> WasmFuncCall<'a, T, state::Uninit> {
 
 impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
     pub fn execute(mut self) -> Result<WasmFuncCall<'a, T, state::Done>, ExecutionOutcome> {
+        #[cfg(feature = "majit-jit")]
+        let _entry_guard = {
+            struct EntryGuard;
+
+            impl Drop for EntryGuard {
+                fn drop(&mut self) {
+                    ENGINE_ENTRY_DEPTH.with(|depth| depth.set(depth.get().wrapping_sub(1)));
+                }
+            }
+
+            ENGINE_ENTRY_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            EntryGuard
+        };
+
         self.store.invoke_call_hook(CallHook::CallingWasm)?;
         let outcome = self.execute_until_done();
         self.store.invoke_call_hook(CallHook::ReturningFromWasm)?;
@@ -135,6 +169,11 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
     fn execute_until_done(&mut self) -> Result<Sp, ExecutionOutcome> {
         // `self.majit` is `Some` only when majit is enabled and the function is
         // eligible (decided once at call init, carrying this call's tier action).
+        #[cfg(feature = "majit-jit")]
+        if ENGINE_ENTRY_DEPTH.with(|depth| depth.get()) > majit_max_entry_depth() {
+            return self.execute_stock();
+        }
+
         #[cfg(feature = "majit-jit")]
         if let Some((key, num_slots, writes_result, action, ref slot_map)) = self.majit {
             let slot_map = slot_map.clone();
