@@ -358,7 +358,10 @@ std::thread_local! {
     /// [`MINI_YIELD_STOCK`]. The caller reads it via [`take_yield_slots`] and
     /// flushes it to the real frame before resuming the stock executor.
     static YIELD_SLOTS: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
-
+    /// Snapshot of the kernel's accumulators at the yield point: accum0
+    /// (`ireg`), accum1 (`freg64` bits), and accum2 (`freg32` bits).
+    static YIELD_IREGS: core::cell::Cell<(i64, i64, i64)> =
+        const { core::cell::Cell::new((0, 0, 0)) };
 }
 
 std::thread_local! {
@@ -441,12 +444,29 @@ pub(crate) fn set_imported_call_runners(
     CALL_INDIRECT_RUNNER_FN.with(|c| c.set(indirect as usize));
 }
 
-/// Clear the call runner (called after `run_persistent` returns).
-pub(crate) fn clear_call_runner() {
-    CALL_RUNNER_FN.with(|c| c.set(0));
-    CALL_RUNNER_DATA.with(|c| c.set(0));
-    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(0));
-    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(0));
+/// Snapshot of the 4 call-runner TLS cells, for save/restore across a nested
+/// `run_jit`. Mirrors run_persistent's MEM_CTX/GLOBALS_CTX save/restore so a
+/// nested kernel entry does not clobber an outer run's registration.
+pub(crate) type CallRunnerSnapshot = (usize, usize, usize, usize);
+
+/// Snapshot the current call-runner registration before overwriting it.
+pub(crate) fn save_call_runner() -> CallRunnerSnapshot {
+    (
+        CALL_RUNNER_FN.with(|c| c.get()),
+        CALL_RUNNER_DATA.with(|c| c.get()),
+        CALL_IMPORTED_RUNNER_FN.with(|c| c.get()),
+        CALL_INDIRECT_RUNNER_FN.with(|c| c.get()),
+    )
+}
+
+/// Restore a call-runner registration snapshot (used after `run_persistent`
+/// instead of clearing to zero, so an outer run's registration survives a
+/// nested `run_jit`).
+pub(crate) fn restore_call_runner(saved: CallRunnerSnapshot) {
+    CALL_RUNNER_FN.with(|c| c.set(saved.0));
+    CALL_RUNNER_DATA.with(|c| c.set(saved.1));
+    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(saved.2));
+    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(saved.3));
 }
 
 /// Records the per-run global raw-pointer table (see [`GLOBALS_CTX`]). The caller
@@ -578,6 +598,7 @@ fn set_mem_ctx(base: i64, len: i64) {
     BAIL_TO_STOCK.with(|b| b.set(false));
     PORTAL_CRN_POSTLOOP.with(|p| p.set(None));
     YIELD_TO_STOCK.with(|y| y.set(false));
+    YIELD_IREGS.with(|r| r.set((0, 0, 0)));
 }
 
 /// Update only the MEM_CTX base/len without resetting per-run flags.
@@ -608,6 +629,11 @@ pub(crate) fn take_yield_offset() -> i64 {
 /// an empty Vec behind.
 pub(crate) fn take_yield_slots() -> Vec<i64> {
     YIELD_SLOTS.with(|c| c.replace(Vec::new()))
+}
+
+/// Takes the kernel's accumulator snapshot from the last [`MINI_YIELD_STOCK`].
+pub(crate) fn take_yield_iregs() -> (i64, i64, i64) {
+    YIELD_IREGS.with(|c| c.replace((0, 0, 0)))
 }
 
 /// Flags a trap from a residual (e.g. a trapping f64→int conversion), recording
@@ -934,6 +960,56 @@ fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i64) }
 }
 
+/// Raw i32 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i32(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 4-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i32) as i64 }
+}
+
+/// Raw u8 load from native linear memory at `base + ea` (zero-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 1-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const u8) as i64 }
+}
+
+/// Raw i8 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i8(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 1-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i8) as i64 }
+}
+
+/// Raw u16 load from native linear memory at `base + ea` (zero-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_u16(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 2-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const u16) as i64 }
+}
+
+/// Raw i16 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i16(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 2-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i16) as i64 }
+}
+
 // ── TLS-free memory load residuals ──────────────────────────────────────
 //
 // These complement the store `_sf` variants for loads. The dispatch arm
@@ -1022,7 +1098,11 @@ extern "C" fn sync_trap_to_tls(trap_did: i64) {
 #[majit_macros::dont_look_inside]
 extern "C" fn read_trap_from_tls() -> i64 {
     (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-        | (if MEM_DID_STORE.with(|d| d.get()) { 1 } else { 0 })
+        | (if MEM_DID_STORE.with(|d| d.get()) {
+            1
+        } else {
+            0
+        })
 }
 
 /// Residual f64 arithmetic, `sel`-dispatched: 0=add, 1=sub, 2=mul, 3=div. Both
@@ -1441,6 +1521,11 @@ fn yield_set_slots(slots: Vec<i64>) {
     YIELD_SLOTS.with(|c| {
         *c.borrow_mut() = slots;
     });
+}
+
+/// Stores the accumulator snapshot for [`MINI_YIELD_STOCK`].
+fn yield_set_iregs(accum0: i64, accum1: i64, accum2: i64) {
+    YIELD_IREGS.with(|c| c.set((accum0, accum1, accum2)));
 }
 
 #[majit_macros::jit_interp(
@@ -2233,19 +2318,19 @@ fn wasm_mainloop(
             MINI_I64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i64(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum1 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum1 = majit_raw_load_i64(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F64_ARITH_RS => {
@@ -2262,10 +2347,10 @@ fn wasm_mainloop(
             MINI_F32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum2 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 4 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum2 = majit_raw_load_i32(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F32_STORE_SR => {
@@ -2460,46 +2545,46 @@ fn wasm_mainloop(
             MINI_I32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 4 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i32(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_U8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 1 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_u8(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 1 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i8(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_U16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 2 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_u16(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 2 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i16(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I32_STORE_SR => {
@@ -2519,13 +2604,12 @@ fn wasm_mainloop(
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum0 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_F64_STORE_SR => {
@@ -2862,6 +2946,7 @@ fn wasm_mainloop(
                     i += 1;
                 }
                 yield_set_slots(slots_copy);
+                yield_set_iregs(state.accum0, state.accum1, state.accum2);
                 sync_trap_to_tls(state.mem_trap_did);
                 return 0;
             }
@@ -3966,6 +4051,82 @@ pub(crate) fn ensure_callee_cached(
     })
 }
 
+/// Cached metadata for a cross-instance callee whose loop can run in the
+/// kernel and yield back to stock at its epilogue.
+pub(crate) fn ensure_loop_yield_callee_cached(
+    ops: &[u8],
+    len_local_slots: u16,
+    len_stack_slots: u16,
+) -> Option<(usize, usize, bool, Vec<u16>)> {
+    let key = ops.as_ptr() as usize;
+    PROGRAMS.with(|p| {
+        let mut progs = p.borrow_mut();
+        let entry = progs.entry(key).or_insert_with(|| {
+            super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
+                portal_rca_log_program(key, &program, "ensure_loop_yield_callee_cached");
+                let has_loop = program.loop_header_word.is_some();
+                CachedFunc {
+                    policy: if has_loop {
+                        TierPolicy::Jit
+                    } else {
+                        TierPolicy::Stock
+                    },
+                    program,
+                }
+            })
+        });
+        let cached = entry.as_ref()?;
+        let has_loop = cached.program.loop_header_word.is_some();
+        let has_yield = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_YIELD_STOCK);
+        let has_bail = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_RETURN_BAIL);
+        let has_trap = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_TRAP);
+        // Traces with an inner (non-return) call_indirect are routed to stock.
+        // The kernel executes the indirect call through a residual runner
+        // (resolve table + type-check + a fresh-frame `execute_until_done`),
+        // which is heavier per call than the stock inline `call_indirect`, so a
+        // call_indirect-bearing loop tiers slower than stock (fib_loop ~1.95x).
+        // Correctness is fine once the loop-yield path registers the runners
+        // (see `with_call_runners`); this gate is a performance decision.
+        let has_call_indirect = cached.program.words.iter().any(|&w| {
+            w == super::prepass::MINI_CALL_INDIRECT
+                || w == super::prepass::MINI_CALL_INDIRECT_SCRATCH0
+        });
+        // Traces with a global store commit an externally-visible side effect
+        // on every iteration. The host kernel re-executes iterations across the
+        // record/tier boundary, so the global accumulates duplicate writes
+        // (store_global_hot: counter 200000 -> 200401). Route to stock until the
+        // kernel snapshots/rolls back global writes.
+        let has_global_set = cached.program.words.iter().any(|&w| {
+            w == super::prepass::MINI_GLOBAL_SET_S
+                || w == super::prepass::MINI_GLOBAL_SET_R
+                || w == super::prepass::MINI_GLOBAL_SET_I
+                || w == super::prepass::MINI_GLOBAL_SET_FR
+                || w == super::prepass::MINI_GLOBAL_SET_F32R
+        });
+        if !(has_loop && has_yield) || has_bail || has_trap || has_call_indirect || has_global_set {
+            return None;
+        }
+        Some((
+            key,
+            cached.program.num_slots,
+            cached.program.uses_globals,
+            cached.program.slot_map.clone(),
+        ))
+    })
+}
+
 /// Whether the cached, eligible function at `key` references any global. The
 /// caller uses this to skip resolving the instance's global raw pointers for a
 /// globals-free function.
@@ -4224,6 +4385,149 @@ pub(crate) fn run_callee(
     result
 }
 
+/// Result of running a cross-instance loop-bearing callee in the kernel.
+pub(crate) enum CalleeYieldRun {
+    /// The nested driver was unavailable or policy declined the kernel; continue
+    /// through the already-pushed stock frame from byte 0.
+    Stock,
+    /// The callee completed in the kernel.
+    Returned(i64),
+    /// The callee yielded at a stock-only instruction and provides the exact
+    /// stock resume state.
+    Yielded {
+        byte_offset: usize,
+        slots: Vec<i64>,
+        accum0: i64,
+        accum1: i64,
+        accum2: i64,
+    },
+    /// A residual trap occurred during the run.
+    MemTrap {
+        did_store: bool,
+        trap_code: crate::TrapCode,
+    },
+}
+
+/// Run an already-cached loop-bearing callee that is expected to yield at its
+/// epilogue. Unlike [`run_callee`], this accepts `MINI_YIELD_STOCK` programs
+/// and returns the captured stock-resume state to the caller.
+pub(crate) fn run_callee_yield(
+    callee_ops_key: usize,
+    init_slots: &[i64],
+    mem_base: i64,
+    mem_len: i64,
+    globals_table: *const *mut u64,
+    globals_count: usize,
+) -> CalleeYieldRun {
+    let saved_mem = MEM_CTX.with(|c| c.get());
+    let saved_globals = GLOBALS_CTX.with(|c| c.get());
+    let saved_trap = MEM_TRAP.with(|t| t.get());
+    let saved_did_store = MEM_DID_STORE.with(|d| d.get());
+    let saved_trap_code = TRAP_CODE.with(|c| c.get());
+    let saved_bail = BAIL_TO_STOCK.with(|b| b.get());
+    let saved_yield = YIELD_TO_STOCK.with(|y| y.get());
+    let saved_yield_offset = YIELD_BYTE_OFFSET.with(|c| c.get());
+    let saved_yield_slots = take_yield_slots();
+    let saved_yield_iregs = take_yield_iregs();
+
+    set_mem_ctx(mem_base, mem_len);
+    set_globals_ctx(globals_table, globals_count);
+
+    let words_raw: Option<(*const i64, usize, usize, usize)> = PROGRAMS.with(|p| {
+        let progs = p.borrow();
+        progs
+            .get(&callee_ops_key)
+            .and_then(|c| c.as_ref())
+            .filter(|c| !matches!(c.policy, TierPolicy::Stock))
+            .map(|c| {
+                (
+                    c.program.words.as_ptr(),
+                    c.program.words.len(),
+                    c.program.loop_live_count,
+                    c.program.num_slots,
+                )
+            })
+    });
+    let run_result = match words_raw {
+        Some((data, len, loop_live_count, num_slots)) => {
+            // SAFETY: same as run_persistent/run_callee — cached program entries
+            // are never removed and their Vec allocations are stable.
+            let words: &MiniCode = unsafe { core::slice::from_raw_parts(data, len) };
+            CALLEE_DRIVER.with(|d| match d.try_borrow_mut() {
+                Ok(mut drivers) => {
+                    let seed_slots = if loop_live_count < num_slots {
+                        let n_scratch = super::prepass::NUM_SCRATCH;
+                        let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
+                        for i in 0..loop_live_count.min(init_slots.len()) {
+                            s[i] = init_slots[i];
+                        }
+                        s
+                    } else {
+                        init_slots.to_vec()
+                    };
+                    let shape_key = seed_slots.len();
+                    if !drivers.contains_key(&shape_key) {
+                        drivers.insert(shape_key, new_driver(THRESHOLD, words, &seed_slots));
+                    }
+                    let driver = drivers
+                        .get_mut(&shape_key)
+                        .expect("callee driver just inserted for shape");
+                    let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(callee_ops_key));
+                    let r = wasm_mainloop(driver, words, init_slots);
+                    CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                    Some(r)
+                }
+                Err(_) => None,
+            })
+        }
+        None => None,
+    };
+
+    let outcome = if run_result.is_none() {
+        CalleeYieldRun::Stock
+    } else if take_yield_to_stock() {
+        if take_mem_trap() {
+            CalleeYieldRun::MemTrap {
+                did_store: take_mem_did_store(),
+                trap_code: take_trap_code(),
+            }
+        } else {
+            let slots = take_yield_slots();
+            let byte_offset = take_yield_offset() as usize;
+            let (accum0, accum1, accum2) = take_yield_iregs();
+            CalleeYieldRun::Yielded {
+                byte_offset,
+                slots,
+                accum0,
+                accum1,
+                accum2,
+            }
+        }
+    } else if take_mem_trap() {
+        CalleeYieldRun::MemTrap {
+            did_store: take_mem_did_store(),
+            trap_code: take_trap_code(),
+        }
+    } else if take_bail_to_stock() {
+        CalleeYieldRun::Stock
+    } else {
+        CalleeYieldRun::Returned(run_result.expect("checked above"))
+    };
+
+    MEM_CTX.with(|c| c.set(saved_mem));
+    GLOBALS_CTX.with(|c| c.set(saved_globals));
+    MEM_TRAP.with(|t| t.set(saved_trap));
+    MEM_DID_STORE.with(|d| d.set(saved_did_store));
+    TRAP_CODE.with(|c| c.set(saved_trap_code));
+    BAIL_TO_STOCK.with(|b| b.set(saved_bail));
+    YIELD_TO_STOCK.with(|y| y.set(saved_yield));
+    YIELD_BYTE_OFFSET.with(|c| c.set(saved_yield_offset));
+    yield_set_slots(saved_yield_slots);
+    YIELD_IREGS.with(|c| c.set(saved_yield_iregs));
+
+    outcome
+}
+
 /// Build a driver and install its canonical liveness once. The install is
 /// program-independent (the generated `build_meta` ignores its args), so callers
 /// keep persistent drivers keyed by `state.slots.len()` to avoid first-seed
@@ -4357,10 +4661,10 @@ pub(crate) fn run_kernel(
 mod tests {
     use super::*;
     use crate::{
-        engine::executor::handler::majit::prepass::{
-            prepass, MiniProgram, MINI_SLOTS_TRUNCATE, NUM_SCRATCH,
-        },
         Engine, Module,
+        engine::executor::handler::majit::prepass::{
+            MINI_SLOTS_TRUNCATE, MiniProgram, NUM_SCRATCH, prepass,
+        },
     };
 
     /// Serializes tests that run the kernel and read the global

@@ -255,10 +255,10 @@ pub(crate) const MINI_RETURN_BAIL: i64 = 156;
 /// `[MINI_YIELD_STOCK, byte_offset, num_slots]` (3 words): yield to the stock
 /// executor AT the indicated byte offset. Unlike [`MINI_RETURN_BAIL`] (which
 /// reruns the function from byte 0), this flushes the kernel's computed slots
-/// to the real frame and resumes the stock executor at `byte_offset` — the
-/// position of a CallInternal the kernel cannot handle. No double-apply of
-/// side effects because execution continues from the exact instruction, not
-/// from the start.
+/// and accumulators to the real frame/executor state and resumes the stock
+/// executor at `byte_offset` — the position of an instruction the kernel cannot
+/// handle. No double-apply of side effects because execution continues from the
+/// exact instruction, not from the start.
 pub(crate) const MINI_YIELD_STOCK: i64 = 157;
 /// `[MINI_CALL_RESIDUAL, func_addr, params_start, params_len]` (4 words):
 /// execute an internal function call via a `#[dont_look_inside]` residual.
@@ -1180,11 +1180,12 @@ fn mini_op_width(op: i64) -> usize {
         // Width 6
         165 // MINI_CALL_INDIRECT
         => 6,
-        // Return ops that read program[pc+1] before returning
+        // Return/trap ops that read program operands before returning
         11 // MINI_RETURN_S (reads program[pc+1])
-        | 157 // MINI_YIELD_STOCK (reads program[pc+1..=pc+2])
         | 159 // MINI_TRAP (reads program[pc+1])
         => 2,
+        157 // MINI_YIELD_STOCK (reads program[pc+1..=pc+2])
+        => 3,
         // ── Scratch-dedicated ops widths ──
         // Width 1: no operands
         171 // MINI_COPY_SCRATCH0_R
@@ -1418,6 +1419,7 @@ pub(crate) fn prepass(
     let mut byte_to_word: BTreeMap<usize, usize> = BTreeMap::new();
     // Deferred branch-target rewrites: (target_field_word, target_byte, is_back_edge).
     let mut fixups: Vec<(usize, usize, bool)> = Vec::new();
+    let mut yield_slot_count_fixups: Vec<usize> = Vec::new();
     // Whether the caller writes the trace's result back to callee slot 0. A
     // no-result function has a zero-slot frame, where slot 0 is out of the
     // callee frame; guarding on a non-empty frame keeps the write in bounds
@@ -5052,24 +5054,51 @@ pub(crate) fn prepass(
                 uses_globals = true;
             }
             // Tail calls and internal calls: the kernel cannot handle these
-            // directly. Emit MINI_RETURN_BAIL so the kernel runs the code
-            // before the call/tail-call and then signals the caller to fall
-            // back to the stock executor. This makes the function eligible
-            // (the hot loop body before the call benefits from JIT) instead of
-            // rejecting the entire function.
+            // directly. Emit a resumable yield so the kernel runs the code
+            // before the call/tail-call and then lets the stock executor resume
+            // at the exact byte offset instead of re-running the whole function.
             OpCode::ReturnCallIndirect_R => {
                 let _op = decode::ReturnCallIndirect_R::decode(&mut cursor).ok()?;
-                words.push(MINI_RETURN_BAIL);
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    std::eprintln!(
+                        "[yield-kind] ReturnCallIndirect_R total={total} op_byte={pos} params_head={:?} params_len={}",
+                        _op.params.span().head(),
+                        _op.params.len(),
+                    );
+                }
+                let slot_count_field = words.len() + 2;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, 0]);
+                yield_slot_count_fixups.push(slot_count_field);
                 has_yield_or_bail = true;
             }
             OpCode::ReturnCallIndirect_S => {
                 let _op = decode::ReturnCallIndirect_S::decode(&mut cursor).ok()?;
-                words.push(MINI_RETURN_BAIL);
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    std::eprintln!(
+                        "[yield-kind] ReturnCallIndirect_S total={total} op_byte={pos} index_slot={:?}",
+                        _op.index
+                    );
+                }
+                let slot_count_field = words.len() + 2;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, 0]);
+                yield_slot_count_fixups.push(slot_count_field);
                 has_yield_or_bail = true;
             }
             OpCode::ReturnCallInternal => {
                 let _op = decode::ReturnCallInternal::decode(&mut cursor).ok()?;
-                words.push(MINI_RETURN_BAIL);
+                #[cfg(feature = "std")]
+                if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                    std::eprintln!(
+                        "[yield-kind] ReturnCallInternal total={total} op_byte={pos} params_head={:?} params_len={}",
+                        _op.params.span().head(),
+                        _op.params.len(),
+                    );
+                }
+                let slot_count_field = words.len() + 2;
+                words.extend_from_slice(&[MINI_YIELD_STOCK, pos as i64, 0]);
+                yield_slot_count_fixups.push(slot_count_field);
                 has_yield_or_bail = true;
             }
             OpCode::CallInternal => {
@@ -5225,8 +5254,7 @@ pub(crate) fn prepass(
                 // i64.load32_u with a result slot: same as `_Rs` (i32 load +
                 // zero-extend mask) plus a COPY_SR writing the zero-extended
                 // value to the result slot.
-                let op =
-                    decode::U64LoadExtend32Mem0Offset16_Rs_s::decode(&mut cursor).ok()?;
+                let op = decode::U64LoadExtend32Mem0Offset16_Rs_s::decode(&mut cursor).ok()?;
                 let dst = s!(Slot::from(op.result));
                 let ptr = s!(op.ptr);
                 let offset = u64::from(op.offset) as i64;
@@ -5248,8 +5276,7 @@ pub(crate) fn prepass(
                 // i64.load32_u whose address is already in the accumulator
                 // reg, with a result slot: like `_Rs_s` but without the
                 // initial COPY_RS.
-                let op =
-                    decode::U64LoadExtend32Mem0Offset16_Rs_r::decode(&mut cursor).ok()?;
+                let op = decode::U64LoadExtend32Mem0Offset16_Rs_r::decode(&mut cursor).ok()?;
                 let dst = s!(Slot::from(op.result));
                 let offset = u64::from(op.offset) as i64;
                 words.extend_from_slice(&[
@@ -5709,6 +5736,18 @@ pub(crate) fn prepass(
                     scratch_base,
                 ]);
             }
+            OpCode::I64NotEq_Rri => {
+                // ireg = (ireg != imm) ? 1 : 0 (i64). Materialize imm into
+                // scratch, then use I64_NE_RS_R.
+                let op = decode::I64NotEq_Rri::decode(&mut cursor).ok()?;
+                words.extend_from_slice(&[
+                    MINI_COPY_SI,
+                    scratch_base,
+                    op.rhs,
+                    MINI_I64_NE_RS_R,
+                    scratch_base,
+                ]);
+            }
             OpCode::BranchI64Lt_Rs => {
                 // if ireg <s slot[rhs] (i64 signed) goto target. Use
                 // I64_LT_RS_R to compute the comparison, then branch.
@@ -5904,7 +5943,9 @@ pub(crate) fn prepass(
                 #[cfg(feature = "std")]
                 if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
                     let pos = total - cursor.len();
-                    std::eprintln!("[majit-prepass] bail at op {other:?} (byte ~{pos})");
+                    std::eprintln!(
+                        "[majit-prepass] bail at op {other:?} (byte ~{pos}) total={total}"
+                    );
                 }
                 return None;
             }
@@ -5997,15 +6038,20 @@ pub(crate) fn prepass(
         .map(|(dense, &orig)| (orig as i64, dense as i64))
         .collect();
     let dense_count = slot_map.len();
+    for &field in &yield_slot_count_fixups {
+        words[field] = dense_count as i64;
+    }
+    // Yield/bail traces keep the full frame: MINI_YIELD_STOCK snapshots num_slots
+    // slots and writes them back via slot_map, which a truncated
+    // (loop_live + NUM_SCRATCH) array cannot serve. Truncation is only an
+    // inputarg-reduction optimization, so skipping it here trades a micro-opt for
+    // a correct stock-resume frame.
     let truncation_active = loop_header_word.is_some()
         && !loop_used_originals.is_empty()
-        && loop_used_originals.len() < dense_count;
-    let loop_live_count = if loop_header_word.is_some() {
-        if !loop_used_originals.is_empty() {
-            loop_used_originals.len()
-        } else {
-            dense_count
-        }
+        && loop_used_originals.len() < dense_count
+        && !has_yield_or_bail;
+    let loop_live_count = if truncation_active {
+        loop_used_originals.len()
     } else {
         dense_count
     };
@@ -6570,6 +6616,7 @@ pub(crate) fn disasm_observe(ops: &[u8]) {
             OpCode::I32BitAnd_Rsi => dec!(I32BitAnd_Rsi),
             OpCode::U32Store_Is => dec!(U32Store_Is),
             OpCode::I64Eq_Rri => dec!(I64Eq_Rri),
+            OpCode::I64NotEq_Rri => dec!(I64NotEq_Rri),
             OpCode::BranchI64Lt_Rs => dec!(BranchI64Lt_Rs),
             OpCode::CallImported => dec!(CallImported),
             OpCode::MemoryCopy => dec!(MemoryCopy),

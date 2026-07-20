@@ -1,41 +1,17 @@
 use crate::{
-    DataSegmentEntity,
-    Func,
+    DataSegmentEntity, Func,
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable},
     engine::{
         code_map::FuncEntry,
         executor::handler::{
             dispatch::{Break, Control},
             state::{
-                self,
-                DoneReason,
-                Freg32,
-                Freg64,
-                Inst,
-                Ip,
-                Ireg,
-                Mem0Len,
-                Mem0Ptr,
-                Sp,
-                VmState,
+                self, DoneReason, Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState,
             },
             utils::{
-                self,
-                GetValue,
-                IntoControl as _,
-                SetValue,
-                fetch_data,
-                fetch_elem,
-                fetch_global,
-                fetch_memory,
-                fetch_table,
-                get_value,
-                resolve_data_mut,
-                resolve_elem_mut,
-                resolve_global_mut,
-                resolve_memory_mut,
-                resolve_table_mut,
-                set_value,
+                self, GetValue, IntoControl as _, SetValue, fetch_data, fetch_elem, fetch_global,
+                fetch_memory, fetch_table, get_value, resolve_data_mut, resolve_elem_mut,
+                resolve_global_mut, resolve_memory_mut, resolve_table_mut, set_value,
             },
         },
     },
@@ -290,22 +266,48 @@ impl Args {
         func: Func,
         params: BoundedSlotSpan,
     ) -> Control<(), Break> {
-        (
-            self.ip,
-            self.sp,
-            self.mem0_ptr,
-            self.mem0_len,
-            self.instance,
-        ) = utils::call_wasm_or_host(
-            state,
-            self.ip,
-            func,
-            params,
-            self.mem0_ptr,
-            self.mem0_len,
-            self.instance,
-        )?;
-        Control::Continue(())
+        #[cfg(feature = "majit-jit")]
+        {
+            let result = utils::call_wasm_or_host_loop_yield(
+                state,
+                self.ip,
+                func,
+                params,
+                self.mem0_ptr,
+                self.mem0_len,
+                self.instance,
+            )?;
+            self.ip = result.ip;
+            self.sp = result.sp;
+            self.mem0_ptr = result.mem0;
+            self.mem0_len = result.mem0_len;
+            self.instance = result.instance;
+            if let Some((accum0, accum1, accum2)) = result.accumulators {
+                self.ireg = Ireg::from(accum0);
+                self.freg64 = Freg64::from(f64::from_bits(accum1 as u64));
+                self.freg32 = Freg32::from(f32::from_bits(accum2 as u32));
+            }
+            Control::Continue(())
+        }
+        #[cfg(not(feature = "majit-jit"))]
+        {
+            (
+                self.ip,
+                self.sp,
+                self.mem0_ptr,
+                self.mem0_len,
+                self.instance,
+            ) = utils::call_wasm_or_host(
+                state,
+                self.ip,
+                func,
+                params,
+                self.mem0_ptr,
+                self.mem0_len,
+                self.instance,
+            )?;
+            Control::Continue(())
+        }
     }
 
     /// Tail-calls `func` with `params` with `state` using `self`.

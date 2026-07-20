@@ -1,14 +1,7 @@
 use crate::{
-    CallHook,
-    Error,
-    Func,
-    Instance,
-    Store,
+    CallHook, Error, Func, Instance, Store,
     engine::{
-        CodeView,
-        EngineFunc,
-        LiftFromCells,
-        LowerToCells,
+        CodeView, EngineFunc, LiftFromCells, LowerToCells,
         executor::handler::{
             dispatch::{ExecutionOutcome, execute_until_done},
             state::{Freg32, Freg64, Inst, Ip, Ireg, Sp, Stack, VmState},
@@ -289,6 +282,7 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             instance: self.instance,
             callee_stack,
         };
+        let saved_runners = super::majit::kernel::save_call_runner();
         super::majit::kernel::set_call_runner(
             call_runner_fn,
             &mut call_ctx as *mut CallRunnerCtx as *mut (),
@@ -305,7 +299,7 @@ impl<'a, T, State: state::Execute> WasmFuncCall<'a, T, State> {
             globals_table.as_ptr(),
             globals_table.len(),
         );
-        super::majit::kernel::clear_call_runner();
+        super::majit::kernel::restore_call_runner(saved_runners);
         // Return the callee Stack to the TLS cache for reuse.
         CALLEE_STACK_CACHE.with(|c| {
             *c.borrow_mut() = Some(call_ctx.callee_stack);
@@ -603,6 +597,49 @@ struct CallRunnerCtx<'a> {
     code: CodeView<'a>,
     instance: Inst,
     callee_stack: Stack,
+}
+
+/// Register the internal/imported/indirect call runners for the duration of `f`,
+/// then restore the previous registration. A residual call (`CallInternal`,
+/// imported, or `CallIndirect`) inside a tiered trace resolves through these
+/// runners; both the plain-call (`run_persistent`) and loop-yield
+/// (`run_callee_yield`) tier entries need them set, so this shares the setup.
+/// The `CallRunnerCtx` borrows a cached callee `Stack` from TLS for the run and
+/// returns it afterward.
+#[cfg(feature = "majit-jit")]
+pub(super) fn with_call_runners<R>(
+    store: *mut crate::store::PrunedStore,
+    code: CodeView<'_>,
+    instance: Inst,
+    f: impl FnOnce() -> R,
+) -> R {
+    let callee_stack = CALLEE_STACK_CACHE.with(|c| {
+        c.borrow_mut()
+            .take()
+            .unwrap_or_else(|| Stack::new(&crate::engine::limits::StackConfig::default()))
+    });
+    let mut call_ctx = CallRunnerCtx {
+        store,
+        code,
+        instance,
+        callee_stack,
+    };
+    let saved_runners = super::majit::kernel::save_call_runner();
+    super::majit::kernel::set_call_runner(
+        call_runner_fn,
+        &mut call_ctx as *mut CallRunnerCtx as *mut (),
+    );
+    super::majit::kernel::set_imported_call_runners(
+        call_imported_runner_fn,
+        call_indirect_runner_fn,
+    );
+    let r = f();
+    super::majit::kernel::restore_call_runner(saved_runners);
+    // Return the callee Stack to the TLS cache for reuse.
+    CALLEE_STACK_CACHE.with(|c| {
+        *c.borrow_mut() = Some(call_ctx.callee_stack);
+    });
+    r
 }
 
 /// The [`super::majit::kernel::CallRunnerFn`] callback. Executes a wasm
