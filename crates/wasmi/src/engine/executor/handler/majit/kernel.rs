@@ -4661,9 +4661,13 @@ pub(crate) fn run_kernel(
 mod tests {
     use super::*;
     use crate::{
-        Engine, Module,
+        Engine,
+        Module,
         engine::executor::handler::majit::prepass::{
-            MINI_SLOTS_TRUNCATE, MiniProgram, NUM_SCRATCH, prepass,
+            MINI_SLOTS_TRUNCATE,
+            MiniProgram,
+            NUM_SCRATCH,
+            prepass,
         },
     };
 
