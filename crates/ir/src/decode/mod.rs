@@ -5,19 +5,48 @@
 mod op;
 
 use self::op::{
-    BinaryOp, BranchTableOp, CallIndirect, CmpBranchOp, GlobalGet, GlobalSet, LoadAtOp, LoadOp,
-    LoadOpMem0Offset16, SelectOp, StoreAtOp, StoreOp, StoreOpMem0Offset16, TableGet, TableSet,
+    BinaryOp,
+    BranchTableOp,
+    CallIndirect,
+    CmpBranchOp,
+    GlobalGet,
+    GlobalSet,
+    LoadAtOp,
+    LoadOp,
+    LoadOpMem0Offset16,
+    SelectOp,
+    StoreAtOp,
+    StoreOp,
+    StoreOpMem0Offset16,
+    TableGet,
+    TableSet,
     UnaryOp,
 };
 #[cfg(feature = "simd")]
 use self::op::{
-    StoreLaneOp, StoreLaneOpMem0Offset16, TernaryOp, V128ExtractLaneOp, V128ReplaceLaneOp,
+    StoreLaneOp,
+    StoreLaneOpMem0Offset16,
+    TernaryOp,
+    V128ExtractLaneOp,
+    V128ReplaceLaneOp,
 };
 #[cfg(feature = "simd")]
 use crate::core::{V128, simd::ImmLaneIdx};
 use crate::{
-    Address, BlockFuel, BoundedSlotSpan, BranchOffset, BranchTableTarget, FixedSlotSpan, Local,
-    Offset, Offset16, OpCode, Reg, Slot, SlotAndReg, SlotSpan,
+    Address,
+    BlockFuel,
+    BoundedSlotSpan,
+    BranchOffset,
+    BranchTableTarget,
+    FixedSlotSpan,
+    Local,
+    Offset,
+    Offset16,
+    OpCode,
+    Reg,
+    Slot,
+    SlotAndReg,
+    SlotSpan,
     core::{ShiftAmount, TrapCode},
     index::{Data, Elem, Func, FuncType, Global, InternalFunc, Memory, RawSlot, Table},
     primitive::OffsetRepr,

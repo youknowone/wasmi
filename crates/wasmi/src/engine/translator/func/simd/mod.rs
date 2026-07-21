@@ -4,9 +4,17 @@ mod op;
 mod visit;
 
 use crate::{
-    Error, TrapCode, V128, ValType,
+    Error,
+    TrapCode,
+    V128,
+    ValType,
     core::{
-        FuelCostsProvider, IntoShiftAmount, RawVal, ShiftAmount, Typed, TypedRawVal,
+        FuelCostsProvider,
+        IntoShiftAmount,
+        RawVal,
+        ShiftAmount,
+        Typed,
+        TypedRawVal,
         simd::IntoLaneIdx,
     },
     engine::translator::{
@@ -18,7 +26,10 @@ use crate::{
         utils::{ToBits, Wrap},
     },
     ir::{
-        Offset, Offset16, Op, Slot,
+        Offset,
+        Offset16,
+        Op,
+        Slot,
         index::{self, Memory},
     },
 };

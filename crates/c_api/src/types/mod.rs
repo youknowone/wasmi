@@ -8,7 +8,14 @@ mod table;
 mod val;
 
 pub use self::{
-    export::*, r#extern::*, func::*, global::*, import::*, memory::*, table::*, val::*,
+    export::*,
+    r#extern::*,
+    func::*,
+    global::*,
+    import::*,
+    memory::*,
+    table::*,
+    val::*,
 };
 
 /// Utility type representing minimum and maximum limitations for Wasm types.

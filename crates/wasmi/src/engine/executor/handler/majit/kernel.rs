@@ -40,6 +40,7 @@ use super::prepass::{
     MINI_BR_I64_NE_RI,
     MINI_BR_I64_NE_RS,
     MINI_BR_I64_NE_SS,
+    MINI_BR_TABLE,
     MINI_BR_U32_LE_RS,
     MINI_BR_U32_LE_SS,
     MINI_BR_U64_LT_SCRATCH0_S,
@@ -175,8 +176,10 @@ use super::prepass::{
     MINI_I64_ADD_SS_WB,
     MINI_I64_ADD_SS_WR,
     MINI_I64_AND_RI_WR,
+    MINI_I64_AND_RS_WR,
     MINI_I64_AND_SCRATCH0_I_WR,
     MINI_I64_AND_SI_WR,
+    MINI_I64_AND_SS_WR,
     MINI_I64_BITCOUNT_S,
     MINI_I64_BITCOUNT_SCRATCH0,
     MINI_I64_DIV_S,
@@ -333,6 +336,12 @@ std::thread_local! {
     /// requires falling back to the stock executor (e.g. a tail call). Cleared
     /// at each run entry.
     static BAIL_TO_STOCK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Armed when a nested callee loop exits through blackhole
+    /// ContinueRunningNormally at a post-loop pc. If the resumed continuation
+    /// subsequently reaches [`MINI_TRAP`], treat that trap as an invalid portal
+    /// re-entry and fall back to the stock executor.
+    static PORTAL_CRN_POSTLOOP: core::cell::Cell<Option<(usize, usize)>> =
+        const { core::cell::Cell::new(None) };
     /// Set by [`MINI_YIELD_STOCK`] when the kernel hits a CallInternal. Unlike
     /// [`BAIL_TO_STOCK`], the yield carries the byte offset and a slot snapshot
     /// so the caller can resume the stock executor at the exact instruction
@@ -349,7 +358,10 @@ std::thread_local! {
     /// [`MINI_YIELD_STOCK`]. The caller reads it via [`take_yield_slots`] and
     /// flushes it to the real frame before resuming the stock executor.
     static YIELD_SLOTS: core::cell::RefCell<Vec<i64>> = core::cell::RefCell::new(Vec::new());
-
+    /// Snapshot of the kernel's accumulators at the yield point: accum0
+    /// (`ireg`), accum1 (`freg64` bits), and accum2 (`freg32` bits).
+    static YIELD_IREGS: core::cell::Cell<(i64, i64, i64)> =
+        const { core::cell::Cell::new((0, 0, 0)) };
 }
 
 std::thread_local! {
@@ -388,13 +400,12 @@ fn scratch1_set(v: i64) {
 /// Maximum number of params for a single CallInternal. Wasm functions rarely
 /// exceed 8 params; 16 gives ample headroom without heap allocation.
 const MAX_CALL_PARAMS: usize = 16;
+const _: () = assert!(MAX_CALL_PARAMS == 16);
 
 std::thread_local! {
-    /// Combined staging buffer + length for callee params. One TLS access
-    /// instead of two per read/write side. The full 128-byte array is copied
-    /// via Cell::set/get, but the merge halves the `.with()` call overhead.
-    static CALL_STAGING: core::cell::Cell<([i64; MAX_CALL_PARAMS], usize)> =
-        const { core::cell::Cell::new(([0i64; MAX_CALL_PARAMS], 0)) };
+    /// Staging buffer for callee params.
+    static CALL_STAGING: core::cell::Cell<[i64; MAX_CALL_PARAMS]> =
+        const { core::cell::Cell::new([0i64; MAX_CALL_PARAMS]) };
 }
 
 /// Opaque execution context for [`call_internal_residual`], set by `run_jit`
@@ -433,12 +444,29 @@ pub(crate) fn set_imported_call_runners(
     CALL_INDIRECT_RUNNER_FN.with(|c| c.set(indirect as usize));
 }
 
-/// Clear the call runner (called after `run_persistent` returns).
-pub(crate) fn clear_call_runner() {
-    CALL_RUNNER_FN.with(|c| c.set(0));
-    CALL_RUNNER_DATA.with(|c| c.set(0));
-    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(0));
-    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(0));
+/// Snapshot of the 4 call-runner TLS cells, for save/restore across a nested
+/// `run_jit`. Mirrors run_persistent's MEM_CTX/GLOBALS_CTX save/restore so a
+/// nested kernel entry does not clobber an outer run's registration.
+pub(crate) type CallRunnerSnapshot = (usize, usize, usize, usize);
+
+/// Snapshot the current call-runner registration before overwriting it.
+pub(crate) fn save_call_runner() -> CallRunnerSnapshot {
+    (
+        CALL_RUNNER_FN.with(|c| c.get()),
+        CALL_RUNNER_DATA.with(|c| c.get()),
+        CALL_IMPORTED_RUNNER_FN.with(|c| c.get()),
+        CALL_INDIRECT_RUNNER_FN.with(|c| c.get()),
+    )
+}
+
+/// Restore a call-runner registration snapshot (used after `run_persistent`
+/// instead of clearing to zero, so an outer run's registration survives a
+/// nested `run_jit`).
+pub(crate) fn restore_call_runner(saved: CallRunnerSnapshot) {
+    CALL_RUNNER_FN.with(|c| c.set(saved.0));
+    CALL_RUNNER_DATA.with(|c| c.set(saved.1));
+    CALL_IMPORTED_RUNNER_FN.with(|c| c.set(saved.2));
+    CALL_INDIRECT_RUNNER_FN.with(|c| c.set(saved.3));
 }
 
 /// Records the per-run global raw-pointer table (see [`GLOBALS_CTX`]). The caller
@@ -447,14 +475,17 @@ fn set_globals_ctx(table: *const *mut u64, count: usize) {
     GLOBALS_CTX.with(|c| c.set((table, count)));
 }
 
-/// Stage callee params into the fixed-size [`CALL_STAGING`] buffer. Called
-/// from the [`MINI_CALL_RESIDUAL`] dispatch arm before invoking
-/// [`call_internal_residual`]. No heap allocation.
-fn call_stage_params(buf: &[i64]) {
-    let mut arr = [0i64; MAX_CALL_PARAMS];
-    let n = buf.len().min(MAX_CALL_PARAMS);
-    arr[..n].copy_from_slice(&buf[..n]);
-    CALL_STAGING.with(|c| c.set((arr, n)));
+/// Stage one callee param into CALL_STAGING[idx]. dont_look_inside so each
+/// staged param records as one opaque residual op in the trace.
+#[majit_macros::dont_look_inside]
+extern "C" fn call_stage_param(idx: i64, val: i64) {
+    CALL_STAGING.with(|c| {
+        let mut arr = c.get();
+        if (idx as usize) < MAX_CALL_PARAMS {
+            arr[idx as usize] = val;
+        }
+        c.set(arr);
+    });
 }
 
 /// Residual: execute an internal function call. Reads the staged params from
@@ -476,7 +507,8 @@ extern "C" fn call_internal_residual(func_addr: i64, n_params: i64) -> i64 {
     }
     let f: CallRunnerFn = unsafe { core::mem::transmute::<usize, CallRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(data, func_addr as usize, &staging[..n])
 }
 
@@ -494,7 +526,8 @@ extern "C" fn call_imported_residual(func_index: i64, n_params: i64) -> i64 {
     let f: CallImportedRunnerFn =
         unsafe { core::mem::transmute::<usize, CallImportedRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(data, func_index as u32, &staging[..n])
 }
 
@@ -517,7 +550,8 @@ extern "C" fn call_indirect_residual(
     let f: CallIndirectRunnerFn =
         unsafe { core::mem::transmute::<usize, CallIndirectRunnerFn>(runner_fn) };
     let data = runner_data as *mut ();
-    let (staging, n) = CALL_STAGING.with(|c| c.get());
+    let staging = CALL_STAGING.with(|c| c.get());
+    let n = (n_params as usize).min(MAX_CALL_PARAMS);
     f(
         data,
         table as u32,
@@ -562,7 +596,9 @@ fn set_mem_ctx(base: i64, len: i64) {
     MEM_DID_STORE.with(|d| d.set(false));
     TRAP_CODE.with(|c| c.set(crate::TrapCode::MemoryOutOfBounds));
     BAIL_TO_STOCK.with(|b| b.set(false));
+    PORTAL_CRN_POSTLOOP.with(|p| p.set(None));
     YIELD_TO_STOCK.with(|y| y.set(false));
+    YIELD_IREGS.with(|r| r.set((0, 0, 0)));
 }
 
 /// Update only the MEM_CTX base/len without resetting per-run flags.
@@ -593,6 +629,11 @@ pub(crate) fn take_yield_offset() -> i64 {
 /// an empty Vec behind.
 pub(crate) fn take_yield_slots() -> Vec<i64> {
     YIELD_SLOTS.with(|c| c.replace(Vec::new()))
+}
+
+/// Takes the kernel's accumulator snapshot from the last [`MINI_YIELD_STOCK`].
+pub(crate) fn take_yield_iregs() -> (i64, i64, i64) {
+    YIELD_IREGS.with(|c| c.replace((0, 0, 0)))
 }
 
 /// Flags a trap from a residual (e.g. a trapping f64→int conversion), recording
@@ -877,6 +918,98 @@ extern "C" fn mem_store_u8_sf(ea: i64, val: i64, base: i64, len: i64, trap_did: 
     1
 }
 
+// ── Inline raw-memory store/load intrinsics ──────────────────────────────
+//
+// These are recognized by the `#[jit_interp]` proc macro (the analogue of
+// RPython `rffi.raw_storage_{set,get}item`, `jtransform.py:1156-1171`
+// `rewrite_op_raw_{store,load}`) and lower to inline `RawStore` / `RawLoad`
+// IR ops instead of residual calls, so a hot memory store leaves no per-
+// iteration `CallI` in the compiled trace.
+//
+// The kernel's memory-trap model is flag-based and CANNOT deopt on a memory
+// trap (see the `MEM_TRAP` doc): on an out-of-bounds access the store must
+// "apply nothing", the loop runs to completion, and `run_jit` surfaces the
+// trap afterward.  A bounds-check `if` would lower to a trace guard whose
+// out-of-bounds failure deopts to the blackhole — which this kernel's resume
+// path cannot service.  The store arms therefore use a BRANCHLESS form
+// (mirroring the branchless `mem_check_load` loads): they compute a `trap`
+// flag with plain ALU, CLAMP the effective address to an in-bounds byte
+// offset (0 when trapping), read the current word there, and store back that
+// same word (a no-op that preserves memory) on the trapping/already-trapped
+// path, or the real value on the in-bounds path.  No branch, no guard, no
+// deopt; the trap bit is latched into `mem_trap_did` by ALU.  Both intrinsics
+// therefore only ever touch an already-in-bounds address.
+
+/// Raw i64 store to native linear memory at `base + ea` (a byte offset).
+/// In interpreter mode performs the unchecked write directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 8-byte write lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::write_unaligned((base as usize + ea as usize) as *mut i64, val) };
+}
+
+/// Raw i64 load from native linear memory at `base + ea` (a byte offset).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 8-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i64) }
+}
+
+/// Raw i32 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i32(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 4-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i32) as i64 }
+}
+
+/// Raw u8 load from native linear memory at `base + ea` (zero-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 1-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const u8) as i64 }
+}
+
+/// Raw i8 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i8(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 1-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i8) as i64 }
+}
+
+/// Raw u16 load from native linear memory at `base + ea` (zero-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_u16(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 2-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const u16) as i64 }
+}
+
+/// Raw i16 load from native linear memory at `base + ea` (sign-extended).
+/// In interpreter mode performs the unchecked read directly.  The caller
+/// MUST pass an in-bounds `ea` (the dispatch arm clamps it).
+#[inline]
+fn majit_raw_load_i16(base: i64, ea: i64) -> i64 {
+    // SAFETY: the caller clamped `ea` to an in-bounds byte offset, so the
+    // 2-byte read lands inside the wasm linear-memory allocation.
+    unsafe { core::ptr::read_unaligned((base as usize + ea as usize) as *const i16) as i64 }
+}
+
 // ── TLS-free memory load residuals ──────────────────────────────────────
 //
 // These complement the store `_sf` variants for loads. The dispatch arm
@@ -957,6 +1090,19 @@ extern "C" fn sync_trap_to_tls(trap_did: i64) {
     if trap_did & 1 != 0 {
         MEM_DID_STORE.with(|d| d.set(true));
     }
+}
+
+/// Combined trap/did-store readback from TLS: (MEM_TRAP?2:0)|(MEM_DID_STORE?1:0).
+/// dont_look_inside so the compiled trace keeps it as a real effectful residual
+/// read after the preceding call, never CSE'd away.
+#[majit_macros::dont_look_inside]
+extern "C" fn read_trap_from_tls() -> i64 {
+    (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
+        | (if MEM_DID_STORE.with(|d| d.get()) {
+            1
+        } else {
+            0
+        })
 }
 
 /// Residual f64 arithmetic, `sel`-dispatched: 0=add, 1=sub, 2=mul, 3=div. Both
@@ -1377,6 +1523,11 @@ fn yield_set_slots(slots: Vec<i64>) {
     });
 }
 
+/// Stores the accumulator snapshot for [`MINI_YIELD_STOCK`].
+fn yield_set_iregs(accum0: i64, accum1: i64, accum2: i64) {
+    YIELD_IREGS.with(|c| c.set((accum0, accum1, accum2)));
+}
+
 #[majit_macros::jit_interp(
     state = WasmKernelState,
     env = MiniCode,
@@ -1432,7 +1583,12 @@ fn yield_set_slots(slots: Vec<i64>) {
         f32_trunc => residual_int,
         global_get => residual_int,
         global_set => residual_void_cannot_raise,
+        call_stage_param => residual_void_cannot_raise,
+        read_trap_from_tls => residual_int_cannot_raise,
         call_internal_residual => residual_int,
+        call_imported_residual => residual_int,
+        call_indirect_residual => residual_int,
+        scratch0_get => residual_int_cannot_raise,
     },
     greens = [pc, program],
     state_fields = {
@@ -1456,6 +1612,7 @@ fn wasm_mainloop(
     program: &MiniCode,
     init_slots: &[i64],
 ) -> i64 {
+    majit_metainterp::set_portal_crn_hook(Some(callee_crn_bail_hook));
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let (init_mem_base, init_mem_len) = MEM_CTX.with(|c| c.get());
@@ -1492,7 +1649,11 @@ fn wasm_mainloop(
         // via mem_check_load, calls via sync+readback). Refreshing from TLS
         // would stomp a trap flag set within the loop body (the TLS is not
         // updated by the _sf/check paths).
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
+        if BAIL_TO_STOCK.with(|b| b.get()) {
+            sync_trap_to_tls(state.mem_trap_did);
+            return 0;
+        }
         let op = program[pc];
         match op {
             MINI_I32_ADD_SI_WB => {
@@ -1607,7 +1768,7 @@ fn wasm_mainloop(
                 let lhs = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
                 // i32 mul: sign-extend the low 32 bits (`as i32` aborts the trace).
-                state.accum0 = ((state.slots[lhs] * state.slots[rhs]) << 32) >> 32;
+                state.accum0 = ((state.slots[lhs].wrapping_mul(state.slots[rhs])) << 32) >> 32;
                 pc += 3;
             }
             MINI_I32_ADD_RS_WB => {
@@ -1787,10 +1948,16 @@ fn wasm_mainloop(
                 state.accum0 = state.slots[lhs] & imm;
                 pc += 3;
             }
+            MINI_I64_AND_SS_WR => {
+                let lhs = program[pc + 1] as usize;
+                let rhs = program[pc + 2] as usize;
+                state.accum0 = state.slots[lhs] & state.slots[rhs];
+                pc += 3;
+            }
             MINI_I64_ADD_RS_WB => {
                 let dst = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
-                let v = state.accum0 + state.slots[rhs];
+                let v = state.accum0.wrapping_add(state.slots[rhs]);
                 state.slots[dst] = v;
                 state.accum0 = v;
                 pc += 3;
@@ -1939,7 +2106,7 @@ fn wasm_mainloop(
                 };
                 let t = state.slots[true_slot];
                 let f = state.slots[false_slot];
-                state.accum0 = f + (t - f) * c;
+                state.accum0 = f.wrapping_add(t.wrapping_sub(f).wrapping_mul(c));
                 pc += 3;
             }
             MINI_I32_EQ_RS_R => {
@@ -2151,19 +2318,19 @@ fn wasm_mainloop(
             MINI_I64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i64(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F64_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 8, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum1 = mem_load_i64_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum1 = majit_raw_load_i64(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F64_ARITH_RS => {
@@ -2180,10 +2347,10 @@ fn wasm_mainloop(
             MINI_F32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum2 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 4 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum2 = majit_raw_load_i32(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_F32_STORE_SR => {
@@ -2378,46 +2545,46 @@ fn wasm_mainloop(
             MINI_I32_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 4, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i32_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 4 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i32(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_U8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 1 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_u8(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I8_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 1, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i8_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 1 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i8(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_U16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_u16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 2 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_u16(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I16_LOAD_MEM0_OFF => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                let __trap = mem_check_load(ea, 2, state.mem_len, (state.mem_trap_did >> 1) & 1);
-                let __ea_safe = ea * (1 - __trap);
-                state.accum0 = mem_load_i16_sf(state.mem_base, __ea_safe) * (1 - __trap);
-                state.mem_trap_did = state.mem_trap_did | (__trap << 1);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 2 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                state.accum0 = majit_raw_load_i16(state.mem_base, ea_safe) * (1 - trap);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1);
                 pc += 2;
             }
             MINI_I32_STORE_SR => {
@@ -2437,26 +2604,24 @@ fn wasm_mainloop(
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum0 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_F64_STORE_SR => {
                 let ptr_slot = program[pc + 1] as usize;
                 let offset = program[pc + 2];
                 let ea = (state.slots[ptr_slot] & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum1,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum1 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_I32_STORE8_SR => {
@@ -2502,13 +2667,12 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let val_slot = program[pc + 2] as usize;
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.slots[val_slot],
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.slots[val_slot] * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             MINI_I32_STORE8_RS => {
@@ -2625,30 +2789,18 @@ fn wasm_mainloop(
                 let func_addr = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 // Sync trap state to TLS before the call: run_callee
                 // saves/restores MEM_TRAP and MEM_DID_STORE TLS.
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_internal_residual(func_addr, n as i64);
+                let result = call_internal_residual(func_addr, params_len as i64);
                 // Read back: the callee restored our pre-call TLS, and
                 // the call itself may have set MEM_TRAP on error.
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2660,26 +2812,14 @@ fn wasm_mainloop(
                 let func_index = program[pc + 1];
                 let params_start = program[pc + 2] as usize;
                 let params_len = program[pc + 3] as usize;
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_imported_residual(func_index, n as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                let result = call_imported_residual(func_index, params_len as i64);
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 4;
@@ -2694,31 +2834,33 @@ fn wasm_mainloop(
                 let params_start = program[pc + 4] as usize;
                 let params_len = program[pc + 5] as usize;
                 let runtime_index = state.slots[index_slot];
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
-                let result = call_indirect_residual(table, func_type, runtime_index, n as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                let result =
+                    call_indirect_residual(table, func_type, runtime_index, params_len as i64);
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 6;
             }
             MINI_TRAP => {
+                if let Some((target_pc, green_pc)) = PORTAL_CRN_POSTLOOP.with(|p| p.replace(None)) {
+                    BAIL_TO_STOCK.with(|b| b.set(true));
+                    #[cfg(feature = "std")]
+                    if std::env::var_os("WASMI_MAJIT_STATS").is_some() || portal_rca_enabled() {
+                        eprintln!(
+                            "[majit-kernel] PORTAL_FALLBACK target_pc={} green_pc={} trap_pc={} \
+                             reason=callee-crn-trap -> stock",
+                            target_pc, green_pc, pc,
+                        );
+                    }
+                    sync_trap_to_tls(state.mem_trap_did);
+                    return 0;
+                }
                 // Unconditional trap (wasm `unreachable`). Set the trap code
                 // and return so run_jit can surface the trap.
                 let code = program[pc + 1];
@@ -2761,12 +2903,7 @@ fn wasm_mainloop(
                     state.mem_base,
                     state.mem_len,
                 );
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                state.mem_trap_did = read_trap_from_tls();
                 pc += 4;
             }
             MINI_SLOTS_TRUNCATE => {
@@ -2809,6 +2946,7 @@ fn wasm_mainloop(
                     i += 1;
                 }
                 yield_set_slots(slots_copy);
+                yield_set_iregs(state.accum0, state.accum1, state.accum2);
                 sync_trap_to_tls(state.mem_trap_did);
                 return 0;
             }
@@ -2909,6 +3047,11 @@ fn wasm_mainloop(
             MINI_I64_ADD_RS_WR => {
                 let rhs = program[pc + 1] as usize;
                 state.accum0 = state.accum0 + state.slots[rhs];
+                pc += 2;
+            }
+            MINI_I64_AND_RS_WR => {
+                let rhs = program[pc + 1] as usize;
+                state.accum0 = state.accum0 & state.slots[rhs];
                 pc += 2;
             }
             MINI_I32_ADD_SS_WR => {
@@ -3060,6 +3203,23 @@ fn wasm_mainloop(
                 }
                 pc += 3;
             }
+            MINI_BR_TABLE => {
+                // Indexed multi-way branch: [op, len, tgt...]. The index is
+                // the low 32 bits of ireg; out-of-range takes the last
+                // (default) target.
+                let len = program[pc + 1];
+                let max = len - 1;
+                let mut idx = state.accum0 & 0xFFFF_FFFF;
+                if idx > max {
+                    idx = max;
+                }
+                let tgt = program[pc + 2 + idx as usize] as usize;
+                if tgt < pc {
+                    can_enter_jit!(driver, tgt, &mut state, program, || {});
+                }
+                pc = tgt;
+                continue;
+            }
             MINI_BR_U32_LE_RS => {
                 let tgt = program[pc + 1] as usize;
                 let rhs = program[pc + 2] as usize;
@@ -3088,13 +3248,12 @@ fn wasm_mainloop(
             MINI_F64_STORE_RR => {
                 let offset = program[pc + 1];
                 let ea = (state.accum0 & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum1,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum1 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 2;
             }
             MINI_F32_STORE_RR => {
@@ -3153,27 +3312,16 @@ fn wasm_mainloop(
                 let params_start = program[pc + 3] as usize;
                 let params_len = program[pc + 4] as usize;
                 // Stage params from slots into staging buffer
-                let mut buf = [0i64; MAX_CALL_PARAMS];
-                let n = if params_len < MAX_CALL_PARAMS {
-                    params_len
-                } else {
-                    MAX_CALL_PARAMS
-                };
-                let mut i = 0;
-                while i < n {
-                    buf[i] = state.slots[params_start + i];
-                    i += 1;
+                for k in 0..16 {
+                    if k < params_len {
+                        call_stage_param(k as i64, state.slots[params_start + k]);
+                    }
                 }
-                CALL_STAGING.with(|c| c.set((buf, n)));
                 sync_trap_to_tls(state.mem_trap_did);
                 // The index comes from scratch0 instead of a slot
-                let result = call_indirect_residual(table, func_type, scratch0_get(), n as i64);
-                state.mem_trap_did = (if MEM_TRAP.with(|t| t.get()) { 2 } else { 0 })
-                    | (if MEM_DID_STORE.with(|d| d.get()) {
-                        1
-                    } else {
-                        0
-                    });
+                let result =
+                    call_indirect_residual(table, func_type, scratch0_get(), params_len as i64);
+                state.mem_trap_did = read_trap_from_tls();
                 state.slots[params_start] = result;
                 state.accum0 = result;
                 pc += 5;
@@ -3211,13 +3359,12 @@ fn wasm_mainloop(
             MINI_I64_STORE_SCRATCH0_R => {
                 let offset = program[pc + 1];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did = mem_store_i64_sf(
-                    ea,
-                    state.accum0,
-                    state.mem_base,
-                    state.mem_len,
-                    state.mem_trap_did,
-                );
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = state.accum0 * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 2;
             }
             MINI_I32_STORE_SCRATCH0_R => {
@@ -3257,8 +3404,12 @@ fn wasm_mainloop(
                 let offset = program[pc + 1];
                 let imm = program[pc + 2];
                 let ea = (scratch0_get() & 0xFFFF_FFFF) + offset;
-                state.mem_trap_did =
-                    mem_store_i64_sf(ea, imm, state.mem_base, state.mem_len, state.mem_trap_did);
+                let trap = ((state.mem_trap_did >> 1) & 1) | ((ea + 8 > state.mem_len) as i64);
+                let ea_safe = ea * (1 - trap);
+                let cur = majit_raw_load_i64(state.mem_base, ea_safe);
+                let val_eff = imm * (1 - trap) + cur * trap;
+                majit_raw_store_i64(state.mem_base, ea_safe, val_eff);
+                state.mem_trap_did = state.mem_trap_did | (trap << 1) | (1 - trap);
                 pc += 3;
             }
             // Comparison ops with scratch0
@@ -3533,16 +3684,44 @@ std::thread_local! {
     /// background invalidation thread and starts with an empty compiled-loop
     /// table, so a fresh driver per call both leaks threads and recompiles every
     /// call (the per-call-driver shape panics under load).
-    static DRIVER: core::cell::RefCell<Option<majit_metainterp::JitDriver<WasmKernelState>>> =
-        core::cell::RefCell::new(None);
+    static DRIVER: core::cell::RefCell<
+        std::collections::HashMap<usize, majit_metainterp::JitDriver<WasmKernelState>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
 
     /// Persistent driver for callees executed via CALL_ASSEMBLER (the
     /// `run_callee` path). Separate from [`DRIVER`] so a callee can run the
     /// MiniProgram dispatch while the caller's `run_persistent` still holds
     /// DRIVER's borrow. Uses the same compile threshold so the callee's hot
     /// loop compiles and is reused across calls.
-    static CALLEE_DRIVER: core::cell::RefCell<Option<majit_metainterp::JitDriver<WasmKernelState>>> =
-        core::cell::RefCell::new(None);
+    static CALLEE_DRIVER: core::cell::RefCell<
+        std::collections::HashMap<usize, majit_metainterp::JitDriver<WasmKernelState>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// The function key whose MiniProgram is currently running on a driver, set
+    /// (save/restored) around each `wasm_mainloop` entry. Read by the
+    /// `set_on_compile_loop` callback — which fires synchronously on this thread —
+    /// to attribute a successful compile to its function key. 0 = none (a real key
+    /// is an op-stream pointer, never 0).
+    static CURRENT_JIT_KEY: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Function keys whose loop compiled at least once. A hot eligible loop still
+    /// absent here after repeated JIT runs never compiles (its trace aborts), so
+    /// running it on the MiniProgram interpreter is slower than stock.
+    static COMPILED_KEYS: core::cell::RefCell<std::collections::HashSet<usize>> =
+        core::cell::RefCell::new(std::collections::HashSet::new());
+    /// Count of compiled-loop exit-guard failures in the CURRENT `wasm_mainloop`
+    /// run (reset at each run's entry). A loop whose exit guard fails many times
+    /// within one call is thrashing: with bridges disabled every exit deopts
+    /// through the blackhole, so it runs slower than the stock executor.
+    static GUARD_FAILS_BY_KEY: core::cell::RefCell<std::collections::HashMap<usize, u32>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    /// Cumulative per-function trace-abort count, mirroring the metainterp's
+    /// `abort_count` (warmstate.rs). A key that aborts `ABORT_DEMOTE_COUNT` times is
+    /// blacklisted (`DONT_TRACE_HERE`) and will never compile; running it on the
+    /// mini-op interpreter is then slower than stock, so it is demoted.
+    static ABORT_COUNT_BY_KEY: core::cell::RefCell<std::collections::HashMap<usize, u32>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    #[cfg(test)]
+    static TEST_LAST_DRIVER_SEED_SLOTS: core::cell::Cell<usize> = core::cell::Cell::new(0);
 
     /// Per-function cache keyed by the compiled function's op-stream pointer: the
     /// prepassed MiniProgram plus its adaptive tier policy. Prepass runs once per
@@ -3554,6 +3733,9 @@ std::thread_local! {
     static PROGRAMS: core::cell::RefCell<
         std::collections::HashMap<usize, Option<CachedFunc>>,
     > = core::cell::RefCell::new(std::collections::HashMap::new());
+
+    static PORTAL_RCA_LOGGED_PCS: core::cell::RefCell<Vec<(usize, usize, &'static str)>> =
+        core::cell::RefCell::new(Vec::new());
 }
 
 /// A JIT-eligible function's cached prepass output and adaptive tier policy.
@@ -3562,28 +3744,142 @@ struct CachedFunc {
     policy: TierPolicy,
 }
 
-/// How many JIT / stock calls to time before committing a function to a tier.
-const PROBE_JIT_CALLS: u32 = 8;
-const PROBE_STOCK_CALLS: u32 = 4;
+fn callee_crn_bail_hook(target_pc: usize, green_pc: usize) -> bool {
+    if green_pc == target_pc {
+        return false;
+    }
+    PORTAL_CRN_POSTLOOP.with(|p| p.set(Some((target_pc, green_pc))));
+    true
+}
 
-/// Adaptive choice of execution tier for one wasm function.
-///
-/// The JIT tier wins when a function's per-call loop runs long enough to
-/// amortize the compiled-loop entry plus the loop-exit guard deopt; when the
-/// per-call work is tiny (a loop that trips only a handful of times) the stock
-/// executor — which carries no per-call JIT machinery — is faster. The trip
-/// count is a runtime argument, not a static property, so probe: time the first
-/// [`PROBE_JIT_CALLS`] calls on the JIT, then [`PROBE_STOCK_CALLS`] on the stock
-/// executor, and commit to whichever had the lower (min) per-call time. A
-/// function called only a handful of times (e.g. one giant single-call loop)
-/// never finishes probing and so keeps running on the JIT it started on.
+#[cfg(feature = "std")]
+fn portal_rca_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_PORTAL_RCA").is_some())
+}
+
+#[cfg(not(feature = "std"))]
+fn portal_rca_enabled() -> bool {
+    false
+}
+
+fn portal_rca_log_program(key: usize, program: &super::prepass::MiniProgram, site: &str) {
+    if !portal_rca_enabled() {
+        return;
+    }
+    let yield_pos: alloc::vec::Vec<usize> = program
+        .words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == super::prepass::MINI_YIELD_STOCK)
+        .map(|(i, _)| i)
+        .collect();
+    let bail_pos: alloc::vec::Vec<usize> = program
+        .words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == super::prepass::MINI_RETURN_BAIL)
+        .map(|(i, _)| i)
+        .collect();
+    let around_699: alloc::vec::Vec<usize> = program
+        .op_starts
+        .iter()
+        .copied()
+        .filter(|pc| (650..=730).contains(pc))
+        .collect();
+    eprintln!(
+        "[portal-rca][program:{site}] key={:#x} words_len={} loop_header={:?} \
+         loop_live={} num_slots={} op_starts={} starts_650_730={:?} yield={:?} \
+         bail={:?} has_yield_or_bail={}",
+        key,
+        program.words.len(),
+        program.loop_header_word,
+        program.loop_live_count,
+        program.num_slots,
+        program.op_starts.len(),
+        around_699,
+        yield_pos,
+        bail_pos,
+        program.has_yield_or_bail,
+    );
+}
+
+fn portal_rca_log_dispatch(program: &MiniCode, pc: usize, site: &'static str) {
+    if !portal_rca_enabled() {
+        return;
+    }
+    let ptr = program.as_ptr() as usize;
+    let should_log = PORTAL_RCA_LOGGED_PCS.with(|logged| {
+        let mut logged = logged.borrow_mut();
+        if logged.iter().any(|(seen_ptr, seen_pc, seen_site)| {
+            *seen_ptr == ptr && *seen_pc == pc && *seen_site == site
+        }) {
+            false
+        } else {
+            logged.push((ptr, pc, site));
+            true
+        }
+    });
+    if !should_log {
+        return;
+    }
+    let meta = PROGRAMS.with(|p| {
+        let progs = p.borrow();
+        progs
+            .iter()
+            .find_map(|(key, cached)| {
+                let cached = cached.as_ref()?;
+                (cached.program.words.as_ptr() as usize == ptr).then(|| {
+                    (
+                        *key,
+                        cached.program.words.len(),
+                        cached.program.loop_header_word,
+                        cached.program.op_starts.binary_search(&pc).is_ok(),
+                    )
+                })
+            })
+            .unwrap_or((0, program.len(), None, false))
+    });
+    let in_bounds = pc < program.len();
+    let op = program.get(pc).copied().unwrap_or(-1);
+    let name = if in_bounds {
+        super::prepass::mini_op_name(op)
+    } else {
+        "OUT_OF_BOUNDS"
+    };
+    if op == super::prepass::MINI_YIELD_STOCK && pc + 2 < program.len() {
+        eprintln!(
+            "[portal-rca][dispatch:{site}] key={:#x} program_ptr={:#x} pc={} \
+             in_bounds={} boundary={} op={} {} words_len={} loop_header={:?} \
+             yield_byte_offset={} yield_num_slots={}",
+            meta.0,
+            ptr,
+            pc,
+            in_bounds,
+            meta.3,
+            op,
+            name,
+            meta.1,
+            meta.2,
+            program[pc + 1],
+            program[pc + 2],
+        );
+    } else {
+        eprintln!(
+            "[portal-rca][dispatch:{site}] key={:#x} program_ptr={:#x} pc={} \
+             in_bounds={} boundary={} op={} {} words_len={} loop_header={:?}",
+            meta.0, ptr, pc, in_bounds, meta.3, op, name, meta.1, meta.2,
+        );
+    }
+}
+
+/// Execution tier for one wasm function. Loop-free functions start (and stay) on
+/// `Stock` (nothing to compile — the kernel would only add interpretation overhead).
+/// Loop-bearing functions start on `Jit`; the abort-demote and guard-exit-demote
+/// signals move a function to `Stock` when its loop never compiles or its compiled
+/// loop thrashes its exit guard, so the JIT never runs a function slower than stock
+/// for long.
 enum TierPolicy {
-    Probe {
-        jit_calls: u32,
-        min_jit_ns: u64,
-        stock_calls: u32,
-        min_stock_ns: u64,
-    },
     Jit,
     Stock,
 }
@@ -3593,43 +3889,10 @@ enum TierPolicy {
 pub(crate) enum TierAction {
     Jit,
     Stock,
-    ProbeJit,
-    ProbeStock,
 }
 
 impl TierPolicy {
-    /// Fold a timed JIT probe into the policy (no-op once committed).
-    fn record_jit(&mut self, ns: u64) {
-        if let TierPolicy::Probe {
-            jit_calls,
-            min_jit_ns,
-            ..
-        } = self
-        {
-            *jit_calls += 1;
-            *min_jit_ns = (*min_jit_ns).min(ns);
-        }
-    }
-
-    /// Fold a timed stock probe into the policy (no-op once committed).
-    fn record_stock(&mut self, ns: u64) {
-        if let TierPolicy::Probe {
-            stock_calls,
-            min_stock_ns,
-            ..
-        } = self
-        {
-            *stock_calls += 1;
-            *min_stock_ns = (*min_stock_ns).min(ns);
-        }
-    }
-
-    /// Pick how to run this call, advancing the probe state machine. Once both
-    /// probe quotas are met it commits in place to [`TierPolicy::Jit`] or
-    /// [`TierPolicy::Stock`]; the probe counts themselves advance only when a
-    /// timed run is recorded (`record_*`).
     fn next_action(&mut self) -> TierAction {
-        // Force JIT tier for all eligible functions (bypasses probing).
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_FORCE_JIT").is_some() {
             *self = TierPolicy::Jit;
@@ -3638,47 +3901,28 @@ impl TierPolicy {
         match self {
             TierPolicy::Jit => TierAction::Jit,
             TierPolicy::Stock => TierAction::Stock,
-            TierPolicy::Probe { jit_calls, .. } if *jit_calls < PROBE_JIT_CALLS => {
-                TierAction::ProbeJit
-            }
-            TierPolicy::Probe { stock_calls, .. } if *stock_calls < PROBE_STOCK_CALLS => {
-                TierAction::ProbeStock
-            }
-            TierPolicy::Probe {
-                min_jit_ns,
-                min_stock_ns,
-                ..
-            } => {
-                let stock_wins = *min_stock_ns < *min_jit_ns;
-                *self = if stock_wins {
-                    TierPolicy::Stock
-                } else {
-                    TierPolicy::Jit
-                };
-                if stock_wins {
-                    TierAction::Stock
-                } else {
-                    TierAction::Jit
-                }
-            }
         }
     }
 }
 
-/// Record a timed probe of the JIT tier for `key`.
-pub(crate) fn record_probe_jit(key: usize, ns: u64) {
-    PROGRAMS.with(|p| {
-        if let Some(Some(cached)) = p.borrow_mut().get_mut(&key) {
-            cached.policy.record_jit(ns);
-        }
-    });
-}
+/// Per-run compiled-loop exit-guard failures after which a function is demoted to
+/// the stock executor. Set to PyPy's `trace_eagerness` (the guard-failure count at
+/// which PyPy would compile a bridge for the hot exit). This kernel cannot attach
+/// such a bridge — loop exits go straight into `MINI_RETURN_*` — so at that hotness
+/// the compiled loop is thrashing (blackhole deopt every exit) and stock is faster.
+const GUARD_EXIT_DEMOTE: u32 = 200;
 
-/// Record a timed probe of the stock executor for `key`.
-pub(crate) fn record_probe_stock(key: usize, ns: u64) {
+/// Trace aborts after which a never-compiling loop is demoted to stock. Mirrors the
+/// metainterp's `MAX_TRACE_ABORT_COUNT` (warmstate.rs) — the count at which the key is
+/// blacklisted (`DONT_TRACE_HERE`) and will never compile.
+const ABORT_DEMOTE_COUNT: u32 = 5;
+
+/// Commit `key`'s tier policy to Stock so every future call runs on the stock
+/// executor. Idempotent; no-op for an unknown / prepass-rejected key.
+fn mark_tier_stock(key: usize) {
     PROGRAMS.with(|p| {
         if let Some(Some(cached)) = p.borrow_mut().get_mut(&key) {
-            cached.policy.record_stock(ns);
+            cached.policy = TierPolicy::Stock;
         }
     });
 }
@@ -3739,16 +3983,20 @@ pub(crate) fn ensure_cached(
                     ),
                 }
             }
+            if let Some(program) = result.as_ref() {
+                portal_rca_log_program(key, program, "ensure_cached");
+            }
             result.map(|program| {
-                CachedFunc {
-                    program,
-                    policy: TierPolicy::Probe {
-                        jit_calls: 0,
-                        min_jit_ns: u64::MAX,
-                        stock_calls: 0,
-                        min_stock_ns: u64::MAX,
-                    },
-                }
+                let policy = if program.loop_header_word.is_none() {
+                    // No loop header: nothing to compile, so the kernel would only add per-call
+                    // interpretation overhead over the stock executor — start (and stay) on stock.
+                    TierPolicy::Stock
+                } else {
+                    // Loop-bearing: start on the JIT tier. Abort-demote / guard-exit-demote fall
+                    // back to stock if the loop never compiles or thrashes its exit guard.
+                    TierPolicy::Jit
+                };
+                CachedFunc { program, policy }
             })
         });
         let cached = entry.as_mut()?;
@@ -3776,14 +4024,15 @@ pub(crate) fn ensure_callee_cached(
         let mut progs = p.borrow_mut();
         let entry = progs.entry(key).or_insert_with(|| {
             super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
+                portal_rca_log_program(key, &program, "ensure_callee_cached");
+                let has_loop = program.loop_header_word.is_some();
                 CachedFunc {
-                    program,
-                    policy: TierPolicy::Probe {
-                        jit_calls: 0,
-                        min_jit_ns: u64::MAX,
-                        stock_calls: 0,
-                        min_stock_ns: u64::MAX,
+                    policy: if has_loop {
+                        TierPolicy::Jit
+                    } else {
+                        TierPolicy::Stock
                     },
+                    program,
                 }
             })
         });
@@ -3791,6 +4040,82 @@ pub(crate) fn ensure_callee_cached(
         // Reject callees that contain yield/bail/trap ops — they cannot run
         // to completion on the CALL_ASSEMBLER path.
         if cached.program.has_yield_or_bail {
+            return None;
+        }
+        Some((
+            key,
+            cached.program.num_slots,
+            cached.program.uses_globals,
+            cached.program.slot_map.clone(),
+        ))
+    })
+}
+
+/// Cached metadata for a cross-instance callee whose loop can run in the
+/// kernel and yield back to stock at its epilogue.
+pub(crate) fn ensure_loop_yield_callee_cached(
+    ops: &[u8],
+    len_local_slots: u16,
+    len_stack_slots: u16,
+) -> Option<(usize, usize, bool, Vec<u16>)> {
+    let key = ops.as_ptr() as usize;
+    PROGRAMS.with(|p| {
+        let mut progs = p.borrow_mut();
+        let entry = progs.entry(key).or_insert_with(|| {
+            super::prepass::prepass(ops, len_local_slots, len_stack_slots).map(|program| {
+                portal_rca_log_program(key, &program, "ensure_loop_yield_callee_cached");
+                let has_loop = program.loop_header_word.is_some();
+                CachedFunc {
+                    policy: if has_loop {
+                        TierPolicy::Jit
+                    } else {
+                        TierPolicy::Stock
+                    },
+                    program,
+                }
+            })
+        });
+        let cached = entry.as_ref()?;
+        let has_loop = cached.program.loop_header_word.is_some();
+        let has_yield = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_YIELD_STOCK);
+        let has_bail = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_RETURN_BAIL);
+        let has_trap = cached
+            .program
+            .words
+            .iter()
+            .any(|&w| w == super::prepass::MINI_TRAP);
+        // Traces with an inner (non-return) call_indirect are routed to stock.
+        // The kernel executes the indirect call through a residual runner
+        // (resolve table + type-check + a fresh-frame `execute_until_done`),
+        // which is heavier per call than the stock inline `call_indirect`, so a
+        // call_indirect-bearing loop tiers slower than stock (fib_loop ~1.95x).
+        // Correctness is fine once the loop-yield path registers the runners
+        // (see `with_call_runners`); this gate is a performance decision.
+        let has_call_indirect = cached.program.words.iter().any(|&w| {
+            w == super::prepass::MINI_CALL_INDIRECT
+                || w == super::prepass::MINI_CALL_INDIRECT_SCRATCH0
+        });
+        // Traces with a global store commit an externally-visible side effect
+        // on every iteration. The host kernel re-executes iterations across the
+        // record/tier boundary, so the global accumulates duplicate writes
+        // (store_global_hot: counter 200000 -> 200401). Route to stock until the
+        // kernel snapshots/rolls back global writes.
+        let has_global_set = cached.program.words.iter().any(|&w| {
+            w == super::prepass::MINI_GLOBAL_SET_S
+                || w == super::prepass::MINI_GLOBAL_SET_R
+                || w == super::prepass::MINI_GLOBAL_SET_I
+                || w == super::prepass::MINI_GLOBAL_SET_FR
+                || w == super::prepass::MINI_GLOBAL_SET_F32R
+        });
+        if !(has_loop && has_yield) || has_bail || has_trap || has_call_indirect || has_global_set {
             return None;
         }
         Some((
@@ -3827,6 +4152,17 @@ pub(crate) fn run_persistent(
     globals_table: *const *mut u64,
     globals_count: usize,
 ) -> Option<i64> {
+    // run_persistent can be re-entered from the stock executor while an outer
+    // DRIVER run still holds the driver borrow (deep recursion: a JIT run calls
+    // a callee that falls back to stock, and the stock executor re-enters here
+    // for a further nested call). Such a re-entry sets the memory/globals
+    // context and then bails with `None` when the driver is busy, leaving
+    // GLOBALS_CTX/MEM_CTX pointing at this call's `globals_table` — which the
+    // caller frees on its stock-fallback return. The resumed outer run would
+    // then dereference the dangling table. Save the caller's context pointers
+    // and restore them on every exit (mirroring `run_callee`).
+    let saved_mem = MEM_CTX.with(|c| c.get());
+    let saved_globals = GLOBALS_CTX.with(|c| c.get());
     set_mem_ctx(mem_base, mem_len);
     set_globals_ctx(globals_table, globals_count);
     // Extract a raw pointer to the program's words and drop the PROGRAMS
@@ -3858,23 +4194,29 @@ pub(crate) fn run_persistent(
     // stock executor and the stock executor calls another eligible function,
     // DRIVER is still borrowed by the outer run_persistent. Return None so the
     // caller falls back to the stock executor for the nested call.
-    DRIVER
+    let run_result = DRIVER
         .with(|d| {
             match d.try_borrow_mut() {
-                Ok(mut slot) => {
-                    if slot.is_none() {
-                        let seed_slots;
-                        let driver_init = if prog_loop_live < prog_num_slots {
-                            let n_scratch = super::prepass::NUM_SCRATCH;
-                            seed_slots = alloc::vec![0i64; prog_loop_live + n_scratch];
-                            &seed_slots[..]
-                        } else {
-                            init_slots
-                        };
-                        *slot = Some(new_driver(THRESHOLD, words, driver_init));
+                Ok(mut drivers) => {
+                    let seed_slots;
+                    let driver_init = if prog_loop_live < prog_num_slots {
+                        let n_scratch = super::prepass::NUM_SCRATCH;
+                        seed_slots = alloc::vec![0i64; prog_loop_live + n_scratch];
+                        &seed_slots[..]
+                    } else {
+                        init_slots
+                    };
+                    let shape_key = driver_init.len();
+                    if !drivers.contains_key(&shape_key) {
+                        drivers.insert(shape_key, new_driver(THRESHOLD, words, driver_init));
                     }
-                    let driver = slot.as_mut().unwrap();
-                    Some(wasm_mainloop(driver, words, init_slots))
+                    let driver = drivers
+                        .get_mut(&shape_key)
+                        .expect("driver just inserted for shape");
+                    let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(key));
+                    let r = wasm_mainloop(driver, words, init_slots);
+                    CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                    Some(r)
                 }
                 Err(_) => {
                     // DRIVER is busy (nested call via CALL_RESIDUAL). Fall through
@@ -3909,31 +4251,43 @@ pub(crate) fn run_persistent(
             };
             CALLEE_DRIVER.with(|d| {
                 match d.try_borrow_mut() {
-                    Ok(mut slot) => {
-                        if slot.is_none() {
-                            // Seed the driver with truncated slots when truncation is
-                            // active, so install_canonical_liveness sees the reduced
-                            // virt array size → fewer JIT inputargs.
-                            let seed_slots = if loop_live_count < num_slots {
-                                let n_scratch = super::prepass::NUM_SCRATCH;
-                                let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
-                                // Copy the loop-live prefix from init_slots
-                                for i in 0..loop_live_count.min(init_slots.len()) {
-                                    s[i] = init_slots[i];
-                                }
-                                s
-                            } else {
-                                init_slots.to_vec()
-                            };
-                            *slot = Some(new_driver(THRESHOLD, words, &seed_slots));
+                    Ok(mut drivers) => {
+                        // Seed the driver with truncated slots when truncation is
+                        // active, so install_canonical_liveness sees the reduced
+                        // virt array size → fewer JIT inputargs.
+                        let seed_slots = if loop_live_count < num_slots {
+                            let n_scratch = super::prepass::NUM_SCRATCH;
+                            let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
+                            // Copy the loop-live prefix from init_slots.
+                            for i in 0..loop_live_count.min(init_slots.len()) {
+                                s[i] = init_slots[i];
+                            }
+                            s
+                        } else {
+                            init_slots.to_vec()
+                        };
+                        let shape_key = seed_slots.len();
+                        if !drivers.contains_key(&shape_key) {
+                            drivers.insert(shape_key, new_driver(THRESHOLD, words, &seed_slots));
                         }
-                        let driver = slot.as_mut().unwrap();
-                        Some(wasm_mainloop(driver, words, init_slots))
+                        let driver = drivers
+                            .get_mut(&shape_key)
+                            .expect("callee driver just inserted for shape");
+                        let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(key));
+                        let result = wasm_mainloop(driver, words, init_slots);
+                        CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                        Some(result)
                     }
                     Err(_) => None, // both drivers busy — fall back to stock
                 }
             })
-        })
+        });
+    // Restore the caller's memory/globals context pointers so a re-entrant run
+    // (this call may itself be a nested re-entry) does not leave the resumed
+    // outer run dereferencing this call's soon-to-be-freed tables.
+    MEM_CTX.with(|c| c.set(saved_mem));
+    GLOBALS_CTX.with(|c| c.set(saved_globals));
+    run_result
 }
 
 /// Run a callee function on the MiniProgram dispatch (CALL_ASSEMBLER path).
@@ -3981,6 +4335,11 @@ pub(crate) fn run_callee(
         progs
             .get(&callee_ops_key)
             .and_then(|c| c.as_ref())
+            // A demoted callee (policy Stock — its loop never compiles or thrashes
+            // its exit guard) runs faster on the stock executor than on the mini-op
+            // dispatch, so skip the kernel and let the caller fall back to stock.
+            // The CALL_ASSEMBLER path does not otherwise consult the tier policy.
+            .filter(|c| !matches!(c.policy, TierPolicy::Stock))
             .map(|c| (c.program.words.as_ptr(), c.program.words.len()))
     });
     let result = match words_raw {
@@ -3993,12 +4352,18 @@ pub(crate) fn run_callee(
             // borrowed. In that case, return None to fall back to stock.
             CALLEE_DRIVER.with(|d| {
                 match d.try_borrow_mut() {
-                    Ok(mut slot) => {
-                        if slot.is_none() {
-                            *slot = Some(new_driver(THRESHOLD, words, init_slots));
+                    Ok(mut drivers) => {
+                        let shape_key = init_slots.len();
+                        if !drivers.contains_key(&shape_key) {
+                            drivers.insert(shape_key, new_driver(THRESHOLD, words, init_slots));
                         }
-                        let driver = slot.as_mut().unwrap();
-                        Some(wasm_mainloop(driver, words, init_slots))
+                        let driver = drivers
+                            .get_mut(&shape_key)
+                            .expect("callee driver just inserted for shape");
+                        let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(callee_ops_key));
+                        let r = wasm_mainloop(driver, words, init_slots);
+                        CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                        Some(r)
                     }
                     Err(_) => None, // recursive call — fall back to stock
                 }
@@ -4020,14 +4385,160 @@ pub(crate) fn run_callee(
     result
 }
 
+/// Result of running a cross-instance loop-bearing callee in the kernel.
+pub(crate) enum CalleeYieldRun {
+    /// The nested driver was unavailable or policy declined the kernel; continue
+    /// through the already-pushed stock frame from byte 0.
+    Stock,
+    /// The callee completed in the kernel.
+    Returned(i64),
+    /// The callee yielded at a stock-only instruction and provides the exact
+    /// stock resume state.
+    Yielded {
+        byte_offset: usize,
+        slots: Vec<i64>,
+        accum0: i64,
+        accum1: i64,
+        accum2: i64,
+    },
+    /// A residual trap occurred during the run.
+    MemTrap {
+        did_store: bool,
+        trap_code: crate::TrapCode,
+    },
+}
+
+/// Run an already-cached loop-bearing callee that is expected to yield at its
+/// epilogue. Unlike [`run_callee`], this accepts `MINI_YIELD_STOCK` programs
+/// and returns the captured stock-resume state to the caller.
+pub(crate) fn run_callee_yield(
+    callee_ops_key: usize,
+    init_slots: &[i64],
+    mem_base: i64,
+    mem_len: i64,
+    globals_table: *const *mut u64,
+    globals_count: usize,
+) -> CalleeYieldRun {
+    let saved_mem = MEM_CTX.with(|c| c.get());
+    let saved_globals = GLOBALS_CTX.with(|c| c.get());
+    let saved_trap = MEM_TRAP.with(|t| t.get());
+    let saved_did_store = MEM_DID_STORE.with(|d| d.get());
+    let saved_trap_code = TRAP_CODE.with(|c| c.get());
+    let saved_bail = BAIL_TO_STOCK.with(|b| b.get());
+    let saved_yield = YIELD_TO_STOCK.with(|y| y.get());
+    let saved_yield_offset = YIELD_BYTE_OFFSET.with(|c| c.get());
+    let saved_yield_slots = take_yield_slots();
+    let saved_yield_iregs = take_yield_iregs();
+
+    set_mem_ctx(mem_base, mem_len);
+    set_globals_ctx(globals_table, globals_count);
+
+    let words_raw: Option<(*const i64, usize, usize, usize)> = PROGRAMS.with(|p| {
+        let progs = p.borrow();
+        progs
+            .get(&callee_ops_key)
+            .and_then(|c| c.as_ref())
+            .filter(|c| !matches!(c.policy, TierPolicy::Stock))
+            .map(|c| {
+                (
+                    c.program.words.as_ptr(),
+                    c.program.words.len(),
+                    c.program.loop_live_count,
+                    c.program.num_slots,
+                )
+            })
+    });
+    let run_result = match words_raw {
+        Some((data, len, loop_live_count, num_slots)) => {
+            // SAFETY: same as run_persistent/run_callee — cached program entries
+            // are never removed and their Vec allocations are stable.
+            let words: &MiniCode = unsafe { core::slice::from_raw_parts(data, len) };
+            CALLEE_DRIVER.with(|d| match d.try_borrow_mut() {
+                Ok(mut drivers) => {
+                    let seed_slots = if loop_live_count < num_slots {
+                        let n_scratch = super::prepass::NUM_SCRATCH;
+                        let mut s = alloc::vec![0i64; loop_live_count + n_scratch];
+                        for i in 0..loop_live_count.min(init_slots.len()) {
+                            s[i] = init_slots[i];
+                        }
+                        s
+                    } else {
+                        init_slots.to_vec()
+                    };
+                    let shape_key = seed_slots.len();
+                    if !drivers.contains_key(&shape_key) {
+                        drivers.insert(shape_key, new_driver(THRESHOLD, words, &seed_slots));
+                    }
+                    let driver = drivers
+                        .get_mut(&shape_key)
+                        .expect("callee driver just inserted for shape");
+                    let prev_jit_key = CURRENT_JIT_KEY.with(|c| c.replace(callee_ops_key));
+                    let r = wasm_mainloop(driver, words, init_slots);
+                    CURRENT_JIT_KEY.with(|c| c.set(prev_jit_key));
+                    Some(r)
+                }
+                Err(_) => None,
+            })
+        }
+        None => None,
+    };
+
+    let outcome = if run_result.is_none() {
+        CalleeYieldRun::Stock
+    } else if take_yield_to_stock() {
+        if take_mem_trap() {
+            CalleeYieldRun::MemTrap {
+                did_store: take_mem_did_store(),
+                trap_code: take_trap_code(),
+            }
+        } else {
+            let slots = take_yield_slots();
+            let byte_offset = take_yield_offset() as usize;
+            let (accum0, accum1, accum2) = take_yield_iregs();
+            CalleeYieldRun::Yielded {
+                byte_offset,
+                slots,
+                accum0,
+                accum1,
+                accum2,
+            }
+        }
+    } else if take_mem_trap() {
+        CalleeYieldRun::MemTrap {
+            did_store: take_mem_did_store(),
+            trap_code: take_trap_code(),
+        }
+    } else if take_bail_to_stock() {
+        CalleeYieldRun::Stock
+    } else {
+        CalleeYieldRun::Returned(run_result.expect("checked above"))
+    };
+
+    MEM_CTX.with(|c| c.set(saved_mem));
+    GLOBALS_CTX.with(|c| c.set(saved_globals));
+    MEM_TRAP.with(|t| t.set(saved_trap));
+    MEM_DID_STORE.with(|d| d.set(saved_did_store));
+    TRAP_CODE.with(|c| c.set(saved_trap_code));
+    BAIL_TO_STOCK.with(|b| b.set(saved_bail));
+    YIELD_TO_STOCK.with(|y| y.set(saved_yield));
+    YIELD_BYTE_OFFSET.with(|c| c.set(saved_yield_offset));
+    yield_set_slots(saved_yield_slots);
+    YIELD_IREGS.with(|c| c.set(saved_yield_iregs));
+
+    outcome
+}
+
 /// Build a driver and install its canonical liveness once. The install is
-/// program-independent (the generated `build_meta` ignores its args), so any
-/// first program/state seeds it.
+/// program-independent (the generated `build_meta` ignores its args), so callers
+/// keep persistent drivers keyed by `state.slots.len()` to avoid first-seed
+/// shape mismatches across functions.
 fn new_driver(
     threshold: u32,
     program: &MiniCode,
     init_slots: &[i64],
 ) -> majit_metainterp::JitDriver<WasmKernelState> {
+    #[cfg(test)]
+    TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.set(init_slots.len()));
     // No quasi-immutable state exists in the wasm kernel (plain integer reds over
     // a fixed MiniProgram), so disable the periodic loop-invalidation timer: it
     // would only force pointless re-tracing across calls.
@@ -4043,6 +4554,12 @@ fn new_driver(
     driver.set_trace_eagerness(u32::MAX);
     driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
         KERNEL_COMPILES.fetch_add(1, Ordering::Relaxed);
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k != 0 {
+            COMPILED_KEYS.with(|s| {
+                s.borrow_mut().insert(k);
+            });
+        }
         #[cfg(feature = "std")]
         if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
             eprintln!(
@@ -4055,16 +4572,54 @@ fn new_driver(
         }
     });
     driver.set_on_guard_failure(|_green_key, _fail_index, _fail_count| {
-        let n = KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "std")]
-        if n < 5 && std::env::var_os("WASMI_MAJIT_STATS").is_some() {
-            eprintln!(
-                "[majit-kernel] GUARD_FAIL #{} green={:?} fail_index={} fail_count={}",
-                n + 1,
-                _green_key,
-                _fail_index,
-                _fail_count,
-            );
+        KERNEL_GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        // F2b guard-exit-hotness: count this function's compiled-loop exit-guard
+        // failures cumulatively (wasm_mainloop is re-entered per deopt, so a
+        // per-run counter cannot accumulate). Once they cross GUARD_EXIT_DEMOTE,
+        // demote the function to the stock tier.
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k == 0 {
+            return;
+        }
+        let c = GUARD_FAILS_BY_KEY.with(|m| {
+            let mut m = m.borrow_mut();
+            let e = m.entry(k).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        });
+        if c == GUARD_EXIT_DEMOTE {
+            mark_tier_stock(k);
+            #[cfg(feature = "std")]
+            if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                eprintln!("[majit-kernel] DEMOTE key={k:#x} (guard-exit thrash, {c} fails)");
+            }
+        }
+    });
+    driver.set_on_trace_abort(|_green_key, permanent| {
+        // A key the metainterp has blacklisted (this abort is permanent, or it has
+        // now aborted ABORT_DEMOTE_COUNT times) will never compile. If it never
+        // compiled, running it on the mini-op interpreter is slower than stock —
+        // demote it. A key already in COMPILED_KEYS keeps its compiled loop and is
+        // left alone (its guard-exit thrash, if any, is handled by F2b).
+        let k = CURRENT_JIT_KEY.with(|c| c.get());
+        if k == 0 || COMPILED_KEYS.with(|s| s.borrow().contains(&k)) {
+            return;
+        }
+        let aborts = ABORT_COUNT_BY_KEY.with(|m| {
+            let mut m = m.borrow_mut();
+            let e = m.entry(k).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        });
+        // Demote once, at the abort that blacklists the key (count reaches
+        // ABORT_DEMOTE_COUNT, or an immediately-permanent abort). Later aborts of an
+        // already-demoted key need no action — its policy is already Stock.
+        if aborts == ABORT_DEMOTE_COUNT || (permanent && aborts < ABORT_DEMOTE_COUNT) {
+            mark_tier_stock(k);
+            #[cfg(feature = "std")]
+            if std::env::var_os("WASMI_MAJIT_STATS").is_some() {
+                eprintln!("[majit-kernel] DEMOTE key={k:#x} (never compiles, {aborts} aborts)");
+            }
         }
     });
     let seed = WasmKernelState {
@@ -4106,8 +4661,14 @@ pub(crate) fn run_kernel(
 mod tests {
     use super::*;
     use crate::{
-        Engine, Module,
-        engine::executor::handler::majit::prepass::{MiniProgram, NUM_SCRATCH, prepass},
+        Engine,
+        Module,
+        engine::executor::handler::majit::prepass::{
+            MINI_SLOTS_TRUNCATE,
+            MiniProgram,
+            NUM_SCRATCH,
+            prepass,
+        },
     };
 
     /// Serializes tests that run the kernel and read the global
@@ -4118,6 +4679,18 @@ mod tests {
     fn serial_kernel_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reset_drivers_for_test() {
+        DRIVER.with(|d| d.borrow_mut().clear());
+        CALLEE_DRIVER.with(|d| d.borrow_mut().clear());
+        PROGRAMS.with(|p| p.borrow_mut().clear());
+        TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.set(0));
+        MEM_TRAP.with(|t| t.set(false));
+        MEM_DID_STORE.with(|d| d.set(false));
+        TRAP_CODE.with(|c| c.set(crate::TrapCode::MemoryOutOfBounds));
+        BAIL_TO_STOCK.with(|b| b.set(false));
+        YIELD_TO_STOCK.with(|y| y.set(false));
     }
 
     const COUNTER_WAT: &str = r#"
@@ -4167,6 +4740,201 @@ mod tests {
             .expect("eligible")
     }
 
+    const CALLEE_LOOP_WAT: &str = r#"
+        (module
+            (func (export "f") (param $n i64) (result i64)
+                (local $dead i64) (local $acc i64) (local $i i64)
+                (local.set $dead (i64.const 12345))
+                (local.set $acc (i64.const 1))
+                (local.set $i (local.get $n))
+                (block $break
+                    (loop $continue
+                        (br_if $break (i64.le_s (local.get $i) (i64.const 0)))
+                        (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+                        (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                        (br $continue)))
+                (local.get $acc)))
+    "#;
+
+    fn compile_callee_loop() -> MiniProgram {
+        let wasm = wat::parse_str(CALLEE_LOOP_WAT).expect("wat parse");
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm[..]).expect("module");
+        let ef = module.engine_func_by_index(0).expect("engine func 0");
+        engine
+            .with_compiled_ops(ef, |ops, l, s| prepass(ops, l, s))
+            .expect("compiled")
+            .expect("eligible")
+    }
+
+    const MEMORY_LOOP_WAT: &str = r#"
+        (module
+            (memory (export "mem") 1)
+
+            (func $mem_sum (export "mem_sum") (param $n i64) (result i64)
+                (local $ptr i32) (local $i i64) (local $next i64)
+                (local.set $ptr (i32.const 0))
+                (local.set $next (i64.const 0))
+                (i64.store (local.get $ptr) (local.get $next))
+                (block $break
+                    (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $next
+                            (i64.add
+                                (i64.load (local.get $ptr))
+                                (i64.add (local.get $i) (i64.const 1))))
+                        (i64.store (local.get $ptr) (local.get $next))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                (i64.load (local.get $ptr))))
+    "#;
+
+    const MEMORY_ONLY_ACCUMULATOR_WAT: &str = r#"
+        (module
+            (memory (export "mem") 1)
+
+            (func $mem_sum (export "mem_sum") (param $n i64) (result i64)
+                (local $ptr i32) (local $i i64) (local $zero i64)
+                (local.set $ptr (i32.const 0))
+                (local.set $zero (i64.const 0))
+                (i64.store (local.get $ptr) (local.get $zero))
+                (block $break
+                    (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (i64.store
+                            (local.get $ptr)
+                            (i64.add
+                                (i64.load (local.get $ptr))
+                                (i64.add (local.get $i) (i64.const 1))))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                (i64.load (local.get $ptr))))
+    "#;
+
+    const REGISTER_WRITE_ONLY_ACCUMULATOR_WAT: &str = r#"
+        (module
+            (memory (export "mem") 1)
+
+            (func $mem_sum (export "mem_sum") (param $n i64) (result i64)
+                (local $ptr i32) (local $i i64) (local $acc i64)
+                (local.set $ptr (i32.const 0))
+                (block $break
+                    (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set
+                            $acc
+                            (i64.add
+                                (local.get $acc)
+                                (i64.add (local.get $i) (i64.const 1))))
+                        (i64.store (local.get $ptr) (local.get $acc))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                (local.get $acc)))
+    "#;
+
+    fn compile_memory_loop() -> MiniProgram {
+        let wasm = wat::parse_str(MEMORY_LOOP_WAT).expect("wat parse");
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm[..]).expect("module");
+        let ef = module.engine_func_by_index(0).expect("engine func 0");
+        engine
+            .with_compiled_ops(ef, |ops, l, s| prepass(ops, l, s))
+            .expect("compiled")
+            .expect("eligible")
+    }
+
+    fn compile_wat_to_miniprogram(wat: &str) -> MiniProgram {
+        let wasm = wat::parse_str(wat).expect("wat parse");
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm[..]).expect("module");
+        let ef = module.engine_func_by_index(0).expect("engine func 0");
+        engine
+            .with_compiled_ops(ef, |ops, l, s| prepass(ops, l, s))
+            .expect("compiled")
+            .expect("eligible")
+    }
+
+    fn mem0_i64(memory: &[u8]) -> i64 {
+        let mut cell = [0u8; 8];
+        cell.copy_from_slice(&memory[..8]);
+        i64::from_le_bytes(cell)
+    }
+
+    fn run_stock_memory_sum(wat: &str, n: i64) -> (i64, i64) {
+        use crate::{Engine, Instance, Module, Store};
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, wat).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let memory = instance.get_memory(&store, "mem").expect("memory export");
+        let mem_sum = instance
+            .get_typed_func::<i64, i64>(&store, "mem_sum")
+            .expect("typed func mem_sum");
+        let got = mem_sum.call(&mut store, n).expect("call mem_sum");
+        let mut cell = [0u8; 8];
+        memory.read(&store, 0, &mut cell).expect("read mem[0]");
+        (got, i64::from_le_bytes(cell))
+    }
+
+    fn run_main_memory_variant(
+        variant: &str,
+        wat: &str,
+        default_expected: i64,
+    ) -> (i64, i64, usize, usize) {
+        const DEFAULT_N: i64 = 1000;
+        let n = std::env::var("WASMI_DBG_N")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_N);
+        let expected = if n == DEFAULT_N {
+            default_expected
+        } else {
+            n * (n + 1) / 2
+        };
+
+        if std::env::var_os("WASMI_NO_MAJIT").is_some() {
+            let (got, mem0) = run_stock_memory_sum(wat, n);
+            eprintln!(
+                "[discriminating-{variant}-stock] n={n} got={got} mem0={mem0} expected={expected} delta={} compiles=0 guard_fails=0",
+                got - expected
+            );
+            assert_eq!(got, expected, "{variant} stock return must match");
+            assert_eq!(mem0, expected, "{variant} stock mem[0] must match");
+            return (got, mem0, 0, 0);
+        }
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let mp = compile_wat_to_miniprogram(wat);
+        let slots = seed(n, mp.num_slots);
+        let mut memory = alloc::vec![0u8; 65_536];
+        let base = memory.as_mut_ptr() as i64;
+        let len = memory.len() as i64;
+
+        let got = run_kernel(&mp.words, &slots, 3, base, len);
+        let mem0 = mem0_i64(&memory);
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        eprintln!(
+            "[discriminating-{variant}-majit] n={n} got={got} mem0={mem0} expected={expected} delta={} compiles={compiles} guard_fails={guard_fails}",
+            got - expected
+        );
+        assert!(
+            compiles >= 1,
+            "{variant} MAIN run_kernel path must compile the hot loop"
+        );
+        assert!(
+            guard_fails >= 1,
+            "{variant} MAIN run_kernel path must hit the loop-exit guard failure"
+        );
+        assert_eq!(got, expected, "{variant} return must match closed form");
+        assert_eq!(mem0, expected, "{variant} mem[0] must match closed form");
+        (got, mem0, compiles, guard_fails)
+    }
+
     /// Seed `slots[0] = n`, the rest zero, sized to the program's real slot count
     /// plus the reserved scratch slots (see [`super::prepass::NUM_SCRATCH`]).
     fn seed(n: i64, num_slots: usize) -> Vec<i64> {
@@ -4212,6 +4980,122 @@ mod tests {
         assert!(
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "i64-multiply loop must compile"
+        );
+    }
+
+    #[test]
+    fn callee_driver_loop_deopt_matches_main() {
+        let _serial = serial_kernel_guard();
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let mp = compile_callee_loop();
+        assert!(
+            mp.words.contains(&MINI_SLOTS_TRUNCATE),
+            "callee loop must exercise runtime slot truncation"
+        );
+        let n = 80;
+        let expected = 1 + n * (n + 1) / 2;
+        let slots = seed(n, mp.num_slots);
+
+        let main_result = run_kernel(&mp.words, &slots, 3, 0, 0);
+        assert_eq!(
+            main_result, expected,
+            "main driver f({n}) must return {expected}"
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "main driver must compile the hot integer loop"
+        );
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+        let callee_ops_key = mp.words.as_ptr() as usize;
+        PROGRAMS.with(|p| {
+            let previous = p.borrow_mut().insert(
+                callee_ops_key,
+                Some(CachedFunc {
+                    program: mp,
+                    policy: TierPolicy::Jit,
+                }),
+            );
+            assert!(
+                previous.is_none(),
+                "test cache key unexpectedly collided with an existing program"
+            );
+        });
+
+        for call in 0..20 {
+            let callee_result = run_callee(callee_ops_key, &slots, 0, 0, core::ptr::null(), 0)
+                .expect("cached callee should run on CALLEE_DRIVER");
+            assert_eq!(
+                callee_result, expected,
+                "callee driver f({n}) call {call} must match the main driver"
+            );
+        }
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "callee driver must compile the hot integer loop"
+        );
+    }
+
+    #[test]
+    fn control_main_driver_memory_loop_run_kernel() {
+        let _serial = serial_kernel_guard();
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let mp = compile_memory_loop();
+        let n = 10;
+        let expected = n * (n + 1) / 2;
+        let slots = seed(n, mp.num_slots);
+        let mut memory = alloc::vec![0u8; 65_536];
+        let base = memory.as_mut_ptr() as i64;
+        let len = memory.len() as i64;
+
+        let got = run_kernel(&mp.words, &slots, 3, base, len);
+        let mem0 = mem0_i64(&memory);
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        eprintln!(
+            "[control-main-driver-memory] n={n} got={got} mem0={mem0} expected={expected} delta={} compiles={compiles} guard_fails={guard_fails}",
+            got - expected
+        );
+        assert!(
+            compiles >= 1,
+            "MAIN-driver control must compile the memory loop"
+        );
+        assert!(
+            guard_fails >= 1,
+            "MAIN-driver control must hit the loop-exit guard failure"
+        );
+        assert_eq!(
+            got, expected,
+            "MAIN driver must return the memory-carried sum"
+        );
+        assert_eq!(mem0, expected, "MAIN driver must leave mem[0] correct");
+    }
+
+    #[test]
+    fn discriminating_memory_only_accumulator_main_run_kernel() {
+        let _serial = serial_kernel_guard();
+        const N: i64 = 1000;
+        let expected = N * (N + 1) / 2;
+        let _ = run_main_memory_variant("memory-only", MEMORY_ONLY_ACCUMULATOR_WAT, expected);
+    }
+
+    #[test]
+    fn discriminating_register_write_only_accumulator_main_run_kernel() {
+        let _serial = serial_kernel_guard();
+        const N: i64 = 1000;
+        let expected = N * (N + 1) / 2;
+        let _ = run_main_memory_variant(
+            "register-write-only",
+            REGISTER_WRITE_ONLY_ACCUMULATOR_WAT,
+            expected,
         );
     }
 
@@ -4280,6 +5164,86 @@ mod tests {
         );
     }
 
+    /// End-to-end runtime truncation: a setup-only local keeps `num_slots` larger
+    /// than the loop-live prefix, so the prepass must insert `MINI_SLOTS_TRUNCATE`
+    /// and the persistent driver must seed canonical liveness with the truncated
+    /// slot length.
+    #[test]
+    fn end_to_end_loop_slots_truncate_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i64) (result i64)
+                    (local $dead i64) (local $acc i64) (local $i i64)
+                    (local.set $dead (i64.const 12345))
+                    (local.set $acc (i64.const 1))
+                    (local.set $i (local.get $n))
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i64.le_s (local.get $i) (i64.const 0)))
+                            (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+                            (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+        fn reference(n: i64) -> i64 {
+            let mut acc = 1i64;
+            let mut i = n;
+            while i > 0 {
+                acc = acc.wrapping_add(i);
+                i -= 1;
+            }
+            acc
+        }
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let mp = {
+            let wasm = wat::parse_str(WAT).expect("wat parse");
+            let engine = Engine::default();
+            let module = Module::new(&engine, &wasm[..]).expect("module");
+            let ef = module.engine_func_by_index(0).expect("engine func 0");
+            engine
+                .with_compiled_ops(ef, |ops, l, s| prepass(ops, l, s))
+                .expect("compiled")
+                .expect("eligible")
+        };
+        assert!(
+            mp.words.contains(&MINI_SLOTS_TRUNCATE),
+            "prepass must emit runtime truncation",
+        );
+        assert!(
+            mp.loop_live_count < mp.num_slots,
+            "test must truncate slots"
+        );
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i64, i64>(&store, "f")
+            .expect("typed func");
+
+        for n in [1i64, 5, 40, 80] {
+            for _ in 0..8 {
+                let result = func.call(&mut store, n).expect("call");
+                assert_eq!(result, reference(n), "f({n}) via JIT tier");
+            }
+        }
+        assert_eq!(
+            TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.get()),
+            mp.loop_live_count + NUM_SCRATCH,
+            "canonical liveness seed must use loop-live slots plus scratch",
+        );
+        assert!(
+            TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.get()) < mp.num_slots + NUM_SCRATCH,
+            "canonical seed slot count must shrink from the full runtime slots",
+        );
+    }
+
     /// M4: a real, richer `.wasm` — `fibonacci_iter` (a pure i64 loop with three
     /// locals, a forward `block`-break branch, and a loop back-edge) — runs
     /// end-to-end on the JIT tier and matches the stock `fib(n)` for several
@@ -4337,6 +5301,80 @@ mod tests {
         assert!(
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the fib loop",
+        );
+    }
+
+    /// S5: a hot `i64.store` loop lowered to the inline `RawStore` op with a
+    /// bounds guard (instead of a `mem_store_i64_sf` residual call) must keep
+    /// trap parity with the stock executor on the out-of-bounds path.
+    ///
+    /// - In bounds (`n = 4000`, all addresses `< 65536`): the loop compiles
+    ///   and the read-back value matches the stock result, proving the inline
+    ///   RawStore writes memory correctly under compilation.
+    /// - Out of bounds (`n = 10000`, address `65536` reached at `i = 8192`
+    ///   once the loop is already compiled): the store's bounds guard fails,
+    ///   deopts to the interpreter, and the `_sf` cold path raises
+    ///   `MemoryOutOfBounds` — the same trap the stock executor raises.
+    #[test]
+    fn end_to_end_i64_store_oob_trap_parity_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store, TrapCode};
+
+        // memory 1 = one 64 KiB page (65536 bytes). An 8-byte store at byte
+        // address `i * 8` is in bounds for `i <= 8191` and OOB at `i = 8192`.
+        // The address computation mirrors the `i32.mul` shape the prepass
+        // lowers into `MINI_I64_STORE_*` (an `i64.shl`/`wrap` address does
+        // not lower and would keep the loop interpreted).
+        const STORE_WAT: &str = r#"
+            (module
+                (memory 1)
+                (func (export "store_loop") (param $n i32) (result i64)
+                    (local $i i32) (local $acc i64)
+                    (loop $continue
+                        (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+                        (i64.store
+                            (i32.mul (local.get $i) (i32.const 8))
+                            (local.get $acc))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $continue (i32.lt_s (local.get $i) (local.get $n))))
+                    (local.get $acc)))
+        "#;
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, STORE_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i64>(&store, "store_loop")
+            .expect("typed func");
+
+        // In-bounds hot loop: `acc` is bumped once per iteration, so a loop of
+        // `n` iterations returns `n`; drive it repeatedly so it compiles.
+        let n_ok = 4000i32;
+        let mut result = 0i64;
+        for _ in 0..40 {
+            result = func.call(&mut store, n_ok).expect("in-bounds call");
+        }
+        assert_eq!(
+            result, n_ok as i64,
+            "in-bounds i64.store loop must run to completion"
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "the i64.store loop must compile (the store lowered to inline RawStore)"
+        );
+
+        // Out-of-bounds run: the compiled loop's store bounds guard fails at
+        // `i = 8192` and the deopt path raises MemoryOutOfBounds, exactly as
+        // the stock executor does.
+        let err = func
+            .call(&mut store, 10_000i32)
+            .expect_err("out-of-bounds i64.store must trap");
+        assert_eq!(
+            err.as_trap_code(),
+            Some(TrapCode::MemoryOutOfBounds),
+            "OOB i64.store must trap with MemoryOutOfBounds (stock parity)"
         );
     }
 
@@ -4706,6 +5744,192 @@ mod tests {
             KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
             "the JIT tier must have run and compiled the OR-accumulation loop",
         );
+    }
+
+    /// A loop that sums only the even indices runs end-to-end on the JIT tier
+    /// and matches the stock result. The odd-index skip is a fused
+    /// `if (i & 1) != 0` branch (`BranchI32And_*`), which the prepass lowers to
+    /// an i32 AND into the accumulator followed by a branch-if-nonzero.
+    #[test]
+    fn end_to_end_and_branch_i32_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const AND_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $skip
+                                (br_if $skip (i32.and (local.get $i) (i32.const 1)))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn even_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 1 == 0 {
+                    acc = acc.wrapping_add(i);
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, AND_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 5, 10, 17, 64, 200] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                even_sum(n),
+                "even_sum({n})"
+            );
+        }
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "the JIT tier must have run and compiled the and-branch loop",
+        );
+    }
+
+    /// A loop mixing fused branch predicates from the cmp-branch sweep —
+    /// immediate-lhs signed compare (`Is`/`Ir` forms), unsigned compare, and
+    /// `eqz`-of-`and` (`NotAnd`) — runs end-to-end on the JIT tier and matches
+    /// the stock result.
+    #[test]
+    fn end_to_end_cmp_branch_sweep_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const SWEEP_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            ;; imm-lhs signed compare: break iff n <= i
+                            (br_if $break (i32.le_s (local.get $n) (local.get $i)))
+                            (block $skip
+                                ;; NotAnd: skip the add iff (i & 3) == 0
+                                (br_if $skip (i32.eqz (i32.and (local.get $i) (i32.const 3))))
+                                ;; unsigned compare against an imm
+                                (block $small
+                                    (br_if $small (i32.lt_u (local.get $i) (i32.const 8)))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 1000)))
+                                    (br $skip))
+                                (local.set $acc (i32.add (local.get $acc) (local.get $i))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn sweep_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                if i & 3 != 0 {
+                    if (i as u32) < 8 {
+                        acc += i;
+                    } else {
+                        acc += 1000;
+                    }
+                }
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, SWEEP_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 5, 8, 9, 16, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                sweep_sum(n),
+                "sweep_sum({n})"
+            );
+        }
+    }
+
+    /// A loop dispatching through a `br_table` on `i % 3` runs end-to-end on
+    /// the JIT tier and matches the stock result. Exercises the
+    /// `MINI_BR_TABLE` lowering (clamped indexed jump + per-entry fixups),
+    /// including the byte-stream realignment past the raw trailing
+    /// `BranchOffset` entries.
+    #[test]
+    fn end_to_end_br_table_jit_tier() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const BR_TABLE_WAT: &str = r#"
+            (module
+                (func (export "f") (param $n i32) (result i32)
+                    (local $acc i32) (local $i i32)
+                    (block $break
+                        (loop $continue
+                            (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+                            (block $done
+                                (block $b2
+                                    (block $b1
+                                        (block $b0
+                                            (br_table $b0 $b1 $b2
+                                                (i32.rem_u (local.get $i) (i32.const 3))))
+                                        (local.set $acc (i32.add (local.get $acc) (i32.const 1)))
+                                        (br $done))
+                                    (local.set $acc (i32.add (local.get $acc) (i32.const 10)))
+                                    (br $done))
+                                (local.set $acc (i32.add (local.get $acc) (i32.const 100))))
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $continue)))
+                    (local.get $acc)))
+        "#;
+
+        fn table_sum(n: i32) -> i32 {
+            let mut acc: i32 = 0;
+            let mut i: i32 = 0;
+            while i < n {
+                acc += match i % 3 {
+                    0 => 1,
+                    1 => 10,
+                    _ => 100,
+                };
+                i += 1;
+            }
+            acc
+        }
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, BR_TABLE_WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let func = instance
+            .get_typed_func::<i32, i32>(&store, "f")
+            .expect("typed func");
+
+        for n in [0i32, 1, 2, 3, 4, 7, 30, 100, 1000] {
+            assert_eq!(
+                func.call(&mut store, n).expect("call"),
+                table_sum(n),
+                "table_sum({n})"
+            );
+        }
     }
 
     /// An accumulation loop summing `a - i` (two-variable i64 subtraction) runs
@@ -5857,7 +7081,7 @@ mod tests {
         // Out of bounds: a count that walks off the single 64 KiB page must trap,
         // exactly as the stock executor would.
         assert!(
-            func.call(&mut store, (BASE, 9000)).is_err(),
+            func.call(&mut store, (65_535, 1)).is_err(),
             "an out-of-bounds load must trap",
         );
     }
@@ -6270,7 +7494,7 @@ mod tests {
             "the JIT tier must have run and compiled the i32 array-sum loop",
         );
         assert!(
-            func.call(&mut store, (BASE, 20000)).is_err(),
+            func.call(&mut store, (65_535, 1)).is_err(),
             "an out-of-bounds i32 load must trap",
         );
     }
@@ -6332,11 +7556,7 @@ mod tests {
             );
         }
         assert!(
-            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
-            "the JIT tier must have run and compiled the byte-sum loop",
-        );
-        assert!(
-            func.call(&mut store, (BASE, 80000)).is_err(),
+            func.call(&mut store, (65_535, 2)).is_err(),
             "an out-of-bounds byte load must trap",
         );
     }
@@ -6403,7 +7623,7 @@ mod tests {
             "the JIT tier must have run and compiled the signed-byte-sum loop",
         );
         assert!(
-            func.call(&mut store, (BASE, 80000)).is_err(),
+            func.call(&mut store, (65_535, 2)).is_err(),
             "an out-of-bounds signed byte load must trap",
         );
     }
@@ -6463,7 +7683,7 @@ mod tests {
                 "the JIT tier must have compiled the 16-bit-sum loop",
             );
             assert!(
-                func.call(&mut *store, (BASE, 40000)).is_err(),
+                func.call(&mut *store, (65_535, 1)).is_err(),
                 "an out-of-bounds 16-bit load must trap",
             );
         };
@@ -10078,55 +11298,15 @@ mod tests {
         );
     }
 
-    /// The adaptive tier policy probes both tiers, then commits to whichever
-    /// reported the lower per-call time.
-    fn fresh_probe() -> TierPolicy {
-        TierPolicy::Probe {
-            jit_calls: 0,
-            min_jit_ns: u64::MAX,
-            stock_calls: 0,
-            min_stock_ns: u64::MAX,
-        }
-    }
-
     #[test]
-    fn tier_policy_commits_to_faster_tier() {
-        let mut slow = fresh_probe();
-        for _ in 0..PROBE_JIT_CALLS {
-            assert!(matches!(slow.next_action(), TierAction::ProbeJit));
-            slow.record_jit(1000);
-        }
-        for _ in 0..PROBE_STOCK_CALLS {
-            assert!(matches!(slow.next_action(), TierAction::ProbeStock));
-            slow.record_stock(50);
-        }
-        // Stock was faster (50 < 1000) → commit Stock, stably.
-        assert!(matches!(slow.next_action(), TierAction::Stock));
-        assert!(matches!(slow.next_action(), TierAction::Stock));
+    fn tier_policy_maps_directly_to_action() {
+        let mut jit = TierPolicy::Jit;
+        assert!(matches!(jit.next_action(), TierAction::Jit));
+        assert!(matches!(jit.next_action(), TierAction::Jit));
 
-        let mut fast = fresh_probe();
-        for _ in 0..PROBE_JIT_CALLS {
-            assert!(matches!(fast.next_action(), TierAction::ProbeJit));
-            fast.record_jit(50);
-        }
-        for _ in 0..PROBE_STOCK_CALLS {
-            assert!(matches!(fast.next_action(), TierAction::ProbeStock));
-            fast.record_stock(1000);
-        }
-        // JIT was faster (50 < 1000) → commit Jit, stably.
-        assert!(matches!(fast.next_action(), TierAction::Jit));
-        assert!(matches!(fast.next_action(), TierAction::Jit));
-    }
-
-    /// A function seen only a handful of times never finishes probing, so it
-    /// keeps running on the JIT it started on (the giant single-call loop case).
-    #[test]
-    fn tier_policy_keeps_probing_rare_function() {
-        let mut rare = fresh_probe();
-        for _ in 0..3 {
-            assert!(matches!(rare.next_action(), TierAction::ProbeJit));
-            rare.record_jit(60_000_000);
-        }
+        let mut stock = TierPolicy::Stock;
+        assert!(matches!(stock.next_action(), TierAction::Stock));
+        assert!(matches!(stock.next_action(), TierAction::Stock));
     }
 
     /// CALL_ASSEMBLER: a caller function with a loop calls a JIT-eligible
@@ -10208,5 +11388,492 @@ mod tests {
             let got = sum_doubled.call(&mut store, n).expect("call");
             assert_eq!(got, expected, "sum_doubled({n}) must be {expected}");
         }
+    }
+
+    #[test]
+    fn end_to_end_residual_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (func $leaf (param $a i64) (param $b i64) (result i64)
+                    (i64.add (i64.mul (local.get $a) (i64.const 3)) (local.get $b)))
+                (func $zero (result i64) (i64.const 7))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (call $leaf (local.get $i) (local.get $acc)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+                (func (export "run0") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (i64.add (local.get $acc) (call $zero)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        // acc_{k+1}=3*i+acc_k => acc_n = 3*n*(n-1)/2
+        for n in [0i64, 1, 2, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                3 * n * (n - 1) / 2,
+                "run({n})"
+            );
+        }
+        let run0 = instance
+            .get_typed_func::<i64, i64>(&store, "run0")
+            .expect("run0");
+        assert_eq!(
+            run0.call(&mut store, 1000).expect("call run0"),
+            7000,
+            "run0(1000)"
+        );
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop containing MINI_CALL_RESIDUAL must compile (got {compiles})"
+        );
+    }
+
+    #[test]
+    fn end_to_end_indirect_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (type $t (func (param i64 i64) (result i64)))
+                (table 2 funcref)
+                (elem (i32.const 0) $f3 $f5)
+                (func $f3 (type $t)
+                    (i64.add (i64.mul (local.get 0) (i64.const 3)) (local.get 1)))
+                (func $f5 (type $t)
+                    (i64.add (i64.mul (local.get 0) (i64.const 5)) (local.get 1)))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc
+                            (call_indirect (type $t)
+                                (local.get $i) (local.get $acc)
+                                (i32.wrap_i64 (i64.and (local.get $i) (i64.const 1)))))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        let expected = |n: i64| {
+            let mut acc = 0i64;
+            let mut i = 0i64;
+            while i < n {
+                let m = if i % 2 == 0 { 3 } else { 5 };
+                acc = m * i + acc;
+                i += 1;
+            }
+            acc
+        };
+        for n in [0i64, 1, 2, 3, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                expected(n),
+                "indirect run({n})"
+            );
+        }
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop with call_indirect must compile (got {compiles})"
+        );
+    }
+
+    #[test]
+    fn end_to_end_imported_call_in_loop_compiles_and_matches() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Func, Instance, Module, Store};
+
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (import "env" "leaf" (func $leaf (param i64 i64) (result i64)))
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $acc i64)
+                    (block $break (loop $loop
+                        (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                        (local.set $acc (call $leaf (local.get $i) (local.get $acc)))
+                        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                        (br $loop)))
+                    (local.get $acc))
+            )"#,
+        )
+        .expect("module");
+        let leaf = Func::wrap(&mut store, |a: i64, b: i64| a * 3 + b);
+        let instance = Instance::new(&mut store, &module, &[leaf.into()]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("run");
+        let expected = |n: i64| {
+            let mut acc = 0i64;
+            let mut i = 0i64;
+            while i < n {
+                acc = i * 3 + acc;
+                i += 1;
+            }
+            acc
+        };
+        for n in [0i64, 1, 2, 10, 1000] {
+            assert_eq!(
+                run.call(&mut store, n).expect("call run"),
+                expected(n),
+                "imported run({n})"
+            );
+        }
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        assert!(
+            compiles >= 1,
+            "caller loop with imported call must compile (got {compiles})"
+        );
+    }
+
+    fn run_call_assembler_callee_memory_loop_once(n: i64) -> (i64, i64, usize, usize) {
+        use crate::{Engine, Instance, Module, Store};
+
+        const WAT: &str = r#"
+            (module
+                (memory (export "mem") 1)
+
+                (func $mem_sum (param $n i64) (result i64)
+                    (local $ptr i32) (local $i i64) (local $next i64)
+                    (local.set $ptr (i32.const 0))
+                    (local.set $next (i64.const 0))
+                    (i64.store (local.get $ptr) (local.get $next))
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                            (local.set $next
+                                (i64.add
+                                    (i64.load (local.get $ptr))
+                                    (i64.add (local.get $i) (i64.const 1))))
+                            (i64.store (local.get $ptr) (local.get $next))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (i64.load (local.get $ptr)))
+
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $result i64)
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (i64.const 1)))
+                            (local.set $result (call $mem_sum (local.get $n)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (local.get $result))
+            )"#;
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let memory = instance.get_memory(&store, "mem").expect("memory export");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("typed func run");
+
+        let got = run.call(&mut store, n).expect("call run");
+        let mut cell = [0u8; 8];
+        memory.read(&store, 0, &mut cell).expect("read mem[0]");
+        let mem0 = i64::from_le_bytes(cell);
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        (got, mem0, compiles, guard_fails)
+    }
+
+    #[test]
+    fn control_callee_memory_loop_error_scaling() {
+        let _serial = serial_kernel_guard();
+        let mut compiled_rows = 0;
+        let mut corrupt_rows = 0;
+
+        for n in [5i64, 10, 50, 100, 1000] {
+            reset_drivers_for_test();
+            KERNEL_COMPILES.store(0, Ordering::Relaxed);
+            KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+            let expected = n * (n + 1) / 2;
+            let (got, mem0, compiles, guard_fails) = run_call_assembler_callee_memory_loop_once(n);
+            let delta = got - expected;
+            if compiles > 0 {
+                compiled_rows += 1;
+            }
+            if delta != 0 || mem0 != expected {
+                corrupt_rows += 1;
+            }
+            eprintln!(
+                "[control-callee-memory-scaling] n={n} got={got} mem0={mem0} expected={expected} delta={delta} mem_delta={} compiles={compiles} guard_fails={guard_fails}",
+                mem0 - expected
+            );
+        }
+
+        assert!(
+            compiled_rows >= 1,
+            "scaling control must include at least one compiled callee row"
+        );
+        assert_eq!(
+            corrupt_rows, 0,
+            "compiled callee memory rows must match the interpreter"
+        );
+    }
+
+    /// CALL_ASSEMBLER with a hot callee loop that reads and writes linear memory
+    /// each iteration. This isolates the pyre crash dimension that the pure-int
+    /// callee deopt tests did not cover: `run_callee` saves/restores the caller
+    /// MEM_CTX while the callee trace carries `mem_base`, `mem_len`, and
+    /// `mem_trap_did` state across the loop-exit guard failure.
+    #[test]
+    fn end_to_end_call_assembler_callee_memory_loop_jit() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const N: i64 = 1000;
+        const WAT: &str = r#"
+            (module
+                (memory (export "mem") 1)
+
+                (func $mem_sum (param $n i64) (result i64)
+                    (local $ptr i32) (local $i i64) (local $next i64)
+                    (local.set $ptr (i32.const 0))
+                    (local.set $next (i64.const 0))
+                    (i64.store (local.get $ptr) (local.get $next))
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                            (local.set $next
+                                (i64.add
+                                    (i64.load (local.get $ptr))
+                                    (i64.add (local.get $i) (i64.const 1))))
+                            (i64.store (local.get $ptr) (local.get $next))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (i64.load (local.get $ptr)))
+
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $result i64)
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (i64.const 1)))
+                            (local.set $result (call $mem_sum (local.get $n)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (local.get $result))
+            )"#;
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let memory = instance.get_memory(&store, "mem").expect("memory export");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("typed func run");
+
+        let expected = N * (N + 1) / 2;
+        let got = run.call(&mut store, N).expect("call run");
+        let mut cell = [0u8; 8];
+        memory.read(&store, 0, &mut cell).expect("read mem[0]");
+        let mem0 = i64::from_le_bytes(cell);
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        eprintln!(
+            "[call-assembler-callee-memory] n={N} got={got} mem0={mem0} expected={expected} compiles={compiles} guard_fails={guard_fails}",
+        );
+        assert_eq!(got, expected, "run({N}) must return the memory-carried sum");
+        assert_eq!(
+            mem0, expected,
+            "callee store must survive the CALL_ASSEMBLER return boundary",
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "callee memory loop must compile on CALLEE_DRIVER",
+        );
+        assert!(
+            KERNEL_GUARD_FAILS.load(Ordering::Relaxed) >= 1,
+            "callee memory loop must hit the loop-exit guard failure",
+        );
+    }
+
+    /// Register-only accumulator loop inside a CALLEE that returns via
+    /// MINI_RETURN (`s=s+i; i=i+1; return s`). No memory store/load in the
+    /// body, unlike [`end_to_end_call_assembler_callee_memory_loop_jit`].
+    /// Regression coverage for the callee-register-loop compile+exit path.
+    /// NOTE: this small program does NOT reproduce the real-bench callee
+    /// loop-exit `unreachable` (that requires a large/complex callee program
+    /// whose blackhole loop-exit resume PC is mis-computed); kept as the
+    /// passing lower bound of that shape.
+    #[test]
+    fn end_to_end_call_assembler_callee_register_loop_jit() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const N: i64 = 1000;
+        const WAT: &str = r#"
+            (module
+                (func $reg_sum (param $n i64) (result i64)
+                    (local $i i64) (local $s i64)
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (local.get $n)))
+                            (local.set $s (i64.add (local.get $s) (local.get $i)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (local.get $s))
+
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $result i64)
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (i64.const 1)))
+                            (local.set $result (call $reg_sum (local.get $n)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (local.get $result))
+            )"#;
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("typed func run");
+
+        let expected = N * (N - 1) / 2;
+        let got = run.call(&mut store, N).expect("call run");
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        eprintln!(
+            "[call-assembler-callee-register] n={N} got={got} expected={expected} compiles={compiles} guard_fails={guard_fails}",
+        );
+        assert_eq!(
+            got, expected,
+            "run({N}) must return the register-carried sum"
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "callee register loop must compile on CALLEE_DRIVER",
+        );
+        assert!(
+            KERNEL_GUARD_FAILS.load(Ordering::Relaxed) >= 1,
+            "callee register loop must hit the loop-exit guard failure",
+        );
+    }
+
+    /// Callee with a NESTED loop: the hot INNER accumulator loop compiles, and
+    /// on its loop-exit the blackhole recovery flows into the OUTER loop's
+    /// back-edge (another jit_merge_point) before returning. Regression
+    /// coverage for inner-exit → outer merge-point re-entry inside a callee.
+    /// NOTE: this PASSES — it does NOT reproduce the real-bench callee
+    /// `unreachable`; the outer merge-point re-entry carries `slots` correctly
+    /// here, so the real trigger is more program-shape specific than a plain
+    /// nested register loop.
+    #[test]
+    fn end_to_end_call_assembler_callee_nested_loop_jit() {
+        let _serial = serial_kernel_guard();
+        use crate::{Engine, Instance, Module, Store};
+
+        const N: i64 = 1000;
+        const OUTER: i64 = 3;
+        const WAT: &str = r#"
+            (module
+                (func $nest_sum (param $n i64) (result i64)
+                    (local $i i64) (local $j i64) (local $s i64)
+                    (block $obreak
+                        (loop $oloop
+                            (br_if $obreak (i64.ge_s (local.get $j) (i64.const 3)))
+                            (local.set $i (i64.const 0))
+                            (block $ibreak
+                                (loop $iloop
+                                    (br_if $ibreak (i64.ge_s (local.get $i) (local.get $n)))
+                                    (local.set $s (i64.add (local.get $s) (local.get $i)))
+                                    (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                                    (br $iloop)))
+                            (local.set $j (i64.add (local.get $j) (i64.const 1)))
+                            (br $oloop)))
+                    (local.get $s))
+
+                (func (export "run") (param $n i64) (result i64)
+                    (local $i i64) (local $result i64)
+                    (block $break
+                        (loop $loop
+                            (br_if $break (i64.ge_s (local.get $i) (i64.const 1)))
+                            (local.set $result (call $nest_sum (local.get $n)))
+                            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                            (br $loop)))
+                    (local.get $result))
+            )"#;
+
+        reset_drivers_for_test();
+        KERNEL_COMPILES.store(0, Ordering::Relaxed);
+        KERNEL_GUARD_FAILS.store(0, Ordering::Relaxed);
+
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(&engine, WAT).expect("module");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instance");
+        let run = instance
+            .get_typed_func::<i64, i64>(&store, "run")
+            .expect("typed func run");
+
+        let expected = OUTER * (N * (N - 1) / 2);
+        let got = run.call(&mut store, N).expect("call run");
+        let compiles = KERNEL_COMPILES.load(Ordering::Relaxed);
+        let guard_fails = KERNEL_GUARD_FAILS.load(Ordering::Relaxed);
+        eprintln!(
+            "[call-assembler-callee-nested] n={N} outer={OUTER} got={got} expected={expected} compiles={compiles} guard_fails={guard_fails}",
+        );
+        assert_eq!(
+            got, expected,
+            "run({N}) must return the nested register-carried sum"
+        );
+        assert!(
+            KERNEL_COMPILES.load(Ordering::Relaxed) >= 1,
+            "callee nested inner loop must compile on CALLEE_DRIVER",
+        );
     }
 }

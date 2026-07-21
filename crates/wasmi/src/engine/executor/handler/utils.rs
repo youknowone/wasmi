@@ -2,12 +2,24 @@ use super::state::{Freg32, Freg64, Inst, Ip, Ireg, Mem0Len, Mem0Ptr, Sp, VmState
 #[cfg(feature = "simd")]
 use crate::core::simd::ImmLaneIdx;
 use crate::{
-    Error, Func, Global, Instance, Memory, Nullable, RefType, Table, TrapCode, V128,
+    Error,
+    Func,
+    Global,
+    Instance,
+    Memory,
+    Nullable,
+    RefType,
+    Table,
+    TrapCode,
+    V128,
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, RawVal, ShiftAmount},
     engine::{
-        DedupFuncType, EngineFunc, FuncEntry,
+        DedupFuncType,
+        EngineFunc,
+        FuncEntry,
         executor::{
-            LoadFromCellsByValue, StoreToCells,
+            LoadFromCellsByValue,
+            StoreToCells,
             handler::{Break, Control, DoneReason, args::Args},
         },
         utils::unreachable_unchecked,
@@ -15,13 +27,40 @@ use crate::{
     func::{FuncEntity, HostFuncEntity},
     instance::InstanceEntity,
     ir::{
-        self, Address, BoundedSlotSpan, Local, Offset, Offset16, Slot, SlotAndReg, SlotSpan, index,
+        self,
+        Address,
+        BoundedSlotSpan,
+        Local,
+        Offset,
+        Offset16,
+        Slot,
+        SlotAndReg,
+        SlotSpan,
+        index,
     },
     memory::{DataSegment, DataSegmentEntity},
     store::{CallHooks, PrunedStore, StoreError, StoreInner},
     table::ElementSegment,
 };
 use core::num::NonZero;
+#[cfg(feature = "std")]
+use std::eprintln;
+
+#[cfg(feature = "majit-jit")]
+pub(crate) struct MajitCallResult {
+    pub ip: Ip,
+    pub sp: Sp,
+    pub mem0: Mem0Ptr,
+    pub mem0_len: Mem0Len,
+    pub instance: Inst,
+    pub accumulators: Option<(i64, i64, i64)>,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static PROBE_CALLEE_KEYS: core::cell::RefCell<std::collections::HashSet<usize>> =
+        core::cell::RefCell::new(std::collections::HashSet::new());
+}
 
 macro_rules! out_of_fuel {
     ($state:expr, $args:expr, $required_fuel:expr) => {{
@@ -74,6 +113,83 @@ pub fn compile_or_get_func(state: &mut VmState, func: EngineFunc) -> Result<(Ip,
         unreachable!("missing function entry at: {func:?}")
     };
     compile_or_get_func_entry(state, func_entry)
+}
+
+#[cfg(feature = "std")]
+fn probe_callee_prepass(
+    state: &mut VmState,
+    func: EngineFunc,
+    caller_instance: Inst,
+    callee_instance: Inst,
+) {
+    if std::env::var_os("WASMI_MAJIT_STATS").is_none() {
+        return;
+    }
+    let Some(func_entry) = state.code.entry(func) else {
+        eprintln!("[probe-callee] missing function entry func={func:?}");
+        return;
+    };
+    let fuel_mut = state.store.inner_mut().fuel_mut();
+    let features = state.code.features();
+    let Ok(compiled) = func_entry.get_or_compile(Some(fuel_mut), features) else {
+        eprintln!("[probe-callee] compile failed func={func:?}");
+        return;
+    };
+    let ops = compiled.ops();
+    let key = ops.as_ptr() as usize;
+    let first_seen = PROBE_CALLEE_KEYS.with(|keys| keys.borrow_mut().insert(key));
+    if !first_seen {
+        return;
+    }
+    let len_local_slots = compiled.len_local_slots();
+    let len_stack_slots = compiled.len_stack_slots();
+    let result = super::majit::prepass::prepass(ops, len_local_slots, len_stack_slots);
+    let cross_instance = callee_instance != caller_instance;
+    match &result {
+        Some(program) => {
+            let yield_pos: alloc::vec::Vec<usize> = program
+                .words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word == super::majit::prepass::MINI_YIELD_STOCK)
+                .map(|(index, _)| index)
+                .collect();
+            let bail_pos: alloc::vec::Vec<usize> = program
+                .words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word == super::majit::prepass::MINI_RETURN_BAIL)
+                .map(|(index, _)| index)
+                .collect();
+            let trap_pos: alloc::vec::Vec<usize> = program
+                .words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word == super::majit::prepass::MINI_TRAP)
+                .map(|(index, _)| index)
+                .collect();
+            eprintln!(
+                "[probe-callee] key={:#x} bytes={} cross_instance={} eligible=Some loop_header={:?} num_slots={} loop_live={} truncation={} has_yield_or_bail={} yield={:?} bail={:?} trap={:?}",
+                key,
+                ops.len(),
+                cross_instance,
+                program.loop_header_word,
+                program.num_slots,
+                program.loop_live_count,
+                program.loop_header_word.is_some() && program.loop_live_count < program.num_slots,
+                program.has_yield_or_bail,
+                yield_pos,
+                bail_pos,
+                trap_pos,
+            );
+        }
+        None => eprintln!(
+            "[probe-callee] key={:#x} bytes={} cross_instance={} eligible=None",
+            key,
+            ops.len(),
+            cross_instance,
+        ),
+    }
 }
 
 macro_rules! compile_or_get_func {
@@ -762,6 +878,211 @@ pub fn call_wasm(
     Control::Continue((callee_ip, callee_sp))
 }
 
+#[cfg(feature = "majit-jit")]
+#[inline]
+pub(crate) fn call_wasm_or_host_loop_yield(
+    state: &mut VmState,
+    caller_ip: Ip,
+    func: Func,
+    params: BoundedSlotSpan,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+    instance: Inst,
+) -> Control<MajitCallResult, Break> {
+    let func_entity = resolve_func(state.store, &func);
+    match func_entity {
+        FuncEntity::Wasm(wasm_func) => {
+            let func = wasm_func.func_body();
+            let callee_instance = *wasm_func.instance();
+            let callee_instance: Inst = resolve_instance(state.store, &callee_instance).into();
+            #[cfg(feature = "std")]
+            probe_callee_prepass(state, func, instance, callee_instance);
+            if callee_instance != instance
+                && super::majit::majit_enabled()
+                && super::majit::loop_yield_enabled()
+            {
+                if let Some(result) = call_wasm_loop_yield_cold(
+                    state,
+                    caller_ip,
+                    params,
+                    func,
+                    callee_instance,
+                    mem0,
+                    mem0_len,
+                    instance,
+                )? {
+                    return Control::Continue(result);
+                }
+            }
+            let (callee_ip, callee_sp) =
+                call_wasm(state, caller_ip, params, func, Some(callee_instance))?;
+            let (instance, mem0, mem0_len) =
+                update_instance(state.store, instance, callee_instance, mem0, mem0_len);
+            Control::Continue(MajitCallResult {
+                ip: callee_ip,
+                sp: callee_sp,
+                mem0,
+                mem0_len,
+                instance,
+                accumulators: None,
+            })
+        }
+        FuncEntity::Host(host_func) => {
+            let host_func = *host_func;
+            let sp = call_host(
+                state,
+                func,
+                Some(caller_ip),
+                host_func,
+                params,
+                Some(instance),
+                CallHooks::Call,
+            )?;
+            let (mem0, mem0_len) = extract_mem0(state.store, instance);
+            Control::Continue(MajitCallResult {
+                ip: caller_ip,
+                sp,
+                mem0,
+                mem0_len,
+                instance,
+                accumulators: None,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "majit-jit")]
+#[cold]
+#[inline(never)]
+#[expect(clippy::too_many_arguments)]
+fn call_wasm_loop_yield_cold(
+    state: &mut VmState,
+    caller_ip: Ip,
+    params: BoundedSlotSpan,
+    func: EngineFunc,
+    callee_instance: Inst,
+    mem0: Mem0Ptr,
+    mem0_len: Mem0Len,
+    instance: Inst,
+) -> Control<Option<MajitCallResult>, Break> {
+    let Some(func_entry) = state.code.entry(func) else {
+        unreachable!("missing function entry at: {func:?}")
+    };
+    let compiled = match func_entry.get_or_compile(
+        Some(state.store.inner_mut().fuel_mut()),
+        state.code.features(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => done!(state, DoneReason::error(error)),
+    };
+    let callee_ops = compiled.ops();
+    let len_local_slots = compiled.len_local_slots();
+    let len_stack_slots = compiled.len_stack_slots();
+    let Some((callee_key, callee_num_slots, callee_uses_globals, callee_slot_map)) =
+        super::majit::kernel::ensure_loop_yield_callee_cached(
+            callee_ops,
+            len_local_slots,
+            len_stack_slots,
+        )
+    else {
+        return Control::Continue(None);
+    };
+
+    let callee_ip = Ip::from(callee_ops);
+    let callee_sp = state
+        .stack
+        .push_frame(
+            Some(caller_ip),
+            callee_ip,
+            params,
+            len_local_slots,
+            len_stack_slots,
+            Some(callee_instance),
+        )
+        .into_control()?;
+    let (new_instance, new_mem0, new_mem0_len) =
+        update_instance(state.store, instance, callee_instance, mem0, mem0_len);
+
+    let mut init_slots = alloc::vec![0i64; callee_num_slots + super::majit::prepass::NUM_SCRATCH];
+    for (dense_idx, &orig) in callee_slot_map.iter().enumerate() {
+        init_slots[dense_idx] = unsafe { callee_sp.get::<i64>(Slot::from(orig)) };
+    }
+    let globals_table = if callee_uses_globals {
+        resolve_globals_table(state.store, callee_instance)
+    } else {
+        alloc::vec::Vec::new()
+    };
+    let (callee_mem0, callee_mem0_len) = extract_mem0(state.store, callee_instance);
+    // Register the call runners so a residual call (CallInternal / imported /
+    // CallIndirect) inside the loop-yield-tiered trace resolves through them,
+    // mirroring the plain-call `run_jit` path. Without this the indirect runner
+    // is unregistered and `call_indirect_residual` traps (UnreachableCodeReached).
+    let store_ptr = state.store as *mut crate::store::PrunedStore;
+    let outcome = super::func::with_call_runners(store_ptr, state.code, callee_instance, || {
+        super::majit::kernel::run_callee_yield(
+            callee_key,
+            &init_slots,
+            callee_mem0.addr() as i64,
+            callee_mem0_len.get() as i64,
+            globals_table.as_ptr(),
+            globals_table.len(),
+        )
+    });
+
+    match outcome {
+        super::majit::kernel::CalleeYieldRun::Yielded {
+            byte_offset,
+            slots,
+            accum0,
+            accum1,
+            accum2,
+        } => {
+            for (dense_idx, &val) in slots.iter().enumerate() {
+                let orig = callee_slot_map
+                    .get(dense_idx)
+                    .copied()
+                    .unwrap_or(dense_idx as u16);
+                unsafe { callee_sp.set::<i64>(Slot::from(orig), val) };
+            }
+            Control::Continue(Some(MajitCallResult {
+                ip: unsafe { callee_ip.add(byte_offset) },
+                sp: callee_sp,
+                mem0: new_mem0,
+                mem0_len: new_mem0_len,
+                instance: new_instance,
+                accumulators: Some((accum0, accum1, accum2)),
+            }))
+        }
+        super::majit::kernel::CalleeYieldRun::MemTrap {
+            did_store,
+            trap_code,
+        } => {
+            if did_store {
+                trap!(trap_code);
+            }
+            Control::Continue(Some(MajitCallResult {
+                ip: callee_ip,
+                sp: callee_sp,
+                mem0: new_mem0,
+                mem0_len: new_mem0_len,
+                instance: new_instance,
+                accumulators: None,
+            }))
+        }
+        super::majit::kernel::CalleeYieldRun::Stock
+        | super::majit::kernel::CalleeYieldRun::Returned(_) => {
+            Control::Continue(Some(MajitCallResult {
+                ip: callee_ip,
+                sp: callee_sp,
+                mem0: new_mem0,
+                mem0_len: new_mem0_len,
+                instance: new_instance,
+                accumulators: None,
+            }))
+        }
+    }
+}
+
 #[inline]
 pub fn return_call_func_entry(
     state: &mut VmState,
@@ -892,6 +1213,8 @@ pub fn call_wasm_or_host(
             let func = wasm_func.func_body();
             let callee_instance = *wasm_func.instance();
             let callee_instance: Inst = resolve_instance(state.store, &callee_instance).into();
+            #[cfg(feature = "std")]
+            probe_callee_prepass(state, func, instance, callee_instance);
             let (callee_ip, callee_sp) =
                 call_wasm(state, caller_ip, params, func, Some(callee_instance))?;
             let (instance, mem0, mem0_len) =

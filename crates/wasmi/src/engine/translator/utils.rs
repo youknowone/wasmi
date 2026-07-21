@@ -1,5 +1,7 @@
 use crate::{
-    Error, ExternRef, ValType,
+    Error,
+    ExternRef,
+    ValType,
     core::{RawVal, Typed, TypedRawVal},
     engine::TranslationError,
 };

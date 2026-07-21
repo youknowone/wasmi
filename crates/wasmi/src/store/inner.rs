@@ -1,13 +1,28 @@
 use crate::{
-    DataSegmentEntity, ElementSegment, Engine, Error, Func, FuncEntity, FuncType, Global, Instance,
-    InstanceEntity, Memory, Table,
+    DataSegmentEntity,
+    ElementSegment,
+    Engine,
+    Error,
+    Func,
+    FuncEntity,
+    FuncType,
+    Global,
+    Instance,
+    InstanceEntity,
+    Memory,
+    Table,
     collections::arena::{Arena, ArenaKey},
     core::{CoreElementSegment, CoreGlobal, CoreMemory, CoreTable, Fuel},
     engine::DedupFuncType,
     memory::DataSegment,
     reftype::{ExternRef, ExternRefEntity},
     store::{
-        AsStoreId as _, Handle, RawHandle, Stored, error::InternalStoreError, handle_arena_err,
+        AsStoreId as _,
+        Handle,
+        RawHandle,
+        Stored,
+        error::InternalStoreError,
+        handle_arena_err,
         id::StoreId,
     },
 };
@@ -31,7 +46,13 @@ pub struct StoreInner {
     /// Stored global variables.
     globals: StoreArena<Global>,
     /// Stored module instances.
-    instances: StoreArena<Instance>,
+    ///
+    /// The entities are boxed so their addresses stay stable when the backing
+    /// arena grows: the executor threads a raw `*const InstanceEntity` (`Inst`)
+    /// across calls, and a host call may instantiate a new module into this same
+    /// store (e.g. a JIT-emitted trace module via `instantiate_and_start`),
+    /// reallocating an unboxed `Vec<InstanceEntity>` and dangling that pointer.
+    instances: Arena<RawHandle<Instance>, alloc::boxed::Box<InstanceEntity>>,
     /// Stored data segments.
     datas: StoreArena<DataSegment>,
     /// Stored data segments.
@@ -216,7 +237,10 @@ impl StoreInner {
     /// - The returned [`Instance`] must later be initialized via the [`StoreInner::initialize_instance`]
     ///   method. Afterwards the [`Instance`] may be used.
     pub fn alloc_instance(&mut self) -> Instance {
-        let key = match self.instances.alloc(InstanceEntity::uninitialized()) {
+        let key = match self
+            .instances
+            .alloc(alloc::boxed::Box::new(InstanceEntity::uninitialized()))
+        {
             Ok(key) => key,
             Err(err) => handle_arena_err(err, "alloc uninit instance"),
         };
@@ -252,7 +276,7 @@ impl StoreInner {
             !uninit.is_initialized(),
             "encountered an already initialized instance: {uninit:?}",
         );
-        *uninit = init;
+        **uninit = init;
     }
 
     /// Returns a shared reference to the entity indexed by the given `idx`.
@@ -610,7 +634,9 @@ impl StoreInner {
         &self,
         key: &Instance,
     ) -> Result<&InstanceEntity, InternalStoreError> {
-        self.resolve(key.as_raw(), &self.instances)
+        // `instances` stores boxed entities for address stability; unwrap the
+        // `Box` so callers still see a plain `&InstanceEntity`.
+        self.resolve(key.as_raw(), &self.instances).map(|b| &**b)
     }
 
     /// Returns a shared reference to the [`ExternRefEntity`] associated to the given [`ExternRef`].

@@ -2,7 +2,8 @@
 
 use super::IntoResult as _;
 use crate::{
-    TrapCode, ValType,
+    TrapCode,
+    ValType,
     core::{IntoShiftAmount, ShiftAmount, Typed, TypedRawVal, wasm},
     engine::eval,
     ir::{Op, Slot},

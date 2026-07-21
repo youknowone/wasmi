@@ -1,5 +1,10 @@
 use crate::{
-    WasmStoreRef, wasm_externkind_t, wasm_externtype_t, wasm_func_t, wasm_global_t, wasm_memory_t,
+    WasmStoreRef,
+    wasm_externkind_t,
+    wasm_externtype_t,
+    wasm_func_t,
+    wasm_global_t,
+    wasm_memory_t,
     wasm_table_t,
 };
 use alloc::boxed::Box;

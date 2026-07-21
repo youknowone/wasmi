@@ -1,6 +1,14 @@
 //! Tests to check if wasmi's ResourceLimiter works as intended.
 use wasmi::{
-    Config, Engine, Error, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, TrapCode,
+    Config,
+    Engine,
+    Error,
+    Linker,
+    Module,
+    Store,
+    StoreLimits,
+    StoreLimitsBuilder,
+    TrapCode,
     TypedFunc,
 };
 

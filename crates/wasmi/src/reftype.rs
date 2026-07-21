@@ -1,5 +1,8 @@
 use crate::{
-    AsContextMut, Func, RefType, StoreContext,
+    AsContextMut,
+    Func,
+    RefType,
+    StoreContext,
     core::RawRef,
     handle::RawHandle,
     store::{AsStoreId, Stored},

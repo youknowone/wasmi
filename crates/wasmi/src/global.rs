@@ -1,7 +1,13 @@
 use wasmi_core::TypedRawVal;
 
 use crate::{
-    AsContext, AsContextMut, GlobalType, Mutability, Val, core::CoreGlobal, errors::GlobalError,
+    AsContext,
+    AsContextMut,
+    GlobalType,
+    Mutability,
+    Val,
+    core::CoreGlobal,
+    errors::GlobalError,
     store::Stored,
 };
 

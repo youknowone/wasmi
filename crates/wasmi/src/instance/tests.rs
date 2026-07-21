@@ -1,7 +1,20 @@
 use super::*;
 use crate::{
-    Caller, Engine, ExternRef, Func, MemoryType, Mutability, Nullable, Ref, RefType, Store,
-    TableType, TrapCode, Val, error::ErrorKind, module::InstantiationError,
+    Caller,
+    Engine,
+    ExternRef,
+    Func,
+    MemoryType,
+    Mutability,
+    Nullable,
+    Ref,
+    RefType,
+    Store,
+    TableType,
+    TrapCode,
+    Val,
+    error::ErrorKind,
+    module::InstantiationError,
 };
 
 #[test]

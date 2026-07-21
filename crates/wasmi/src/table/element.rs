@@ -1,5 +1,7 @@
 use crate::{
-    AsContext, AsContextMut, RefType,
+    AsContext,
+    AsContextMut,
+    RefType,
     core::{CoreElementSegment, RawRef},
     store::Stored,
 };

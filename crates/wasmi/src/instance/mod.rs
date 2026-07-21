@@ -1,9 +1,24 @@
 pub(crate) use self::builder::InstanceEntityBuilder;
 pub use self::exports::{Export, ExportsIter, Extern, ExternType};
 use crate::{
-    AsContext, AsContextMut, ElementSegment, Error, Func, Global, Memory, Module, StoreContext,
-    Table, TypedFunc, WasmParams, WasmResults, collections::Map, engine::DedupFuncType,
-    func::FuncError, memory::DataSegment, store::Stored,
+    AsContext,
+    AsContextMut,
+    ElementSegment,
+    Error,
+    Func,
+    Global,
+    Memory,
+    Module,
+    StoreContext,
+    Table,
+    TypedFunc,
+    WasmParams,
+    WasmResults,
+    collections::Map,
+    engine::DedupFuncType,
+    func::FuncError,
+    memory::DataSegment,
+    store::Stored,
 };
 use alloc::{boxed::Box, sync::Arc};
 

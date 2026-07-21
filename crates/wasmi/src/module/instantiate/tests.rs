@@ -8,8 +8,19 @@
 //! those entities.
 
 use crate::{
-    Engine, Error, Instance, Linker, Memory, MemoryType, Module, Ref, RefType, Store, Table,
-    TableType, instance::InstanceEntity,
+    Engine,
+    Error,
+    Instance,
+    Linker,
+    Memory,
+    MemoryType,
+    Module,
+    Ref,
+    RefType,
+    Store,
+    Table,
+    TableType,
+    instance::InstanceEntity,
 };
 
 fn try_instantiate_from_wat(wasm: &str) -> Result<(Store<()>, Instance), Error> {

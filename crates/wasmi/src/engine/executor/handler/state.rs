@@ -1,10 +1,20 @@
 use crate::{
-    Error, Func, TrapCode,
+    Error,
+    Func,
+    TrapCode,
     core::RawRef,
     engine::{
-        ResumableHostTrapError, ResumableOutOfFuelError, StackConfig,
+        ResumableHostTrapError,
+        ResumableOutOfFuelError,
+        StackConfig,
         executor::{
-            Cell, CellError, CellsReader, CellsWriter, CodeView, InOutParams, LoadFromCellsByValue,
+            Cell,
+            CellError,
+            CellsReader,
+            CellsWriter,
+            CodeView,
+            InOutParams,
+            LoadFromCellsByValue,
             StoreToCells,
             handler::{
                 dispatch::{Control, ExecutionOutcome},

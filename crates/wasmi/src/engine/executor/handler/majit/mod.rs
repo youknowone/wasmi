@@ -63,3 +63,21 @@ pub(crate) fn majit_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("WASMI_NO_MAJIT").is_none())
 }
+
+/// Whether the cross-instance loop-yield tier entry is enabled. Default off:
+/// this path runs a callee's loop in the kernel until its tail-call, then
+/// resumes the stock executor at that offset. Across the bench suite it never
+/// yields a real win (per-bench deltas sit within run-to-run noise) but it
+/// regresses a tail-call loop (`int_loop`) ~18%. That ~18% is not extra work:
+/// the retired-instruction count is identical with the tier on or off (~159.7M
+/// both), so the loss is purely microarchitectural — resuming the stock
+/// executor mid-function at the tail-call offset has worse code locality and
+/// branch prediction than a fresh call entry. There is no mechanical lever to
+/// recover it. The plain-call tier (`run_persistent`) is unaffected. Opt in
+/// with `WASMI_MAJIT_LOOP_YIELD` to evaluate the path on a workload that might
+/// benefit.
+pub(crate) fn loop_yield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WASMI_MAJIT_LOOP_YIELD").is_some())
+}

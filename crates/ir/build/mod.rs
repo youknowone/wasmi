@@ -7,8 +7,13 @@ mod ty;
 
 use self::{
     display::{
-        DisplayConstructor, DisplayDecode, DisplayEncode, DisplayOp, DisplayOpCode,
-        DisplayResultMut, Indent,
+        DisplayConstructor,
+        DisplayDecode,
+        DisplayEncode,
+        DisplayOp,
+        DisplayOpCode,
+        DisplayResultMut,
+        Indent,
     },
     ident::{Ident, SnakeCase},
     isa::Isa,
