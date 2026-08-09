@@ -4539,10 +4539,7 @@ fn new_driver(
 ) -> majit_metainterp::JitDriver<WasmKernelState> {
     #[cfg(test)]
     TEST_LAST_DRIVER_SEED_SLOTS.with(|len| len.set(init_slots.len()));
-    // No quasi-immutable state exists in the wasm kernel (plain integer reds over
-    // a fixed MiniProgram), so disable the periodic loop-invalidation timer: it
-    // would only force pointless re-tracing across calls.
-    let mut driver = majit_metainterp::JitDriver::with_options(threshold, false);
+    let mut driver = majit_metainterp::JitDriver::new(threshold);
     // Raise the guard-failure threshold out of reach so a hot loop-exit guard
     // never starts a bridge trace. This kernel's loop exits straight into
     // `MINI_RETURN_*`, and the `#[jit_interp]` dispatch-jitcode does not lower a
@@ -5109,7 +5106,7 @@ mod tests {
         let _serial = serial_kernel_guard();
         let mp = compile_counter();
         // Shared driver, bridges on (eagerness 2 → bridge after 2 guard fails).
-        let mut driver = majit_metainterp::JitDriver::with_options(3, false);
+        let mut driver = majit_metainterp::JitDriver::new(3);
         driver.set_trace_eagerness(2);
         let seed0 = WasmKernelState {
             slots: seed(8, mp.num_slots),
