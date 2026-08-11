@@ -4549,7 +4549,7 @@ fn new_driver(
     // the correct blackhole recovery resume each call. (Giant single-call loops
     // never get a hot exit guard, so they are unaffected either way.)
     driver.set_trace_eagerness(u32::MAX);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes_after| {
         KERNEL_COMPILES.fetch_add(1, Ordering::Relaxed);
         let k = CURRENT_JIT_KEY.with(|c| c.get());
         if k != 0 {

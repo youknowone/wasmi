@@ -57,7 +57,7 @@ struct SmokeState {
 fn smoke_mainloop(program: &Bytecode, num_regs: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<SmokeState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after, _opcodes_after| {
         SMOKE_COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     driver.set_on_guard_failure(|_green_key, _a, _b| {
