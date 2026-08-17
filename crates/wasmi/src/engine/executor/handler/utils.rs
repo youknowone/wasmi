@@ -43,7 +43,7 @@ use crate::{
     table::ElementSegment,
 };
 use core::num::NonZero;
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "majit-jit"))]
 use std::eprintln;
 
 #[cfg(feature = "majit-jit")]
@@ -56,7 +56,7 @@ pub(crate) struct MajitCallResult {
     pub accumulators: Option<(i64, i64, i64)>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "majit-jit"))]
 std::thread_local! {
     static PROBE_CALLEE_KEYS: core::cell::RefCell<std::collections::HashSet<usize>> =
         core::cell::RefCell::new(std::collections::HashSet::new());
@@ -115,7 +115,7 @@ pub fn compile_or_get_func(state: &mut VmState, func: EngineFunc) -> Result<(Ip,
     compile_or_get_func_entry(state, func_entry)
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "majit-jit"))]
 fn probe_callee_prepass(
     state: &mut VmState,
     func: EngineFunc,
@@ -895,7 +895,7 @@ pub(crate) fn call_wasm_or_host_loop_yield(
             let func = wasm_func.func_body();
             let callee_instance = *wasm_func.instance();
             let callee_instance: Inst = resolve_instance(state.store, &callee_instance).into();
-            #[cfg(feature = "std")]
+            #[cfg(all(feature = "std", feature = "majit-jit"))]
             probe_callee_prepass(state, func, instance, callee_instance);
             if callee_instance != instance
                 && super::majit::majit_enabled()
@@ -1213,7 +1213,7 @@ pub fn call_wasm_or_host(
             let func = wasm_func.func_body();
             let callee_instance = *wasm_func.instance();
             let callee_instance: Inst = resolve_instance(state.store, &callee_instance).into();
-            #[cfg(feature = "std")]
+            #[cfg(all(feature = "std", feature = "majit-jit"))]
             probe_callee_prepass(state, func, instance, callee_instance);
             let (callee_ip, callee_sp) =
                 call_wasm(state, caller_ip, params, func, Some(callee_instance))?;
